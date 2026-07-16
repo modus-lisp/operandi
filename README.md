@@ -108,6 +108,7 @@ sbcl --non-interactive --load inspect/robustness-test.lisp
 | Brave Search token | `~/.operandi/brave-search.token` |
 | Agent audit log DB | `~/.operandi/operandi.db` |
 | Persistent agent notes | `~/.operandi/operandi-notes.md` |
+| Offloaded results (compaction + large WebFetch) | `~/.operandi/offload/` |
 | Cron reports / state | `~/.operandi/` |
 
 Tool-sandbox limits (rebindable specials in `operandi.tools`):

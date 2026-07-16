@@ -14,7 +14,8 @@
 
 (defpackage #:operandi.text
   (:use #:cl)
-  (:export #:*result-budget* #:bound-result))
+  (:export #:*result-budget* #:bound-result
+           #:*offload-dir* #:offload-string #:save-and-bound))
 
 (in-package #:operandi.text)
 
@@ -67,3 +68,56 @@
                (format o "~&~%… ~:D of ~:D chars of ~A elided~@[ — ~A~] …~%~%"
                        elided len label hint)
                (write-string s o :start tail-start))))))))
+
+;;; ------------------------- reversible offload -----------------------
+;;; Bounding drops the middle from context — but disk is cheap, so keep the
+;;; FULL result on disk and point the agent at it. Then a truncation is
+;;; reversible: instead of re-running the tool (costly, and for a web fetch
+;;; not even reproducible — the page changes, it re-triggers the sanitizer),
+;;; the agent just Reads the saved file. Mirrors the engine's compaction
+;;; offload, applied at tool-return time.
+
+(defparameter *offload-dir*
+  (namestring (merge-pathnames ".operandi/offload/" (user-homedir-pathname)))
+  "Directory where SAVE-AND-BOUND writes the full copy of a large tool
+   result. Recoverable with the Read tool.")
+
+(defvar *offload-counter* 0
+  "Monotonic suffix so concurrent offloads within a second don't collide.")
+
+(defun offload-string (s &key (prefix "blob") (dir *offload-dir*))
+  "Write string S verbatim to a fresh file under DIR; return its absolute
+   namestring, or NIL on any I/O error (caller degrades to a plain bound
+   result). The filename is prefix + time + counter — no randomness needed."
+  (handler-case
+      (progn
+        (ensure-directories-exist dir)
+        (let ((path (merge-pathnames
+                     (format nil "~A-~D-~D.txt" prefix
+                             (get-universal-time) (incf *offload-counter*))
+                     dir)))
+          (with-open-file (o path :direction :output
+                                  :if-exists :supersede
+                                  :if-does-not-exist :create
+                                  :external-format :utf-8)
+            (write-string s o))
+          (namestring (truename path))))
+    (error () nil)))
+
+(defun save-and-bound (s &key (budget *result-budget*) (head-frac 0.5d0)
+                              (label "output") (prefix "blob") extra-hint)
+  "Like BOUND-RESULT, but REVERSIBLE: when S is over budget, save the FULL S
+   to a file and make the elision note point at it (Read it to recover the
+   middle), so nothing is actually lost. Returns S unchanged when it fits;
+   falls back to a plain bounded result (with EXTRA-HINT) if the offload
+   fails. The saved copy is whatever the caller passes — pass the SANITIZED
+   text, never raw untrusted bytes, so recovery stays safe."
+  (if (<= (length s) budget)
+      s
+      (let ((path (offload-string s :prefix prefix)))
+        (bound-result
+         s :budget budget :head-frac head-frac :label label
+         :hint (if path
+                   (format nil "full ~A (~:D chars) saved to ~A — Read it (offset/limit) to see the rest~@[; ~A~]"
+                           label (length s) path extra-hint)
+                   (or extra-hint "re-run to see the rest"))))))

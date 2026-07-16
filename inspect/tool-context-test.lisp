@@ -82,12 +82,42 @@
 (let ((r (call "Grep" "pattern" "(" "path" "src")))
   (check "grep signals the 200-line wall" (search "matching lines total" r)))
 
-;;; ---- WebFetch envelope keeps the tail (unit, no network) ----
-(format t "~&== WebFetch cap keeps the tail ==~%")
-(let* ((page (concatenate 'string (make-string 60000 :initial-element #\p) "PAGE_TAIL_KEEP"))
-       (r (funcall (find-symbol "%CAP-FETCH" "OPERANDI.SAFEFETCH") page)))
-  (check "fetch cap keeps the page tail" (search "PAGE_TAIL_KEEP" r))
-  (check "fetch cap bounded the page"    (< (length r) (length page))))
+;;; ---- reversible offload: the full result is saved, not lost ----
+(format t "~&== save-and-bound offloads the full result ==~%")
+(let ((txt:*offload-dir* (namestring (merge-pathnames "octx-offload-test/"
+                                                      (uiop:temporary-directory)))))
+  (ignore-errors (uiop:delete-directory-tree (pathname txt:*offload-dir*)
+                                             :validate t :if-does-not-exist :ignore))
+  (let* ((full (concatenate 'string (make-string 60000 :initial-element #\p)
+                            (string #\Newline) "PAGE_TAIL_KEEP"))
+         (r (txt:save-and-bound full :budget 20000 :label "page" :prefix "fetch")))
+    (check "bounded, not whole"        (< (length r) (length full)))
+    (check "keeps the tail sentinel"   (search "PAGE_TAIL_KEEP" r))
+    (check "points at a saved file"    (search "saved to" r))
+    ;; the pointer's path must hold the FULL original — recoverable via Read
+    (let* ((mark (search "saved to " r))
+           (start (and mark (+ mark (length "saved to "))))
+           (endsp (and start (position #\Space r :start start)))
+           (path (and start (subseq r start endsp))))
+      (check "saved file exists"        (and path (probe-file path)))
+      (check "saved file is the FULL result"
+             (and path (probe-file path)
+                  (string= full (uiop:read-file-string path)))))))
+
+;; chunked sanitize cleans across chunk boundaries (stub detector, no network)
+(format t "~&== chunked sanitize covers the whole page ==~%")
+(let* ((sf::*fetch-sanitize-chunk* 100)
+       ;; detector flags the literal "INJECT" wherever it appears
+       (sf:*injection-detector*
+         (lambda (text) (values (when (search "INJECT" text) (list "INJECT")) t)))
+       ;; put an INJECT far past the first chunk so only chunking catches it
+       (page (concatenate 'string (make-string 350 :initial-element #\a)
+                          (string #\Newline) "INJECT"
+                          (string #\Newline) (make-string 50 :initial-element #\b))))
+  (multiple-value-bind (clean red ok) (sf::sanitize-content-chunked page)
+    (check "chunked sanitize verified"        ok)
+    (check "redacted the deep-page injection" (and red (plusp (length red))))
+    (check "clean text has no INJECT left"    (null (search "INJECT" clean)))))
 
 (format t "~&~%tool-context-test: ~A failure~:P~%" *fails*)
 (sb-ext:exit :code (if (zerop *fails*) 0 1))

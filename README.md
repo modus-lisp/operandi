@@ -23,6 +23,7 @@ src/
   engine.lisp         operandi.engine   — the agent loop (retries, auto-compaction, cost)
   subagent.lisp       operandi.subagent — the Task tool (delegated sub-agents, depth-capped)
   cron.lisp           operandi.cron     — in-image scheduled-task runner (empty by default)
+  tui.lisp            operandi.tui      — interactive REPL: streaming, tool rendering, /commands
 bin/operandi.lisp     standalone CLI
 mcp/                  Node MCP server exposing operandi as dispatchable tools + a swarm harness
 ```
@@ -52,8 +53,30 @@ instructions, rebind `operandi.engine:*base-system-prompt*`.
 
 ```
 sbcl --non-interactive --load bin/operandi.lisp -- "your task here"
-sbcl --non-interactive --load bin/operandi.lisp -- shell
+sbcl --non-interactive --load bin/operandi.lisp -- tui
 sbcl --non-interactive --load bin/operandi.lisp -- --openrouter minimax/minimax-m2.7 "task"
+```
+
+## TUI
+
+`tui` (aliases: `shell`, `repl`) launches the interactive REPL — an enhanced,
+inline terminal UI:
+
+- **live token streaming** of the assistant's reply,
+- **coloured tool-call lines** — `⏺ Bash(echo hi)` … `✔ 27ms  hi` — rendered as
+  each tool fires (via `operandi.hooks`, so nothing in the engine changed),
+- **multi-turn memory** — conversation history is threaded across turns until
+  `/clear`,
+- a per-turn metrics line and a **running session cost** in the prompt,
+- **Ctrl-C aborts the current turn** and returns to the prompt (Ctrl-D quits),
+- slash commands: `/help /clear /cost /model [id] /system /tools /quit`.
+
+It's line-based on purpose — no alt-screen, no raw mode — so it works over ssh
+and in a pipe. Colour and line-editing (linedit, if installed) auto-enable only
+on an interactive tty; piped/non-interactive output is plain text.
+
+```
+sbcl --non-interactive --load bin/operandi.lisp -- --openrouter deepseek/deepseek-v4-flash tui
 ```
 
 ## MCP server

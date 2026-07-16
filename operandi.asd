@@ -34,4 +34,5 @@
      (:file "tools"    :depends-on ("llm" "search" "hooks" "safefetch"))  ; operandi.tools
      (:file "engine"   :depends-on ("llm" "tools" "hooks" "safefetch"))   ; operandi.engine
      (:file "subagent" :depends-on ("llm" "tools" "engine"))  ; operandi.subagent
-     (:file "cron"     :depends-on ("engine"))))))            ; operandi.cron
+     (:file "cron"     :depends-on ("engine"))                ; operandi.cron
+     (:file "tui"      :depends-on ("engine" "tools" "llm" "hooks"))))))  ; operandi.tui

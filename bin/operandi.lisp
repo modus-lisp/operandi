@@ -62,24 +62,9 @@
       (sb-ext:exit :code 130))))
 
 (defun run-shell ()
-  (ignore-errors (funcall (read-from-string "ql:quickload") "linedit" :silent t))
-  (let ((linedit (find-symbol "LINEDIT" "LINEDIT")))
-    (format t "~&operandi shell. Type 'exit' or Ctrl-D to quit; Ctrl-C aborts current task.~%")
-    (loop
-      (handler-case
-          (let ((line (if linedit
-                          (funcall linedit :prompt "> "
-                                           :history #P"~/.operandi/history")
-                          (progn (format t "> ") (force-output)
-                                 (or (read-line *standard-input* nil) (return))))))
-            (cond
-              ((member line '("exit" "quit") :test #'string-equal) (return))
-              ((zerop (length line)))
-              (t (handler-case (display-run line)
-                   (#+sbcl sb-sys:interactive-interrupt #-sbcl error ()
-                     (format t "~&interrupted.~%"))
-                   (error (e) (format t "~&error: ~A~%" e))))))
-        (end-of-file () (return))))))
+  "Launch the interactive TUI — the enhanced inline REPL with live
+   streaming, tool rendering, multi-turn memory, and slash commands."
+  (funcall (find-symbol "REPL" "OPERANDI.TUI")))
 
 (let* ((raw (remove "--" (uiop:command-line-arguments) :test #'string=))
        ;; Strip --openrouter [model] flag if present and switch backend.
@@ -101,9 +86,9 @@
     ((null cmd)
      (format t "~&usage:~%")
      (format t "  operandi.lisp -- \"task description\"~%")
-     (format t "  operandi.lisp -- shell~%")
+     (format t "  operandi.lisp -- tui        (interactive REPL: streaming, tools, /commands)~%")
      (format t "  operandi.lisp -- --openrouter [MODEL] \"task\"~%")
      (format t "~%--openrouter reads token from ~~/.operandi/openrouter.token.~%")
      (format t "Default backend is a local llama.cpp on http://127.0.0.1:8081.~%"))
-    ((string-equal cmd "shell") (run-shell))
+    ((member cmd '("tui" "shell" "repl") :test #'string-equal) (run-shell))
     (t (run-once (format nil "~{~A~^ ~}" args)))))

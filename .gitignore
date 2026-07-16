@@ -1,0 +1,14 @@
+# Lisp / ASDF build artifacts
+*.fasl
+*.fas
+*.lx64fsl
+.cache/
+
+# Node
+mcp/node_modules/
+
+# operandi runtime state (also lives under ~/.operandi at runtime)
+/.operandi/
+*.db
+*.db-journal
+*.db-wal

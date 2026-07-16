@@ -1,0 +1,33 @@
+{
+  "name": "operandi-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that exposes the operandi agent (a cheap-model ReAct + swarm harness) as dispatchable tools. An MCP client hands operandi a task; operandi runs its agent loop and returns the final answer plus cost/iteration metadata.",
+  "type": "module",
+  "bin": {
+    "operandi-mcp": "server.js"
+  },
+  "main": "server.js",
+  "files": [
+    "server.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "mcp-server",
+    "agent",
+    "ai-agent",
+    "react-agent",
+    "operandi",
+    "swarm"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  }
+}

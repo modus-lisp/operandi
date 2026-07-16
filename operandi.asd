@@ -26,12 +26,13 @@
   :components
   ((:module "src"
     :components
-    ((:file "llm")                                            ; operandi.llm
+    ((:file "text")                                           ; operandi.text
+     (:file "llm")                                            ; operandi.llm
      (:file "store")                                          ; operandi.store
      (:file "search")                                         ; operandi.search
-     (:file "safefetch" :depends-on ("llm"))                  ; operandi.safefetch
+     (:file "safefetch" :depends-on ("llm" "text"))           ; operandi.safefetch
      (:file "hooks"    :depends-on ("store"))                 ; operandi.hooks
-     (:file "tools"    :depends-on ("llm" "search" "hooks" "safefetch"))  ; operandi.tools
+     (:file "tools"    :depends-on ("llm" "search" "hooks" "safefetch" "text"))  ; operandi.tools
      (:file "engine"   :depends-on ("llm" "tools" "hooks" "safefetch"))   ; operandi.engine
      (:file "subagent" :depends-on ("llm" "tools" "engine"))  ; operandi.subagent
      (:file "cron"     :depends-on ("engine"))                ; operandi.cron

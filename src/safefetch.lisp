@@ -28,7 +28,8 @@
   (:local-nicknames (#:dex   #:dexador)
                     (#:jzon  #:com.inuoe.jzon)
                     (#:ppcre #:cl-ppcre)
-                    (#:llm   #:operandi.llm))
+                    (#:llm   #:operandi.llm)
+                    (#:txt   #:operandi.text))
   (:export #:fetch
            #:*fetch-impl* #:naive-fetch #:safe-fetch
            #:*injection-detector* #:sanitize-content #:*fetch-sanitizer-system*
@@ -180,7 +181,11 @@ remove. No prose. If nothing qualifies, output []")
     (values text redactions ok)))
 
 (defun %cap-fetch (s)
-  (if (> (length s) *fetch-max-return*) (subseq s 0 *fetch-max-return*) s))
+  ;; Head+tail envelope, not a silent head-only cut: a page's nav/lead is up
+  ;; front but the substance (and any conclusion) is often lower down, so keep
+  ;; both ends and tell the agent how to see more.
+  (txt:bound-result s :budget *fetch-max-return* :head-frac 0.6d0 :label "page"
+                      :hint "fetch a more specific URL, or a section, to see the rest"))
 
 (defun naive-fetch (url)
   "Trusting fetch: bounded GET + strip-html, NO sanitization."

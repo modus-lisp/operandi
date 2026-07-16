@@ -29,7 +29,8 @@
   (:local-nicknames (#:jzon  #:com.inuoe.jzon)
                     (#:llm   #:operandi.llm)
                     (#:hooks #:operandi.hooks)
-                    (#:sf    #:operandi.safefetch))
+                    (#:sf    #:operandi.safefetch)
+                    (#:txt   #:operandi.text))
   (:export #:*tools*
            #:*notes-file*
            #:*file-read-state*
@@ -399,7 +400,9 @@ Read the file first."
                         path (length text) (length out))))))))))
 
 (define-tool "Bash"
-    (:description "Run a shell command via /bin/bash -c. Output truncated to 50KB.
+    (:description "Run a shell command via /bin/bash -c. Long output keeps the
+head AND the tail (where a command's verdict — failures, exit status — lives),
+noting the elided middle; pipe through head/tail/grep to shape it at the source.
 Prefer Eval for anything touching our Lisp data."
      :schema (llm:ht
               "type" "object"
@@ -426,9 +429,11 @@ Prefer Eval for anything touching our Lisp data."
                   (error (e) (format s "~&error: ~A~%" e)))))
          ;; coreutils timeout exits 124 (term) / 137 (128+SIGKILL) on timeout.
          (timed-out (member code '(124 137)))
-         (body (if (> (length out) 50000)
-                   (format nil "(output truncated to 50KB)~%~A" (subseq out 0 50000))
-                   out)))
+         ;; Keep both ends — the verdict (failures/exit line) is at the TAIL,
+         ;; so favour it (head-frac 0.35) instead of a head-only cut.
+         (body (txt:bound-result
+                out :head-frac 0.35d0 :label "command output"
+                :hint "re-run piping through head/tail/grep to keep only what you need")))
     (if timed-out
         (format nil "~A~&[killed: command exceeded ~Ds]" body *bash-timeout*)
         body)))
@@ -489,8 +494,16 @@ Literal by default; prefix '/' for regex. First 200 matching lines."
                          (uiop:run-program argv :output s :error-output nil
                                                 :ignore-error-status t)
                        (error () nil))))
+              (total (count #\Newline raw))          ; ~one match per line
               (out (%first-n-lines raw 200)))
-         (if (zerop (length out)) "(no matches)" out))))))
+         (cond
+           ((zerop (length out)) "(no matches)")
+           ;; Tell the agent when it hit the wall, and how to get past it —
+           ;; a bare 200-line cut can't be told apart from "200 = all".
+           ((> total 200)
+            (format nil "~A~&… ~:D matching lines total, showing the first 200 — narrow the pattern or pass a PATH to see the rest."
+                    out total))
+           (t out)))))))
 
 (define-tool "TodoWrite"
     (:description "Set the current task list for this run. Replaces any
@@ -557,7 +570,11 @@ Returns up to 200 paths, newest first."
                                 (format nil "~D" *bash-timeout*) "/bin/bash" "-c" cmd)
                           :output s :error-output nil :ignore-error-status t)
                        (error () nil)))))
-         (if (zerop (length out)) "(no matches)" out))))))
+         (cond
+           ((zerop (length out)) "(no matches)")
+           ((>= (count #\Newline out) 200)
+            (format nil "~A~&… showing the newest 200 matches — refine the pattern to narrow." out))
+           (t out)))))))
 
 (define-tool "WebFetch"
     (:description "Fetch URL and return text-content (HTML stripped, 50KB cap).
@@ -646,8 +663,9 @@ Notes appear in every future run's system prompt — keep them tight."
 (define-tool "Eval"
     (:description "Evaluate Common Lisp in the running SBCL image. Every
 package loaded in the image is callable — operandi.store plus whatever
-domain packages the host application loaded. Returns the printed result
-+ captured stdout (50KB cap)."
+domain packages the host application loaded. Returns the value it evaluated
+to (ALWAYS kept, even under noisy output) plus captured stdout (head+tail if
+large)."
      :schema (llm:ht
               "type" "object"
               "properties" (llm:ht
@@ -655,7 +673,8 @@ domain packages the host application loaded. Returns the printed result
                                             "description" "Common Lisp form (or multiple forms separated by whitespace) to evaluate. Use the :CL-USER package as default; reference other packages by their name like (operandi.store:select-rows ...)."))
               "required" (vector "form")))
   (let ((src (gethash "form" args))
-        (out (make-string-output-stream)))
+        (out (make-string-output-stream))
+        (result-line nil))
     (handler-case
         ;; WITH-TIMEOUT aborts an infinite loop in the Eval'd form. Its
         ;; SB-EXT:TIMEOUT is a SERIOUS-CONDITION, not an ERROR, so it needs
@@ -670,16 +689,27 @@ domain packages the host application loaded. Returns the printed result
               (loop for form = (read in nil :eof)
                     until (eq form :eof)
                     do (setf last-result (eval form))))
-            (format out "~&=> ~S" last-result)))
+            ;; Print the value with bounded printing so a huge or circular
+            ;; structure can't spin out a gigabyte string (or loop forever).
+            (setf result-line
+                  (let ((*print-length* 1000) (*print-level* 20) (*print-circle* t))
+                    (format nil "=> ~S" last-result)))))
       (sb-ext:timeout ()
-        (format out "~&EVAL ERROR: aborted — form ran longer than ~Ds" *eval-timeout*))
+        (setf result-line (format nil "EVAL ERROR: aborted — form ran longer than ~Ds" *eval-timeout*)))
       (storage-condition (e)
-        (format out "~&EVAL ERROR: exhausted stack/heap (~A)" (type-of e)))
-      (error (e) (format out "~&EVAL ERROR: ~A" e)))
-    (let ((s (get-output-stream-string out)))
-      (if (> (length s) 50000)
-          (format nil "(truncated to 50KB)~%~A" (subseq s 0 50000))
-          s))))
+        (setf result-line (format nil "EVAL ERROR: exhausted stack/heap (~A)" (type-of e))))
+      (error (e) (setf result-line (format nil "EVAL ERROR: ~A" e))))
+    ;; The RESULT LINE (the => value, or the error) is the point of the call,
+    ;; so it is ALWAYS kept — bounded on its own budget, never elided away by a
+    ;; chatty form's stdout. stdout gets the head+tail envelope separately.
+    (let* ((stdout  (get-output-stream-string out))
+           (bounded (txt:bound-result
+                     stdout :label "stdout"
+                     :hint "capture only what you need in the form itself"))
+           (value   (txt:bound-result result-line :budget 20000 :label "printed value")))
+      (if (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return) bounded)))
+          (format nil "~A~&~A" bounded value)
+          value))))
 
 (defun default-tools ()
   '("Eval" "Read" "Write" "Edit" "Bash" "Grep" "Glob" "WebFetch"

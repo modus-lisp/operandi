@@ -310,15 +310,24 @@
      (funcall (read-from-string "ql:quickload") "linedit" :silent t)
      (setf *linedit* (find-symbol "LINEDIT" "LINEDIT")))))
 
+(defun %plain-read (prompt)
+  (write-string prompt) (force-output)
+  (read-line *standard-input* nil nil))
+
 (defun read-input (prompt)
-  "Read one line of input with editing/history if linedit is present, else
-   a plain prompt. Returns the line, or NIL on EOF (Ctrl-D). Falls back to
-   read-line if the line editor errors."
-  (or (and *linedit*
-           (ignore-errors
-            (funcall *linedit* :prompt prompt :history #P"~/.operandi/history")))
-      (progn (write-string prompt) (force-output)
-             (read-line *standard-input* nil nil))))
+  "Read one line of input with editing/history if linedit is present, else a
+   plain prompt. Returns the line, or NIL on EOF (Ctrl-D) — which the REPL
+   treats as quit. Ctrl-D must take exactly ONE press: linedit signals EOF as
+   an END-OF-FILE condition (or returns NIL), and either way we propagate that
+   as NIL rather than silently retrying with read-line (which would swallow the
+   first Ctrl-D and demand a second). A genuine, non-EOF linedit failure falls
+   back to read-line once."
+  (if *linedit*
+      (handler-case
+          (funcall *linedit* :prompt prompt :history #P"~/.operandi/history")
+        (end-of-file () nil)          ; Ctrl-D -> quit, don't re-read
+        (error () (%plain-read prompt)))
+      (%plain-read prompt)))
 
 (defun prompt-string (sess)
   (let ((cost (llm:usage-cost-usd (session-usage sess))))

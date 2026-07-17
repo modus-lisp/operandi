@@ -96,3 +96,10 @@
      (format t "Default backend is a local llama.cpp on http://127.0.0.1:8081.~%"))
     ((member cmd '("tui" "shell" "repl") :test #'string-equal) (run-shell))
     (t (run-once (format nil "~{~A~^ ~}" args)))))
+
+;; Exit cleanly once the command is done. Without this, an invocation that
+;; lacks --non-interactive (e.g. `sbcl --noinform --load bin/operandi.lisp`)
+;; drops into SBCL's own REPL after the TUI quits — forcing an extra Ctrl-D.
+;; (`bin/operandi` and the MCP already pass --non-interactive; this is harmless
+;; there and makes the bare --load form behave the same.)
+(sb-ext:exit :code 0)

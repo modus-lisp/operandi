@@ -82,27 +82,28 @@
 (let ((r (call "Grep" "pattern" "(" "path" "src")))
   (check "grep signals the 200-line wall" (search "matching lines total" r)))
 
-;;; ---- reversible offload: the full result is saved, not lost ----
-(format t "~&== save-and-bound offloads the full result ==~%")
-(let ((txt:*offload-dir* (namestring (merge-pathnames "octx-offload-test/"
-                                                      (uiop:temporary-directory)))))
-  (ignore-errors (uiop:delete-directory-tree (pathname txt:*offload-dir*)
-                                             :validate t :if-does-not-exist :ignore))
-  (let* ((full (concatenate 'string (make-string 60000 :initial-element #\p)
-                            (string #\Newline) "PAGE_TAIL_KEEP"))
-         (r (txt:save-and-bound full :budget 20000 :label "page" :prefix "fetch")))
-    (check "bounded, not whole"        (< (length r) (length full)))
-    (check "keeps the tail sentinel"   (search "PAGE_TAIL_KEEP" r))
-    (check "points at a saved file"    (search "saved to" r))
-    ;; the pointer's path must hold the FULL original — recoverable via Read
-    (let* ((mark (search "saved to " r))
-           (start (and mark (+ mark (length "saved to "))))
-           (endsp (and start (position #\Space r :start start)))
-           (path (and start (subseq r start endsp))))
-      (check "saved file exists"        (and path (probe-file path)))
-      (check "saved file is the FULL result"
-             (and path (probe-file path)
-                  (string= full (uiop:read-file-string path)))))))
+;;; ---- WebFetch: windowed + LAZY sanitize (only the returned window) ----
+(format t "~&== WebFetch windows + lazy sanitize ==~%")
+(let* ((sf:*fetch-raw-cache* (make-hash-table :test 'equal))
+       (sf::*fetch-window* 200)
+       (calls 0)
+       ;; a stub detector that counts how much page it's asked to sanitize
+       (sf:*injection-detector* (lambda (text) (declare (ignore text))
+                                  (incf calls) (values nil t)))
+       (page (with-output-to-string (o)
+               (dotimes (i 400) (format o "line ~3,'0D ....................~%" i)))))
+  ;; seed the cache so no network is touched (a miss would error → proves cache use)
+  (setf (gethash "http://x/big" sf:*fetch-raw-cache*) page)
+  (let ((r0 (sf:safe-fetch "http://x/big" 0)))
+    (check "window 0 returns the head" (search "line 000" r0))
+    (check "window 0 is bounded"       (not (search "line 399" r0)))
+    (check "reports total size"        (search (format nil "of ~:D" (length page)) r0))
+    (check "offers the next offset"    (search "offset=" r0)))
+  ;; the whole point: a big page cost exactly ONE detector call, not N
+  (check "sanitized ONLY the returned window (1 call)" (= calls 1))
+  (let ((r1 (sf:safe-fetch "http://x/big" (- (length page) 100))))
+    (check "offset window reaches the tail" (search "line 399" r1)))
+  (check "each fetch sanitizes just its window (2 calls total)" (= calls 2)))
 
 ;; chunked sanitize cleans across chunk boundaries (stub detector, no network)
 (format t "~&== chunked sanitize covers the whole page ==~%")

@@ -736,11 +736,13 @@ another tool or give a final answer.")
          (usage (llm:make-usage))
          (*subagent-usage* (llm:make-usage))
          (*subagents* (make-hash-table :test 'equal))
-         (sf:*fetch-history* (make-hash-table :test 'equal)))
+         (sf:*fetch-history* (make-hash-table :test 'equal))
+         (sf:*fetch-raw-cache* (make-hash-table :test 'equal)))
     (declare (special hooks:*current-run-id*
                        tools:*file-read-state*
                        tools:*todos*
                        sf:*fetch-history*
+                       sf:*fetch-raw-cache*
                        *subagent-usage*
                        *subagents*))
     (loop

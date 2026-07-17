@@ -83,12 +83,20 @@
         (<= (length red) 2))))
 
   (check "WebFetch routes through *fetch-impl* (agent can't pick the impl)"
-    (let ((sf:*fetch-impl* (lambda (url) (format nil "STUB:~A" url))))
-      (string= "STUB:http://x"
+    (let ((sf:*fetch-impl* (lambda (url &optional offset)
+                             (format nil "STUB:~A@~A" url offset))))
+      (string= "STUB:http://x@0"
                (tools:invoke-tool "WebFetch" (llm:ht "url" "http://x")))))
 
+  (check "WebFetch passes the offset arg through to the impl"
+    (let ((sf:*fetch-impl* (lambda (url &optional offset)
+                             (format nil "STUB:~A@~A" url offset))))
+      (string= "STUB:http://x@500"
+               (tools:invoke-tool "WebFetch" (llm:ht "url" "http://x" "offset" 500)))))
+
   (check "WebFetch reports impl errors as a caught string"
-    (let ((sf:*fetch-impl* (lambda (url) (declare (ignore url)) (error "boom"))))
+    (let ((sf:*fetch-impl* (lambda (url &optional offset)
+                             (declare (ignore url offset)) (error "boom"))))
       (search "FETCH ERROR" (tools:invoke-tool "WebFetch" (llm:ht "url" "http://x")))))
 
   ;; --- outbound guard (deterministic, no network) ---

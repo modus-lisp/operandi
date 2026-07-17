@@ -12,3 +12,6 @@ mcp/node_modules/
 *.db
 *.db-journal
 *.db-wal
+
+# dumped core image (built by bin/operandi)
+/operandi.core

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Fast launcher for operandi.
+#
+# SBCL's own startup is ~50ms, but loading operandi from source every run is
+# slow — mostly an ASDF source-registry scan (if your ~/.config points a :tree
+# at a big directory) plus Quicklisp loading dexador's dependency closure. So
+# instead we dump a CORE image with operandi (+ linedit) baked in, and launch
+# from it with the init files skipped: ~20ms to a ready agent.
+#
+# The core is rebuilt automatically on first run and whenever a source file is
+# newer than it. Usage mirrors bin/operandi.lisp:
+#   bin/operandi "task description"
+#   bin/operandi tui
+#   bin/operandi --openrouter deepseek/deepseek-v4-flash "task"
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CORE="$ROOT/operandi.core"
+SBCL="${OPERANDI_SBCL:-sbcl}"
+
+needs_build() {
+  [ ! -f "$CORE" ] && return 0
+  # any source or the .asd newer than the core → rebuild
+  [ -n "$(find "$ROOT/src" "$ROOT/operandi.asd" "$ROOT/bin/operandi.lisp" \
+            -newer "$CORE" 2>/dev/null | head -1)" ]
+}
+
+if needs_build; then
+  echo "operandi: building core image (one-time, ~20s)…" >&2
+  # The build pays the full source scan + compile ONCE. It uses the normal init
+  # files so Quicklisp is found; the resulting core needs none of that at run.
+  "$SBCL" --non-interactive \
+    --eval '(require :asdf)' \
+    --eval "(let ((q (merge-pathnames \"quicklisp/setup.lisp\" (user-homedir-pathname)))) (when (probe-file q) (load q)))" \
+    --eval '(funcall (read-from-string "ql:quickload") (list :operandi :linedit) :silent t)' \
+    --eval "(save-lisp-and-die \"$CORE\")" >/dev/null
+fi
+
+# Launch from the core. --no-userinit/--no-sysinit skips the init files (and
+# thus the whole-home ASDF tree scan); operandi is already in the image, so
+# bin/operandi.lisp's load is a no-op and only the CLI dispatch runs.
+exec "$SBCL" --core "$CORE" --no-userinit --no-sysinit --non-interactive \
+  --load "$ROOT/bin/operandi.lisp" -- "$@"

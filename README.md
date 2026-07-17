@@ -57,6 +57,25 @@ sbcl --non-interactive --load bin/operandi.lisp -- tui
 sbcl --non-interactive --load bin/operandi.lisp -- --openrouter minimax/minimax-m2.7 "task"
 ```
 
+### Fast start (`bin/operandi`)
+
+Loading from source every run is slow — not SBCL (≈50ms) but the per-run
+Quicklisp dependency load (dexador pulls in cl+ssl/cffi/usocket), plus, if your
+`~/.config/common-lisp` points an ASDF `:tree` at a big directory, a full
+filesystem scan on every launch. `bin/operandi` sidesteps both: it dumps a
+**core image** with operandi (+ linedit) baked in and launches from it with the
+init files skipped — **≈60ms to a ready agent** instead of ~16s.
+
+```
+bin/operandi tui
+bin/operandi "your task here"
+bin/operandi --openrouter deepseek/deepseek-v4-flash "task"
+```
+
+The core (`operandi.core`, gitignored) is built on first run and rebuilt
+automatically whenever a source file changes. Same arguments as the `.lisp`
+entry point above.
+
 ## TUI
 
 `tui` (aliases: `shell`, `repl`) launches the interactive REPL — an enhanced,

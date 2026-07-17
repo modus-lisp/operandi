@@ -24,12 +24,16 @@
   (let ((init (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
     (when (probe-file init) (load init))))
 
-;; Load the library. Prefer Quicklisp (resolves deps); fall back to a
-;; bare ASDF load-system if the project is registered but ql is absent.
-(handler-case
-    (funcall (read-from-string "ql:quickload") :operandi :silent t)
-  (error ()
-    (asdf:load-system :operandi)))
+;; Load the library — UNLESS it's already present, e.g. we were launched from a
+;; dumped core (bin/operandi) that baked it in. Skipping the quickload there is
+;; what turns a ~16s cold start into ~20ms. Prefer Quicklisp (resolves deps);
+;; fall back to a bare ASDF load-system if the project is registered but ql is
+;; absent.
+(unless (find-package :operandi.engine)
+  (handler-case
+      (funcall (read-from-string "ql:quickload") :operandi :silent t)
+    (error ()
+      (asdf:load-system :operandi))))
 
 ;; Open operandi's own store so the tool-call log + Eval have *db* live
 ;; without manual setup. FIND-SYMBOL so the reader needn't intern the

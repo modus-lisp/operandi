@@ -81,6 +81,13 @@ entry point above.
 `tui` (aliases: `shell`, `repl`) launches the interactive REPL — an enhanced,
 inline terminal UI:
 
+- **type while it works** — on an interactive tty the input line is pinned to
+  the bottom row (a scroll region keeps it separate from streaming output) and
+  the agent turn runs on a background thread, so you can compose the next message
+  mid-turn. What you type is echoed as `⧗ queued` and submitted as the next user
+  turn when the current one (with all its tool use) finishes. `^C` aborts the
+  running turn (and drops the queue); `^D` quits. Piped/non-tty input falls back
+  to a simple line-at-a-time loop.
 - **live token streaming** of the assistant's reply,
 - **coloured tool-call lines** — `⏺ Bash(echo hi)` … `✔ 27ms  hi` — rendered as
   each tool fires (via `operandi.hooks`, so nothing in the engine changed),

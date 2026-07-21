@@ -176,11 +176,104 @@
     (emit tok)))
 
 ;;; ------------------------------ session -----------------------------
+;;; The session is a plain HASH-TABLE, not a defstruct — on purpose. operandi
+;;; can reload/recompile itself in its own running image (the Eval tool,
+;;; self-improvement), and a live defstruct instance turns "not of type
+;;; SESSION" the instant its defstruct is re-evaluated under a running REPL.
+;;; A hash-table has no such layout coupling; the usage totals are kept as raw
+;;; numbers (not an llm:usage struct) for the same reason. A fresh usage struct
+;;; is built on demand for display, so it always matches the current layout.
 
-(defstruct session
-  (history nil)                 ; message list threaded back into eng:run
-  (usage (llm:make-usage))      ; cumulative across the whole session
-  (turns 0))
+(defparameter *sessions-dir*
+  (namestring (merge-pathnames ".operandi/sessions/" (user-homedir-pathname)))
+  "Where each interactive session's transcript is written, updated after every
+   turn (so a crash never loses the log).")
+
+(defun session-id ()
+  (multiple-value-bind (s mi h d mo y) (decode-universal-time (get-universal-time))
+    (format nil "~4,'0D~2,'0D~2,'0D-~2,'0D~2,'0D~2,'0D" y mo d h mi s)))
+
+(defun reset-session! (s)
+  "(Re)initialise session hash-table S with a fresh id and zeroed totals.
+   Used by both make-session and /clear (so /clear starts a new transcript
+   file, preserving the previous one)."
+  (setf (gethash :id s) (session-id)
+        (gethash :history s) nil
+        (gethash :turns s) 0
+        (gethash :cost s) 0d0
+        (gethash :prompt-tok s) 0
+        (gethash :completion-tok s) 0
+        (gethash :cached-tok s) 0
+        (gethash :calls s) 0)
+  s)
+
+(defun make-session () (reset-session! (make-hash-table :test 'eq)))
+
+(defun session-history (s) (gethash :history s))
+(defun (setf session-history) (v s) (setf (gethash :history s) v))
+(defun session-turns (s) (gethash :turns s))
+
+(defun session-add-usage (s u)
+  "Fold one turn's usage (an llm:usage) into the session's raw totals."
+  (when u
+    (incf (gethash :cost s)           (llm:usage-cost-usd u))
+    (incf (gethash :prompt-tok s)     (llm:usage-prompt-tokens u))
+    (incf (gethash :completion-tok s) (llm:usage-completion-tokens u))
+    (incf (gethash :cached-tok s)     (llm:usage-cached-tokens u))
+    (incf (gethash :calls s)          (llm:usage-calls u))))
+
+(defun session-usage (s)
+  "A transient llm:usage built from the session's raw totals — freshly
+   constructed, so it always has the current struct layout."
+  (llm:make-usage :cost-usd (gethash :cost s)
+                  :prompt-tokens (gethash :prompt-tok s)
+                  :completion-tokens (gethash :completion-tok s)
+                  :cached-tokens (gethash :cached-tok s)
+                  :calls (gethash :calls s)))
+
+;;; --- transcript persistence (~/.operandi/sessions/<id>.md) ---
+
+(defun %clip (s max)
+  (let ((s (if (stringp s) s (princ-to-string (or s "")))))
+    (if (> (length s) max)
+        (format nil "~A~%…[~:D more chars]" (subseq s 0 max) (- (length s) max))
+        s)))
+
+(defun render-session (s)
+  "A readable markdown transcript of the whole conversation so far. The system
+   prompt is omitted (large, unchanging); tool results are clipped for
+   readability — the raw record lives in the SQLite tool-call log."
+  (with-output-to-string (o)
+    (format o "# operandi session ~A~%~%- model: ~A~%- turns: ~A~%- ~A~%~%---~%~%"
+            (gethash :id s) (model-label) (gethash :turns s)
+            (llm:usage-summary (session-usage s)))
+    (dolist (m (gethash :history s))
+      (let ((role (gethash "role" m)) (c (gethash "content" m))
+            (tcs (gethash "tool_calls" m)))
+        (unless (string= role "system")
+          (format o "**~A:** ~A~%~%" role (%clip (or (and (stringp c) c) "") 6000))
+          (when (and tcs (or (vectorp tcs) (listp tcs)))
+            (map nil (lambda (tc)
+                       (let ((fn (and (hash-table-p tc) (gethash "function" tc))))
+                         (when (hash-table-p fn)
+                           (format o "    → ~A(~A)~%" (gethash "name" fn)
+                                   (%clip (gethash "arguments" fn) 400)))))
+                 (if (listp tcs) (coerce tcs 'vector) tcs))
+            (terpri o)))))))
+
+(defun persist-session (s)
+  "Write the session transcript to its file. Best-effort — never lets an I/O
+   error take down the REPL."
+  (handler-case
+      (progn
+        (ensure-directories-exist *sessions-dir*)
+        (with-open-file (o (merge-pathnames (format nil "~A.md" (gethash :id s))
+                                            *sessions-dir*)
+                           :direction :output :if-exists :supersede
+                           :if-does-not-exist :create :external-format :utf-8)
+          (write-string (render-session s) o))
+        t)
+    (error () nil)))
 
 (defun user-msg (text) (llm:ht "role" "user" "content" text))
 
@@ -207,8 +300,9 @@
         (multiple-value-bind (text hist* iters usage)
             (eng:run prompt :history messages :verbose nil)
           (setf (session-history sess) hist*)
-          (incf (session-turns sess))
-          (llm:usage-incf (session-usage sess) usage)
+          (incf (gethash :turns sess))
+          (session-add-usage sess usage)
+          (persist-session sess)          ; crash-safe: write after every turn
           ;; If nothing streamed (non-streaming turn, or a salvaged/synthetic
           ;; answer), or the final text diverged from the stream, print it.
           (let ((streamed (string-right-trim '(#\Space #\Newline)
@@ -290,8 +384,8 @@
       ((member verb '("/quit" "/exit" "/q") :test #'string-equal) :quit)
       ((string-equal verb "/help") (cmd-help) t)
       ((string-equal verb "/clear")
-       (setf (session-history sess) nil)
-       (format t "~&~A~%" (paint "— conversation cleared —" :gray)) t)
+       (reset-session! sess)
+       (format t "~&~A~%" (paint "— conversation cleared (new session) —" :gray)) t)
       ((string-equal verb "/cost") (cmd-cost sess) t)
       ((string-equal verb "/model") (cmd-model arg) t)
       ((string-equal verb "/system") (cmd-system sess) t)
@@ -330,7 +424,7 @@
       (%plain-read prompt)))
 
 (defun prompt-string (sess)
-  (let ((cost (llm:usage-cost-usd (session-usage sess))))
+  (let ((cost (gethash :cost sess)))
     (format nil "~A~A ~A "
             (paint (model-label) :green)
             (if (plusp cost)
@@ -339,11 +433,13 @@
 
 ;;; -------------------------------- repl ------------------------------
 
-(defun banner ()
-  (format t "~&~A ~A~%~A~%~%"
+(defun banner (sess)
+  (format t "~&~A ~A~%~A~%~A~%~%"
           (paint "operandi" :bold :cyan)
           (paint (format nil "· ~A" (model-label)) :gray)
           (paint "Type a task, or /help for commands. Ctrl-C aborts a turn, Ctrl-D quits."
+                 :gray)
+          (paint (format nil "· session log: ~A~A.md" *sessions-dir* (gethash :id sess))
                  :gray)))
 
 (defun repl (&key (greet t))
@@ -352,7 +448,7 @@
    history across turns until /clear."
   (try-load-linedit)
   (let ((sess (make-session)))
-    (when greet (banner))
+    (when greet (banner sess))
     (loop
       (let ((line (handler-case (read-input (prompt-string sess))
                     (#+sbcl sb-sys:interactive-interrupt #-sbcl error ()

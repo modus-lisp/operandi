@@ -88,9 +88,12 @@ inline terminal UI:
   `/clear`,
 - a per-turn metrics line and a **running session cost** in the prompt,
 - **Ctrl-C aborts the current turn** and returns to the prompt (Ctrl-D quits),
-- slash commands: `/help /clear /cost /model [id] /system /tools /quit`,
-- each session's transcript is written to `~/.operandi/sessions/<id>.md`,
-  updated after every turn (so a crash never loses it); `/clear` starts a new one.
+- slash commands: `/help /clear /sessions /resume [id] /cost /model [id] /system /tools /quit`,
+- each session is saved to `~/.operandi/sessions/<id>.{md,json}`, updated after
+  every turn (so a crash never loses it); `/clear` starts a new one. `/sessions`
+  lists them and `/resume [id]` continues one (the latest if no id) — or resume
+  from the shell: `bin/operandi --resume [id] tui`, or non-interactively
+  `bin/operandi --resume [id] "a follow-up question"`.
 
 It's line-based on purpose — no alt-screen, no raw mode — so it works over ssh
 and in a pipe. Colour and line-editing (linedit, if installed) auto-enable only

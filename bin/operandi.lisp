@@ -65,34 +65,60 @@
       (format t "~&interrupted.~%")
       (sb-ext:exit :code 130))))
 
-(defun run-shell ()
+(defun run-shell (&optional resume)
   "Launch the interactive TUI — the enhanced inline REPL with live
-   streaming, tool rendering, multi-turn memory, and slash commands."
-  (funcall (find-symbol "REPL" "OPERANDI.TUI")))
+   streaming, tool rendering, multi-turn memory, and slash commands.
+   RESUME (a session id or :LATEST) continues a saved session."
+  (funcall (find-symbol "REPL" "OPERANDI.TUI") :resume resume))
+
+(defun run-resumed-task (resume prompt)
+  "Resume a saved session and run PROMPT as one more turn, non-interactively."
+  (handler-case
+      (funcall (find-symbol "REPL" "OPERANDI.TUI") :resume resume :once prompt :greet nil)
+    (#+sbcl sb-sys:interactive-interrupt #-sbcl error ()
+      (format t "~&interrupted.~%")
+      (sb-ext:exit :code 130))))
+
+(defun session-id-like (s)
+  "True if S looks like a session id (YYYYMMDD-HHMMSS), so `--resume <id>` can
+   tell an id apart from a following command/task."
+  (and (stringp s) (= (length s) 15) (char= (char s 8) #\-)
+       (every #'digit-char-p (remove #\- s))))
 
 (let* ((raw (remove "--" (uiop:command-line-arguments) :test #'string=))
-       ;; Strip --openrouter [model] flag if present and switch backend.
+       (resume nil)
+       ;; Strip leading flags (--openrouter [model], --resume [id]) in any order.
        (args (let ((acc raw))
-               (when (and acc (string= (first acc) "--openrouter"))
-                 (let* ((tail (rest acc))
-                        (next (first tail))
-                        ;; OpenRouter model IDs look like 'vendor/model' —
-                        ;; single token, slash inside, no spaces. If the
-                        ;; next arg has spaces it's the task, not a model.
-                        (is-model (and next (find #\/ next)
-                                       (not (find #\Space next)))))
-                   (cond
-                     (is-model (llm:use-openrouter :model next) (setf acc (rest tail)))
-                     (t        (llm:use-openrouter)             (setf acc tail)))))
+               (loop
+                 (cond
+                   ((and acc (string= (first acc) "--openrouter"))
+                    (let* ((tail (rest acc)) (next (first tail))
+                           ;; OpenRouter model IDs look like 'vendor/model' — a
+                           ;; single slashed token. A spaced arg is the task.
+                           (is-model (and next (find #\/ next) (not (find #\Space next)))))
+                      (cond (is-model (llm:use-openrouter :model next) (setf acc (rest tail)))
+                            (t        (llm:use-openrouter)             (setf acc tail)))))
+                   ((and acc (string= (first acc) "--resume"))
+                    (let* ((tail (rest acc)) (next (first tail)))
+                      (cond ((session-id-like next) (setf resume next    acc (rest tail)))
+                            (t                       (setf resume :latest acc tail)))))
+                   (t (return))))
                acc))
        (cmd (first args)))
   (cond
+    ;; --resume alone or with an explicit tui command → resumed interactive TUI
+    ((and resume (or (null cmd) (member cmd '("tui" "shell" "repl") :test #'string-equal)))
+     (run-shell resume))
+    ;; --resume + a task → continue that session with one more (non-interactive) turn
+    (resume (run-resumed-task resume (format nil "~{~A~^ ~}" args)))
     ((null cmd)
      (format t "~&usage:~%")
      (format t "  operandi.lisp -- \"task description\"~%")
-     (format t "  operandi.lisp -- tui        (interactive REPL: streaming, tools, /commands)~%")
+     (format t "  operandi.lisp -- tui              (interactive REPL: streaming, tools, /commands)~%")
+     (format t "  operandi.lisp -- --resume [ID] tui  (resume a saved session; latest if no ID)~%")
      (format t "  operandi.lisp -- --openrouter [MODEL] \"task\"~%")
      (format t "~%--openrouter reads token from ~~/.operandi/openrouter.token.~%")
+     (format t "Sessions are saved under ~~/.operandi/sessions/; --resume continues one.~%")
      (format t "Default backend is a local llama.cpp on http://127.0.0.1:8081.~%"))
     ((member cmd '("tui" "shell" "repl") :test #'string-equal) (run-shell))
     (t (run-once (format nil "~{~A~^ ~}" args)))))

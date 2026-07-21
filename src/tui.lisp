@@ -29,7 +29,8 @@
   (:local-nicknames (#:eng   #:operandi.engine)
                     (#:llm   #:operandi.llm)
                     (#:hooks #:operandi.hooks)
-                    (#:tools #:operandi.tools))
+                    (#:tools #:operandi.tools)
+                    (#:jzon  #:com.inuoe.jzon))
   (:export #:repl #:*color*))
 
 (in-package #:operandi.tui)
@@ -261,9 +262,29 @@
                  (if (listp tcs) (coerce tcs 'vector) tcs))
             (terpri o)))))))
 
+(defun session-json-path (id)
+  (merge-pathnames (format nil "~A.json" id) *sessions-dir*))
+
+(defun session->json (s)
+  "Serialize the session — id, model, totals, and the RAW message history —
+   to JSON. The history is exactly the message list eng:run threads, so
+   resuming re-sends the same context verbatim."
+  (jzon:stringify
+   (llm:ht "id"      (gethash :id s)
+           "model"   (model-label)
+           "backend" (string-downcase (symbol-name llm:*llm-backend*))
+           "turns"   (gethash :turns s)
+           "usage"   (llm:ht "cost" (gethash :cost s)
+                             "prompt" (gethash :prompt-tok s)
+                             "completion" (gethash :completion-tok s)
+                             "cached" (gethash :cached-tok s)
+                             "calls" (gethash :calls s))
+           "history" (coerce (gethash :history s) 'vector))
+   :pretty t))
+
 (defun persist-session (s)
-  "Write the session transcript to its file. Best-effort — never lets an I/O
-   error take down the REPL."
+  "Write the session's human transcript (.md) and machine record (.json, for
+   --resume). Best-effort — never lets an I/O error take down the REPL."
   (handler-case
       (progn
         (ensure-directories-exist *sessions-dir*)
@@ -272,8 +293,51 @@
                            :direction :output :if-exists :supersede
                            :if-does-not-exist :create :external-format :utf-8)
           (write-string (render-session s) o))
+        (with-open-file (o (session-json-path (gethash :id s))
+                           :direction :output :if-exists :supersede
+                           :if-does-not-exist :create :external-format :utf-8)
+          (write-string (session->json s) o))
         t)
     (error () nil)))
+
+(defun list-sessions ()
+  "Saved sessions, newest first: a list of (id turns first-user-prompt)."
+  (let ((files (ignore-errors (directory (merge-pathnames "*.json" *sessions-dir*)))))
+    (loop for f in (sort (copy-list files) #'> :key #'file-write-date)
+          collect (handler-case
+                      (let* ((d (jzon:parse (uiop:read-file-string f)))
+                             (hist (coerce (or (gethash "history" d) #()) 'vector))
+                             (first-user (loop for m across hist
+                                               when (and (hash-table-p m)
+                                                         (equal (gethash "role" m) "user"))
+                                               return (gethash "content" m))))
+                        (list (pathname-name f) (or (gethash "turns" d) 0) (or first-user "")))
+                    (error () (list (pathname-name f) 0 "(unreadable)"))))))
+
+(defun resume-session! (s target)
+  "Load a saved session into hash-table S in place. TARGET is a session id
+   string or :LATEST. Returns the id on success, NIL if not found/unreadable.
+   The resumed session keeps its id, so continuing appends to the same files."
+  (let ((id (if (eq target :latest)
+                (let ((all (list-sessions))) (and all (first (first all))))
+                target)))
+    (when id
+      (handler-case
+          (let* ((path (session-json-path id))
+                 (d (and (probe-file path) (jzon:parse (uiop:read-file-string path)))))
+            (when (hash-table-p d)
+              (let ((u (gethash "usage" d)) (h (gethash "history" d)))
+                (flet ((u@ (k) (or (and (hash-table-p u) (gethash k u)) 0)))
+                  (setf (gethash :id s) id
+                        (gethash :history s) (if (vectorp h) (coerce h 'list) h)
+                        (gethash :turns s) (or (gethash "turns" d) 0)
+                        (gethash :cost s) (float (u@ "cost") 1d0)
+                        (gethash :prompt-tok s) (u@ "prompt")
+                        (gethash :completion-tok s) (u@ "completion")
+                        (gethash :cached-tok s) (u@ "cached")
+                        (gethash :calls s) (u@ "calls")))
+                id)))
+        (error () nil)))))
 
 (defun user-msg (text) (llm:ht "role" "user" "content" text))
 
@@ -331,6 +395,8 @@
   (format t "~&~A~%" (paint "commands:" :bold))
   (dolist (row '(("/help"          "show this help")
                  ("/clear"         "forget the conversation, start fresh")
+                 ("/sessions"      "list saved sessions you can resume")
+                 ("/resume [id]"   "resume a saved session (latest if no id)")
                  ("/cost"          "session cost + token totals")
                  ("/model [id]"    "show or switch model (id like vendor/name → OpenRouter)")
                  ("/system"        "print the active system prompt")
@@ -344,6 +410,25 @@
   (let ((u (session-usage sess)))
     (format t "~&~A over ~A turn~:P — ~A~%"
             (paint "session" :bold) (session-turns sess) (llm:usage-summary u))))
+
+(defun cmd-sessions ()
+  (let ((rows (list-sessions)))
+    (if (null rows)
+        (format t "~&~A~%" (paint "(no saved sessions yet)" :gray))
+        (progn
+          (format t "~&~A~%" (paint "saved sessions (newest first):" :bold))
+          (dolist (r rows)
+            (destructuring-bind (id turns first) r
+              (format t "  ~A  ~A turn~:P  ~A~%"
+                      (paint id :cyan) turns (oneline first 56))))))))
+
+(defun cmd-resume (sess arg)
+  (let ((id (resume-session! sess (or arg :latest))))
+    (if id
+        (format t "~&~A~%"
+                (paint (format nil "— resumed ~A (~A turn~:P) —" id (session-turns sess)) :gray))
+        (format t "~&~A~%"
+                (paint "no such session to resume — try /sessions" :yellow)))))
 
 (defun cmd-model (arg)
   (cond
@@ -387,6 +472,8 @@
        (reset-session! sess)
        (format t "~&~A~%" (paint "— conversation cleared (new session) —" :gray)) t)
       ((string-equal verb "/cost") (cmd-cost sess) t)
+      ((string-equal verb "/sessions") (cmd-sessions) t)
+      ((string-equal verb "/resume") (cmd-resume sess arg) t)
       ((string-equal verb "/model") (cmd-model arg) t)
       ((string-equal verb "/system") (cmd-system sess) t)
       ((string-equal verb "/tools") (cmd-tools) t)
@@ -442,12 +529,29 @@
           (paint (format nil "· session log: ~A~A.md" *sessions-dir* (gethash :id sess))
                  :gray)))
 
-(defun repl (&key (greet t))
+(defun repl (&key (greet t) resume once)
   "Start the interactive operandi REPL. Reads a task per line, runs the
    agent with live streaming + tool rendering, and keeps conversation
-   history across turns until /clear."
-  (try-load-linedit)
+   history across turns until /clear.
+
+   RESUME (a session id string or :LATEST) loads a saved session first, so
+   the conversation continues where it left off. ONCE (a prompt string) runs
+   exactly that one turn — with the resumed context if any — then returns
+   instead of looping; this backs the non-interactive `--resume … \"task\"`."
+  (unless once (try-load-linedit))
   (let ((sess (make-session)))
+    (when resume
+      (let ((id (resume-session! sess resume)))
+        (when (and greet (not once))
+          (format t "~&~A~%"
+                  (paint (if id
+                             (format nil "resumed session ~A — ~A turn~:P"
+                                     id (session-turns sess))
+                             "no prior session to resume; starting fresh")
+                         (if id :br-cyan :yellow))))))
+    (when once
+      (run-turn sess once)
+      (return-from repl nil))
     (when greet (banner sess))
     (loop
       (let ((line (handler-case (read-input (prompt-string sess))

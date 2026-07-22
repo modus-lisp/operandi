@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Fast launcher for the operandi ACP server (agentclientprotocol.com).
+# Editors spawn this per session, so startup speed matters: it runs from a
+# dumped core (operandi preloaded) with the init files skipped — ~60ms vs ~16s.
+# The core is shared with `bin/operandi` and rebuilt when a source file changes.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CORE="$ROOT/operandi.core"
+SBCL="${OPERANDI_SBCL:-sbcl}"
+
+needs_build() {
+  [ ! -f "$CORE" ] && return 0
+  [ -n "$(find "$ROOT/src" "$ROOT/operandi.asd" "$ROOT/bin/operandi-acp.lisp" \
+            -newer "$CORE" 2>/dev/null | head -1)" ]
+}
+if needs_build; then
+  echo "operandi: building core image (one-time, ~20s)…" >&2
+  "$SBCL" --non-interactive \
+    --eval '(require :asdf)' \
+    --eval "(let ((q (merge-pathnames \"quicklisp/setup.lisp\" (user-homedir-pathname)))) (when (probe-file q) (load q)))" \
+    --eval '(funcall (read-from-string "ql:quickload") (list :operandi :linedit) :silent t)' \
+    --eval "(save-lisp-and-die \"$CORE\")" >/dev/null
+fi
+exec "$SBCL" --core "$CORE" --noinform --no-userinit --no-sysinit --non-interactive \
+  --load "$ROOT/bin/operandi-acp.lisp"

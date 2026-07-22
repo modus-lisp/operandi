@@ -23,8 +23,11 @@ src/
   engine.lisp         operandi.engine   — the agent loop (retries, auto-compaction, cost)
   subagent.lisp       operandi.subagent — the Task tool (delegated sub-agents, depth-capped)
   cron.lisp           operandi.cron     — in-image scheduled-task runner (empty by default)
+  session.lisp        operandi.session  — conversation session state + persistence (shared)
   tui.lisp            operandi.tui      — interactive REPL: streaming, tool rendering, /commands
-bin/operandi.lisp     standalone CLI
+  acp.lisp            operandi.acp      — Agent Client Protocol server (drives operandi from editors)
+bin/operandi.lisp     standalone CLI          (fast launcher: bin/operandi)
+bin/operandi-acp.lisp ACP server entry point  (fast launcher: bin/operandi-acp)
 mcp/                  Node MCP server exposing operandi as dispatchable tools + a swarm harness
 ```
 
@@ -109,6 +112,27 @@ on an interactive tty; piped/non-interactive output is plain text.
 ```
 sbcl --non-interactive --load bin/operandi.lisp -- --openrouter deepseek/deepseek-v4-flash tui
 ```
+
+## ACP server (drive operandi from an editor)
+
+operandi speaks the [Agent Client Protocol](https://agentclientprotocol.com) —
+the "LSP for coding agents" — so editors like Zed can drive it in their agent
+panel. It's JSON-RPC 2.0 over stdio: the editor spawns `bin/operandi-acp` and
+exchanges `initialize` / `session/new` / `session/prompt` / `session/cancel`,
+while operandi streams `session/update` notifications back (message chunks, tool
+calls, the plan, usage) and asks the editor for permission before edits/commands
+via `session/request_permission`. Sessions persist and resume (`session/load`).
+
+```jsonc
+// example Zed agent-server entry
+{ "operandi": { "command": "/path/to/operandi/bin/operandi-acp" } }
+```
+
+`bin/operandi-acp` launches from a dumped core (~60 ms). Backend: set
+`OPERANDI_ACP_MODEL` (an OpenRouter model id), else it uses deepseek-v4-flash if
+an OpenRouter token is present, else local llama.cpp. The mapping — operandi's
+streaming/hooks/plan/usage/session seams onto the ACP wire — lives in
+`src/acp.lisp`; `(operandi.acp:serve)` runs it over any stdin/stdout.
 
 ## MCP server
 

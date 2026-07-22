@@ -15,7 +15,7 @@
 
 (defpackage #:session-test
   (:use #:cl)
-  (:local-nicknames (#:tui #:operandi.tui) (#:llm #:operandi.llm)))
+  (:local-nicknames (#:tui #:operandi.tui) (#:session #:operandi.session) (#:llm #:operandi.llm)))
 (in-package #:session-test)
 
 (defvar *fails* 0)
@@ -25,17 +25,17 @@
      (error (e) (incf *fails*) (format t "  ERR  ~A: ~A~%" ,name e))))
 
 ;; isolate all writes to a scratch dir
-(setf (symbol-value (find-symbol "*SESSIONS-DIR*" "OPERANDI.TUI"))
+(setf (symbol-value (find-symbol "*SESSIONS-DIR*" "OPERANDI.SESSION"))
       (namestring (merge-pathnames "operandi-session-test/" (uiop:temporary-directory))))
 (ignore-errors (uiop:delete-directory-tree
-                (pathname (symbol-value (find-symbol "*SESSIONS-DIR*" "OPERANDI.TUI")))
+                (pathname (symbol-value (find-symbol "*SESSIONS-DIR*" "OPERANDI.SESSION")))
                 :validate t :if-does-not-exist :ignore))
 
 (defun mk (&rest kv) (apply #'llm:ht kv))
 (defun sref (s k) (gethash k s))
 
 (format t "~&== session is a redefine-safe hash-table ==~%")
-(let ((s (tui::make-session)))
+(let ((s (session::make-session)))
   (check "make-session returns a hash-table" (hash-table-p s))
   (check "fresh id looks like YYYYMMDD-HHMMSS"
          (let ((id (sref s :id))) (and (= (length id) 15) (char= (char id 8) #\-))))
@@ -43,11 +43,11 @@
          ;; ids are second-resolution; force a difference by stuffing one
          (let ((old (sref s :id)))
            (setf (gethash :id s) "00000000-000000")
-           (tui::reset-session! s)
+           (session::reset-session! s)
            (not (string= (sref s :id) "00000000-000000")))))
 
 (format t "~&== persist -> resume round-trips the raw history ==~%")
-(let ((s (tui::make-session)))
+(let ((s (session::make-session)))
   (setf (gethash :history s)
         (list (mk "role" "system" "content" "SYS")
               (mk "role" "user" "content" "run echo hi")
@@ -59,10 +59,10 @@
               (mk "role" "assistant" "content" "It printed hi."))
         (gethash :turns s) 2 (gethash :cost s) 0.0123d0 (gethash :calls s) 3
         (gethash :prompt-tok s) 500 (gethash :completion-tok s) 20)
-  (check "persist-session writes files" (tui::persist-session s))
+  (check "persist-session writes files" (session::persist-session s))
   (let* ((id (gethash :id s))
-         (r (tui::make-session))
-         (got (tui::resume-session! r id)))
+         (r (session::make-session))
+         (got (session::resume-session! r id)))
     (check "resume returns the id"        (equal got id))
     (check "turns restored"               (= 2 (gethash :turns r)))
     (check "calls restored"               (= 3 (gethash :calls r)))
@@ -82,15 +82,15 @@
                (equal "call_1" (gethash "tool_call_id" (fourth h))))))))
 
 (format t "~&== listing, latest, and graceful misses ==~%")
-(let ((rows (tui::list-sessions)))
+(let ((rows (session::list-sessions)))
   (check "list-sessions finds the saved session" (and rows (>= (length rows) 1)))
   (check "list row is (id turns first-prompt)"
          (and (stringp (first (first rows))) (integerp (second (first rows))))))
-(let ((r (tui::make-session)))
-  (check "resume :latest resolves to newest" (stringp (tui::resume-session! r :latest))))
-(let ((r (tui::make-session)))
+(let ((r (session::make-session)))
+  (check "resume :latest resolves to newest" (stringp (session::resume-session! r :latest))))
+(let ((r (session::make-session)))
   (check "resume of a missing id returns NIL"
-         (null (tui::resume-session! r "19990101-000000"))))
+         (null (session::resume-session! r "19990101-000000"))))
 
 (format t "~&~%session-test: ~A failure~:P~%" *fails*)
 (sb-ext:exit :code (if (zerop *fails*) 0 1))

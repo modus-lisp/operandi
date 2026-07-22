@@ -15,7 +15,7 @@
 (funcall (read-from-string "ql:quickload") :operandi :silent t)
 
 (defpackage #:concurrent-ui-test (:use #:cl)
-  (:local-nicknames (#:tui #:operandi.tui) (#:bt #:bordeaux-threads)))
+  (:local-nicknames (#:tui #:operandi.tui) (#:session #:operandi.session) (#:bt #:bordeaux-threads)))
 (in-package #:concurrent-ui-test)
 
 (defvar *fails* 0)
@@ -49,7 +49,7 @@
 
 (format t "~&== line editor ==~%")
 ;; editor calls ui-repaint -> paint-input -> raw-write; swallow that output.
-(setf (symbol-value (find-symbol "*UI-SESS*" "OPERANDI.TUI")) (tui::make-session))
+(setf (symbol-value (find-symbol "*UI-SESS*" "OPERANDI.TUI")) (session::make-session))
 (setf (symbol-value (find-symbol "*ROWS*" "OPERANDI.TUI")) 40
       (symbol-value (find-symbol "*COLS*" "OPERANDI.TUI")) 100)
 (defmacro with-sink (&body body)
@@ -98,7 +98,7 @@
           (sleep 0.3)))                     ; simulate a turn taking time
   (unwind-protect
       (with-sink
-        (let ((sess (tui::make-session)))
+        (let ((sess (session::make-session)))
           ;; init the worker globals the way repl-concurrent does
           (setf (symbol-value (find-symbol "*UI-SESS*" "OPERANDI.TUI")) sess
                 (symbol-value (find-symbol "*QUEUE*" "OPERANDI.TUI")) nil

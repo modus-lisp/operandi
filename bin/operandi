@@ -39,5 +39,5 @@ fi
 # Launch from the core. --no-userinit/--no-sysinit skips the init files (and
 # thus the whole-home ASDF tree scan); operandi is already in the image, so
 # bin/operandi.lisp's load is a no-op and only the CLI dispatch runs.
-exec "$SBCL" --core "$CORE" --no-userinit --no-sysinit --non-interactive \
+exec "$SBCL" --core "$CORE" --noinform --no-userinit --no-sysinit --non-interactive \
   --load "$ROOT/bin/operandi.lisp" -- "$@"

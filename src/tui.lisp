@@ -31,7 +31,8 @@
                     (#:hooks #:operandi.hooks)
                     (#:tools #:operandi.tools)
                     (#:jzon  #:com.inuoe.jzon)
-                    (#:bt    #:bordeaux-threads))
+                    (#:bt    #:bordeaux-threads)
+                    (#:session #:operandi.session))
   (:export #:repl #:*color*))
 
 (in-package #:operandi.tui)
@@ -186,167 +187,9 @@
     (emit tok)))
 
 ;;; ------------------------------ session -----------------------------
-;;; The session is a plain HASH-TABLE, not a defstruct — on purpose. operandi
-;;; can reload/recompile itself in its own running image (the Eval tool,
-;;; self-improvement), and a live defstruct instance turns "not of type
-;;; SESSION" the instant its defstruct is re-evaluated under a running REPL.
-;;; A hash-table has no such layout coupling; the usage totals are kept as raw
-;;; numbers (not an llm:usage struct) for the same reason. A fresh usage struct
-;;; is built on demand for display, so it always matches the current layout.
-
-(defparameter *sessions-dir*
-  (namestring (merge-pathnames ".operandi/sessions/" (user-homedir-pathname)))
-  "Where each interactive session's transcript is written, updated after every
-   turn (so a crash never loses the log).")
-
-(defun session-id ()
-  (multiple-value-bind (s mi h d mo y) (decode-universal-time (get-universal-time))
-    (format nil "~4,'0D~2,'0D~2,'0D-~2,'0D~2,'0D~2,'0D" y mo d h mi s)))
-
-(defun reset-session! (s)
-  "(Re)initialise session hash-table S with a fresh id and zeroed totals.
-   Used by both make-session and /clear (so /clear starts a new transcript
-   file, preserving the previous one)."
-  (setf (gethash :id s) (session-id)
-        (gethash :history s) nil
-        (gethash :turns s) 0
-        (gethash :cost s) 0d0
-        (gethash :prompt-tok s) 0
-        (gethash :completion-tok s) 0
-        (gethash :cached-tok s) 0
-        (gethash :calls s) 0)
-  s)
-
-(defun make-session () (reset-session! (make-hash-table :test 'eq)))
-
-(defun session-history (s) (gethash :history s))
-(defun (setf session-history) (v s) (setf (gethash :history s) v))
-(defun session-turns (s) (gethash :turns s))
-
-(defun session-add-usage (s u)
-  "Fold one turn's usage (an llm:usage) into the session's raw totals."
-  (when u
-    (incf (gethash :cost s)           (llm:usage-cost-usd u))
-    (incf (gethash :prompt-tok s)     (llm:usage-prompt-tokens u))
-    (incf (gethash :completion-tok s) (llm:usage-completion-tokens u))
-    (incf (gethash :cached-tok s)     (llm:usage-cached-tokens u))
-    (incf (gethash :calls s)          (llm:usage-calls u))))
-
-(defun session-usage (s)
-  "A transient llm:usage built from the session's raw totals — freshly
-   constructed, so it always has the current struct layout."
-  (llm:make-usage :cost-usd (gethash :cost s)
-                  :prompt-tokens (gethash :prompt-tok s)
-                  :completion-tokens (gethash :completion-tok s)
-                  :cached-tokens (gethash :cached-tok s)
-                  :calls (gethash :calls s)))
-
-;;; --- transcript persistence (~/.operandi/sessions/<id>.md) ---
-
-(defun %clip (s max)
-  (let ((s (if (stringp s) s (princ-to-string (or s "")))))
-    (if (> (length s) max)
-        (format nil "~A~%…[~:D more chars]" (subseq s 0 max) (- (length s) max))
-        s)))
-
-(defun render-session (s)
-  "A readable markdown transcript of the whole conversation so far. The system
-   prompt is omitted (large, unchanging); tool results are clipped for
-   readability — the raw record lives in the SQLite tool-call log."
-  (with-output-to-string (o)
-    (format o "# operandi session ~A~%~%- model: ~A~%- turns: ~A~%- ~A~%~%---~%~%"
-            (gethash :id s) (model-label) (gethash :turns s)
-            (llm:usage-summary (session-usage s)))
-    (dolist (m (gethash :history s))
-      (let ((role (gethash "role" m)) (c (gethash "content" m))
-            (tcs (gethash "tool_calls" m)))
-        (unless (string= role "system")
-          (format o "**~A:** ~A~%~%" role (%clip (or (and (stringp c) c) "") 6000))
-          (when (and tcs (or (vectorp tcs) (listp tcs)))
-            (map nil (lambda (tc)
-                       (let ((fn (and (hash-table-p tc) (gethash "function" tc))))
-                         (when (hash-table-p fn)
-                           (format o "    → ~A(~A)~%" (gethash "name" fn)
-                                   (%clip (gethash "arguments" fn) 400)))))
-                 (if (listp tcs) (coerce tcs 'vector) tcs))
-            (terpri o)))))))
-
-(defun session-json-path (id)
-  (merge-pathnames (format nil "~A.json" id) *sessions-dir*))
-
-(defun session->json (s)
-  "Serialize the session — id, model, totals, and the RAW message history —
-   to JSON. The history is exactly the message list eng:run threads, so
-   resuming re-sends the same context verbatim."
-  (jzon:stringify
-   (llm:ht "id"      (gethash :id s)
-           "model"   (model-label)
-           "backend" (string-downcase (symbol-name llm:*llm-backend*))
-           "turns"   (gethash :turns s)
-           "usage"   (llm:ht "cost" (gethash :cost s)
-                             "prompt" (gethash :prompt-tok s)
-                             "completion" (gethash :completion-tok s)
-                             "cached" (gethash :cached-tok s)
-                             "calls" (gethash :calls s))
-           "history" (coerce (gethash :history s) 'vector))
-   :pretty t))
-
-(defun persist-session (s)
-  "Write the session's human transcript (.md) and machine record (.json, for
-   --resume). Best-effort — never lets an I/O error take down the REPL."
-  (handler-case
-      (progn
-        (ensure-directories-exist *sessions-dir*)
-        (with-open-file (o (merge-pathnames (format nil "~A.md" (gethash :id s))
-                                            *sessions-dir*)
-                           :direction :output :if-exists :supersede
-                           :if-does-not-exist :create :external-format :utf-8)
-          (write-string (render-session s) o))
-        (with-open-file (o (session-json-path (gethash :id s))
-                           :direction :output :if-exists :supersede
-                           :if-does-not-exist :create :external-format :utf-8)
-          (write-string (session->json s) o))
-        t)
-    (error () nil)))
-
-(defun list-sessions ()
-  "Saved sessions, newest first: a list of (id turns first-user-prompt)."
-  (let ((files (ignore-errors (directory (merge-pathnames "*.json" *sessions-dir*)))))
-    (loop for f in (sort (copy-list files) #'> :key #'file-write-date)
-          collect (handler-case
-                      (let* ((d (jzon:parse (uiop:read-file-string f)))
-                             (hist (coerce (or (gethash "history" d) #()) 'vector))
-                             (first-user (loop for m across hist
-                                               when (and (hash-table-p m)
-                                                         (equal (gethash "role" m) "user"))
-                                               return (gethash "content" m))))
-                        (list (pathname-name f) (or (gethash "turns" d) 0) (or first-user "")))
-                    (error () (list (pathname-name f) 0 "(unreadable)"))))))
-
-(defun resume-session! (s target)
-  "Load a saved session into hash-table S in place. TARGET is a session id
-   string or :LATEST. Returns the id on success, NIL if not found/unreadable.
-   The resumed session keeps its id, so continuing appends to the same files."
-  (let ((id (if (eq target :latest)
-                (let ((all (list-sessions))) (and all (first (first all))))
-                target)))
-    (when id
-      (handler-case
-          (let* ((path (session-json-path id))
-                 (d (and (probe-file path) (jzon:parse (uiop:read-file-string path)))))
-            (when (hash-table-p d)
-              (let ((u (gethash "usage" d)) (h (gethash "history" d)))
-                (flet ((u@ (k) (or (and (hash-table-p u) (gethash k u)) 0)))
-                  (setf (gethash :id s) id
-                        (gethash :history s) (if (vectorp h) (coerce h 'list) h)
-                        (gethash :turns s) (or (gethash "turns" d) 0)
-                        (gethash :cost s) (float (u@ "cost") 1d0)
-                        (gethash :prompt-tok s) (u@ "prompt")
-                        (gethash :completion-tok s) (u@ "completion")
-                        (gethash :cached-tok s) (u@ "cached")
-                        (gethash :calls s) (u@ "calls")))
-                id)))
-        (error () nil)))))
+;;; Session state + persistence live in operandi.session (shared with the ACP
+;;; server). The TUI uses it via the `session:` nickname; raw hash-table access
+;;; (gethash :cost/:id/:turns …) is still fine since a session is a hash-table.
 
 (defun user-msg (text) (llm:ht "role" "user" "content" text))
 
@@ -358,7 +201,7 @@
 (defun run-turn (sess prompt)
   "Run one agent turn on PROMPT, streaming to the terminal, threading
    SESS's history and folding usage. Ctrl-C aborts just this turn."
-  (let* ((hist (session-history sess))
+  (let* ((hist (session:session-history sess))
          (messages (if hist (append hist (list (user-msg prompt))) nil))
          (*at-bol* t)
          (*need-bullet* t)
@@ -372,10 +215,10 @@
     (handler-case
         (multiple-value-bind (text hist* iters usage)
             (eng:run prompt :history messages :verbose nil)
-          (setf (session-history sess) hist*)
+          (setf (session:session-history sess) hist*)
           (incf (gethash :turns sess))
-          (session-add-usage sess usage)
-          (persist-session sess)          ; crash-safe: write after every turn
+          (session:session-add-usage sess usage)
+          (session:persist-session sess)          ; crash-safe: write after every turn
           ;; If nothing streamed (non-streaming turn, or a salvaged/synthetic
           ;; answer), or the final text diverged from the stream, print it.
           (let ((streamed (string-right-trim '(#\Space #\Newline)
@@ -416,12 +259,12 @@
   (format t "~&Type anything else to hand it to the agent. Ctrl-C aborts a running turn.~%"))
 
 (defun cmd-cost (sess)
-  (let ((u (session-usage sess)))
+  (let ((u (session:session-usage sess)))
     (format t "~&~A over ~A turn~:P — ~A~%"
-            (paint "session" :bold) (session-turns sess) (llm:usage-summary u))))
+            (paint "session" :bold) (session:session-turns sess) (llm:usage-summary u))))
 
 (defun cmd-sessions ()
-  (let ((rows (list-sessions)))
+  (let ((rows (session:list-sessions)))
     (if (null rows)
         (format t "~&~A~%" (paint "(no saved sessions yet)" :gray))
         (progn
@@ -432,10 +275,10 @@
                       (paint id :cyan) turns (oneline first 56))))))))
 
 (defun cmd-resume (sess arg)
-  (let ((id (resume-session! sess (or arg :latest))))
+  (let ((id (session:resume-session! sess (or arg :latest))))
     (if id
         (format t "~&~A~%"
-                (paint (format nil "— resumed ~A (~A turn~:P) —" id (session-turns sess)) :gray))
+                (paint (format nil "— resumed ~A (~A turn~:P) —" id (session:session-turns sess)) :gray))
         (format t "~&~A~%"
                 (paint "no such session to resume — try /sessions" :yellow)))))
 
@@ -478,7 +321,7 @@
       ((member verb '("/quit" "/exit" "/q") :test #'string-equal) :quit)
       ((string-equal verb "/help") (cmd-help) t)
       ((string-equal verb "/clear")
-       (reset-session! sess)
+       (session:reset-session! sess)
        (format t "~&~A~%" (paint "— conversation cleared (new session) —" :gray)) t)
       ((string-equal verb "/cost") (cmd-cost sess) t)
       ((string-equal verb "/sessions") (cmd-sessions) t)
@@ -788,7 +631,7 @@
                 (paint (format nil "· ~A" (model-label)) :gray)
                 (paint "Type while it works — your line queues as the next message. ^C aborts a turn, ^D quits."
                        :gray)
-                (paint (format nil "· session log: ~A~A.md" *sessions-dir* (gethash :id sess))
+                (paint (format nil "· session log: ~A~A.md" session:*sessions-dir* (gethash :id sess))
                        :gray))))
 
 (defun repl-concurrent (sess &key (greet t) resume resumed)
@@ -805,7 +648,7 @@
         (when resume
           (ui-freshline)
           (emit (paint (if resumed
-                           (format nil "resumed session ~A — ~A turn~:P~%" resumed (session-turns sess))
+                           (format nil "resumed session ~A — ~A turn~:P~%" resumed (session:session-turns sess))
                            (format nil "no prior session to resume; starting fresh~%"))
                        (if resumed :br-cyan :yellow))))
         (setf *worker* (bt:make-thread (lambda () (worker-loop sess)) :name "operandi-turn"))
@@ -849,7 +692,7 @@
           (paint (format nil "· ~A" (model-label)) :gray)
           (paint "Type a task, or /help for commands. Ctrl-C aborts a turn, Ctrl-D quits."
                  :gray)
-          (paint (format nil "· session log: ~A~A.md" *sessions-dir* (gethash :id sess))
+          (paint (format nil "· session log: ~A~A.md" session:*sessions-dir* (gethash :id sess))
                  :gray)))
 
 (defun repl-simple (sess &key (greet t) resume resumed)
@@ -860,7 +703,7 @@
   (when (and greet resume)
     (format t "~&~A~%"
             (paint (if resumed
-                       (format nil "resumed session ~A — ~A turn~:P" resumed (session-turns sess))
+                       (format nil "resumed session ~A — ~A turn~:P" resumed (session:session-turns sess))
                        "no prior session to resume; starting fresh")
                    (if resumed :br-cyan :yellow))))
   (when greet (banner sess))
@@ -886,8 +729,8 @@
    (the non-interactive `--resume … \"task\"` path). On an interactive tty this
    uses the concurrent UI (pinned input, background worker, type-while-working);
    piped/non-tty falls back to the simple synchronous loop."
-  (let* ((sess (make-session))
-         (resumed (when resume (resume-session! sess resume))))
+  (let* ((sess (session:make-session))
+         (resumed (when resume (session:resume-session! sess resume))))
     (cond
       (once (run-turn sess once) nil)
       ((and (stdin-tty-p) (stdout-tty-p))

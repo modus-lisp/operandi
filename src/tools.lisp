@@ -39,6 +39,7 @@
            #:*eval-timeout*
            #:*edit-max-bytes*
            #:*read-max-total-bytes*
+           #:*tool-gate*
            #:define-tool
            #:tool-by-name
            #:tools-as-openai-array
@@ -140,6 +141,14 @@
                                                "parameters" (getf tool :schema))))
      'vector)))
 
+(defvar *tool-gate* nil
+  "Optional permission gate: a function (name args-hash) -> NIL to allow, or a
+   REFUSED string to deny. Consulted after the pre-hook and BEFORE the tool
+   runs; a denial short-circuits the impl and is returned as the tool result
+   (so the model sees why). Lets a front-end (e.g. the ACP server asking the
+   editor via session/request_permission) veto a tool without touching the
+   engine loop. NIL = no gating.")
+
 (defun invoke-tool (name args-hash)
   "Run the tool, calling pre/post hooks. Returns the result string.
    Hook errors are caught and logged to *error-output*; they never
@@ -153,11 +162,16 @@
          err))
       (t
        (hooks:run-pre-hooks name args-hash)
-       (let* ((err nil)
-              (result (handler-case (funcall (getf tool :impl) args-hash)
-                        (error (e)
-                          (setf err e)
-                          (format nil "TOOL ERROR: ~A" e))))
+       (let* ((deny (and *tool-gate*
+                         (let ((d (ignore-errors (funcall *tool-gate* name args-hash))))
+                           (and (stringp d) d))))
+              (err nil)
+              (result (cond
+                        (deny deny)          ; permission refused — don't run the tool
+                        (t (handler-case (funcall (getf tool :impl) args-hash)
+                             (error (e)
+                               (setf err e)
+                               (format nil "TOOL ERROR: ~A" e))))))
               (dur (round (* 1000 (/ (- (get-internal-real-time) start)
                                       internal-time-units-per-second)))))
          (hooks:run-post-hooks name args-hash result err dur)

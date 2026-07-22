@@ -14,7 +14,7 @@
 (funcall (find-symbol "OPEN-STORE" "OPERANDI.STORE"))
 
 (defpackage #:tui-smoke (:use #:cl)
-  (:local-nicknames (#:tui #:operandi.tui) (#:llm #:operandi.llm)
+  (:local-nicknames (#:tui #:operandi.tui) (#:session #:operandi.session) (#:llm #:operandi.llm)
                     (#:hooks #:operandi.hooks)))
 (in-package #:tui-smoke)
 
@@ -38,7 +38,7 @@
     r))
 
 (format t "~&== slash-command dispatch ==~%")
-(let ((sess (tui::make-session)))
+(let ((sess (session::make-session)))
   ;; unknown command is handled (returns non-nil, non-:quit)
   (check "unknown cmd handled"
          (let ((r (capture (lambda () (tui::handle-command "/nope" sess))))) (declare (ignore r)) t))
@@ -48,9 +48,9 @@
   ;; a plain line is NOT a command (returns nil so the repl runs a turn)
   (check "plain line -> nil" (null (tui::handle-command "hello there" sess)))
   ;; /clear wipes history
-  (setf (tui::session-history sess) (list (llm:ht "role" "user" "content" "x")))
+  (setf (session::session-history sess) (list (llm:ht "role" "user" "content" "x")))
   (capture (lambda () (tui::handle-command "/clear" sess)))
-  (check "/clear empties history" (null (tui::session-history sess)))
+  (check "/clear empties history" (null (session::session-history sess)))
   ;; /help, /cost, /tools, /model, /system all produce output & return T
   (check "/help returns T" (eq t (capture-and-return sess "/help")))
   (check "/cost returns T"  (eq t (capture-and-return sess "/cost")))
@@ -95,15 +95,15 @@
     (progn
       (when (probe-file (merge-pathnames ".operandi/openrouter.token" (user-homedir-pathname)))
         (llm:use-openrouter :model "deepseek/deepseek-v4-flash"))
-      (let* ((sess (tui::make-session))
+      (let* ((sess (session::make-session))
              (out (capture (lambda ()
                              (tui::run-turn sess "Use the Bash tool to run exactly: echo operandi-lives . Then tell me the single word it printed.")))))
         (format t "~A~%" out)
         (if (search "operandi-lives" out)
             (format t "  ok   live turn ran a tool and answered~%")
             (format t "  warn live turn produced no expected marker (backend/model dependent)~%"))
-        (check "live turn recorded a turn" (= 1 (tui::session-turns sess)))
-        (check "live turn threaded history" (and (tui::session-history sess) t))))
+        (check "live turn recorded a turn" (= 1 (session::session-turns sess)))
+        (check "live turn threaded history" (and (session::session-history sess) t))))
   (error (e) (format t "  warn live turn skipped: ~A~%" e)))
 
 (format t "~&~%tui-smoke: ~A failure~:P~%" *fails*)

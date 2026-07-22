@@ -370,14 +370,14 @@
         (progn
           (sput sid (list :session sess :cwd cwd :allow nil :active nil :worker nil))
           (replay-history sid sess)
-          +null+)
+          (obj))
         (error "unknown sessionId ~A" sid))))
 
 (defun handle-request (id method params)
   (handler-case
       (cond
         ((string= method "initialize")     (send-response id (h-initialize params)))
-        ((string= method "authenticate")   (send-response id +null+))
+        ((string= method "authenticate")   (send-response id (obj)))
         ((string= method "session/new")    (send-response id (h-session-new params)))
         ((string= method "session/load")   (send-response id (h-session-load params)))
         ((string= method "session/prompt") (start-prompt id params))   ; responds async

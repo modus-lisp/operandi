@@ -1,0 +1,13 @@
+{
+  "name": "operandi-acp-conformance",
+  "private": true,
+  "type": "module",
+  "description": "Validates operandi's ACP server against the official schema (schema.json, v1.20.0) by driving a live session as a compliant client. Refresh schema: gh release download schema-vX --repo zed-industries/agent-client-protocol --pattern schema.json.",
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1"
+  },
+  "scripts": {
+    "test": "node conformance.mjs"
+  }
+}

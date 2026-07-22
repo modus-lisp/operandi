@@ -15,3 +15,6 @@ mcp/node_modules/
 
 # dumped core image (built by bin/operandi)
 /operandi.core
+
+# ACP conformance harness deps
+inspect/acp/node_modules/

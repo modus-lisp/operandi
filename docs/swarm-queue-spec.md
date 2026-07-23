@@ -142,7 +142,7 @@ items/<id>/
   "parent": "weft.forms.valueasnumber",   // null for the seed
   "group": "weft.forms.valueasnumber",     // sibling variants → reduce keep-best
   "deps": [],                              // item ids that must be `verified` first
-  "repo": "/home/claude/weft",
+  "repo": "/path/to/weft",
   "edit_scope": ["src/script/forms-valueasnumber.lisp"],  // the ONLY files the agent may touch
   "oracle": "cd $WD && ... forms-oracle.lisp ... (run \"valueasnumber\")",
   "success": {"metric": "failed", "goal": 0, "direction": "min"},
@@ -322,5 +322,5 @@ Each verb is a small script/Lisp entrypoint; the item dir is the ABI between the
 *Prototype to read first:* `weft/tools/swarm/forms-{wave,worker,merge}.sh`,
 `forms-wave2.sh` (variants + keep-best), and `weft/inspect/forms-oracle.lisp` (an oracle
 emitting the tally line). The v1 primitives already work — this spec generalizes them
-into a standing agenda. `combat/SWARM.md` has the operating invariants every item must
-still honor. The MCP `operandi_swarm` becomes a thin adapter over this native model.
+into a standing agenda. The host repo's `SWARM.md` carries the operating invariants
+every item must still honor. The MCP `operandi_swarm` becomes a thin adapter over this native model.

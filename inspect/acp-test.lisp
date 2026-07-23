@@ -151,6 +151,32 @@
                (null (acp::acp-gate *sid* "Bash" (llm:ht "command" "make test")))))
     (when orig (setf (fdefinition (find-symbol "CALL-CLIENT" "OPERANDI.ACP")) orig))))
 
+(format t "~&== host systemPrompt is honored (Buzz-compat) ==~%")
+(let ((captured nil)
+      (orig (fdefinition (find-symbol "RUN" "OPERANDI.ENGINE"))))
+  (setf (fdefinition (find-symbol "RUN" "OPERANDI.ENGINE"))
+        (lambda (prompt &key history system verbose &allow-other-keys)
+          (declare (ignore prompt verbose))
+          (setf captured system)
+          (values "ok" (append history (list (llm:ht "role" "assistant" "content" "ok")))
+                  1 (llm:make-usage))))
+  (unwind-protect
+      (progn
+        (acp::handle-message
+         (llm:ht "jsonrpc" "2.0" "id" 20 "method" "session/new"
+                 "params" (llm:ht "cwd" (namestring (uiop:temporary-directory)) "mcpServers" #()
+                                  "systemPrompt" "BUZZ-ENV: reply via the buzz CLI.")))
+        (let ((sid2 (m@ (first (drain)) "result" "sessionId")))
+          (check "systemPrompt stored on the session"
+                 (equal "BUZZ-ENV: reply via the buzz CLI." (getf (acp::sget sid2) :system-prompt)))
+          (acp::run-prompt-turn sid2 21 "hi")
+          (drain)
+          (check "host prompt reaches eng:run :system"
+                 (and (stringp captured) (search "BUZZ-ENV" captured)))
+          (check "combined WITH operandi's own base prompt"
+                 (and (stringp captured) (search "operandi" captured)))))
+    (setf (fdefinition (find-symbol "RUN" "OPERANDI.ENGINE")) orig)))
+
 (format t "~&== session/load replays history ==~%")
 (let ((s2 (session:make-session)))
   (setf (gethash :history s2) (list (llm:ht "role" "user" "content" "earlier question")

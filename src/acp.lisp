@@ -274,6 +274,15 @@
 (defun run-prompt-turn (sid req-id prompt-text)
   (let* ((p (sget sid))
          (sess (getf p :session))
+         (host-sys (getf p :system-prompt))
+         ;; A host (e.g. buzz-acp) may pass a `systemPrompt` on session/new to
+         ;; teach the agent its environment. Combine it WITH operandi's own base
+         ;; prompt (keep operandi's discipline; add the host's context) — used
+         ;; only on the first turn; later turns carry the system msg in history.
+         (sys (when (and (stringp host-sys) (plusp (length host-sys)))
+                (format nil "~A~%~%~A"
+                        (funcall (find-symbol "BUILD-SYSTEM-PROMPT" "OPERANDI.ENGINE"))
+                        host-sys)))
          (hist (session:session-history sess))
          (messages (if hist (append hist (list (user-msg prompt-text))) nil))
          (*sid* sid)
@@ -289,7 +298,7 @@
     (unwind-protect
         (let ((r (catch 'acp-cancel
                    (multiple-value-list
-                    (eng:run prompt-text :history messages :verbose nil)))))
+                    (eng:run prompt-text :history messages :system sys :verbose nil)))))
           (setf stop (if (eq r :cancelled) "cancelled" (finish-turn sess messages r))))
       (supdate sid :active nil)
       (supdate sid :worker nil)
@@ -359,7 +368,10 @@
          (sid (gethash :id sess))
          (cwd (and (hash-table-p params) (gethash "cwd" params))))
     (when cwd (ignore-errors (uiop:chdir cwd)))
-    (sput sid (list :session sess :cwd cwd :allow nil :active nil :worker nil))
+    (sput sid (list :session sess :cwd cwd :allow nil :active nil :worker nil
+                    ;; non-standard, honored: hosts like buzz-acp pass a system
+                    ;; prompt here to configure the agent for their environment.
+                    :system-prompt (and (hash-table-p params) (gethash "systemPrompt" params))))
     (obj "sessionId" sid)))
 
 (defun h-session-load (params)
@@ -368,7 +380,8 @@
          (sess (session:make-session)))
     (if (session:resume-session! sess sid)
         (progn
-          (sput sid (list :session sess :cwd cwd :allow nil :active nil :worker nil))
+          (sput sid (list :session sess :cwd cwd :allow nil :active nil :worker nil
+                          :system-prompt (and (hash-table-p params) (gethash "systemPrompt" params))))
           (replay-history sid sess)
           (obj))
         (error "unknown sessionId ~A" sid))))

@@ -1,267 +1,326 @@
-# operandi swarm queue — design spec
+# operandi swarm — design spec
 
-Status: **proposal / pick-up-ready**. Author: ynniv + Claude. Date: 2026-07-22.
+Status: **proposal / pick-up-ready** (v2 — the agenda model). Authors: ynniv +
+Claude. Date: 2026-07-23. Supersedes the v1 "control-plane / factory-line" framing.
 
-## 1. Why
+## 0. The frame: a plan that's *grown, not authored*
 
-We run **swarms**: many operandi agents, each on a cheap model, each filling one
-small isolated unit of a large mechanical job (implement a spec surface, fix a
-class of bugs, port N call-sites), gated by an **objective oracle** so we keep
-only what verifiably works. The pattern is proven — see `combat/SWARM.md` and the
-reference implementation in `weft/tools/swarm/forms-*` (a 6-unit and then a
-12-job wave that landed real WPT test passes).
+We are not building a factory line — a fixed sequence of stations that work flows
+through. We are building **a todo list that a variable number of agents work on**.
 
-Today the runner is `xargs -P <pool>` over a fixed job list. That is fine for a
-dozen jobs in one sitting. It does **not** scale to what we actually want:
+The list starts as **one item: the whole job**. A worker that picks it up rarely
+finishes it; it looks at the item and **grows** it — splits it into sub-items and
+puts them back on the list. Other workers pick those up, grow or close them. The
+list **breathes**: it expands as decomposition outruns completion, then contracts
+as leaves close and roll up, until the root item closes. **The tree of work is
+discovered by doing it, not decreed up front.**
 
-> **A hundred (or more) workers, running unattended, that I never have to babysit.**
-> Tokens cost the same today or tomorrow. *Serial work costs my time; parallel
-> work does not.* Optimize for wall-clock and for zero human-in-the-loop, not for
-> token thrift.
+This is old, load-bearing prior art, not a novelty:
+- **Work-stealing pools** (Cilk, ForkJoinPool, rayon): a shared task pool,
+  fungible workers, tasks that spawn subtasks. That *is* "a variable number of
+  people on a todo list."
+- **Blackboard architecture** (Hearsay-II): a shared blackboard, opportunistic
+  workers contributing wherever they see an opening — **no central controller**;
+  coordination emerges from the shared state. There is no orchestrator to be a
+  bottleneck or a single point of failure. The list coordinates.
+- **Goal-reduction / agenda search** (means-ends, HTN, Prolog): pop a goal; solve
+  it or reduce it to sub-goals; the agenda breathes.
 
-So the goal is a **persistent, resumable, observable work-queue** that turns "a
-swarm" from a one-shot shell command into a standing service you enqueue against
-and walk away from.
+Two consequences fall out, and they are the whole reason to build it this way:
+
+1. **A single agent and a hundred are the same program at different pool sizes.**
+   One worker recursively grows-and-closes the tree serially — that is just a
+   normal agent. Add workers and the identical list runs in parallel. There is no
+   separate "swarm mode." In fact this is **Claude Code turned inside-out**: Claude
+   Code already keeps a todo list it grows and shrinks (`TodoWrite`) and delegates
+   sub-items to subagents. We externalize that list to durable disk and turn the
+   subagents into a fungible pool that pulls from it. Same shape — bigger, and
+   standing.
+
+2. **The rigid parts go only at the irreversibility boundaries.** Claude Code's
+   own lesson (from its docs): *expect the model to be uncertain; make reversibility
+   and inspection deterministic.* Its traditional code isn't a pipeline — it's thin
+   membranes placed exactly where a wrong move can't be undone: read-before-edit,
+   write-requires-read, protected paths never auto-approved, a checkpoint before
+   every prompt with rewind, bounded/backgrounded output. Everything *between* those
+   membranes — which tool, what order, when done, how to decompose — is the model.
+   We copy that placement exactly (§3).
+
+So: **not a factory line, not a wild-LLM party.** A model conductor — distributed
+across a fungible pool with no central orchestrator — running on a substrate that
+makes being wrong cheap and undoable.
+
+## 1. Why (the motivation under the frame)
+
+> A hundred (or more) workers, running unattended, that I never have to babysit.
+> Tokens cost the same today or tomorrow. **Serial work costs my time; parallel
+> work does not.** Optimize for wall-clock and zero-human-in-the-loop, not token
+> thrift.
+
+Today the runner is `xargs -P` over a fixed job list — fine for a dozen jobs in one
+sitting, but it can't be a standing service you seed and walk away from, and its job
+list is authored up front. The agenda model removes the up-front authoring: you seed
+one item and the workers grow the rest.
 
 ### Design values (inherited, non-negotiable)
-- **Local over containers.** Plain processes on our own hosts. No Docker/k8s.
-  Coordination via the filesystem (and optionally a tiny TCP broker), not a cloud
-  queue. (See the operator's "local over containers" preference.)
-- **Isolation is sacred.** Every worker edits only its own repo copy, loads via
-  `CL_SOURCE_REGISTRY (:tree $WD) :ignore-inherited-configuration`, wipes its own
-  fasl cache. A worker must be *unable* to affect canonical or another worker.
-  This is already proven (a corrupted copy aborts compilation with no result
-  line — it cannot fall through to the canonical tree).
-- **Oracle-gated, never vacuous.** A job defines its own success predicate that
-  cannot pass without doing the work. Merge only re-verifies in canonical and
-  **keeps-if-improves**.
-- **Cheap fan + strong gate.** Most workers on a cheap model; a minority of
-  variants on a stronger model as the "good gate." (See "cheap-model scope.")
+- **Grown, not authored.** No up-front carve is required; decomposition is *work*,
+  done by workers, at runtime. (A carve *may* be seeded as a hint — see §8 dedup.)
+- **Determinism only at irreversibility boundaries.** Everything else is the model.
+- **Models over harness rules — in the judgment layer.** How to split, when an
+  item is small enough to just do, whether a review passes where no oracle exists,
+  when to escalate — model judgment; static rules rot. Correctness gates — claim,
+  verify, merge — stay deterministic (§3, §9).
+- **Local over containers.** Plain processes on our own hosts; coordination via the
+  filesystem (optionally a tiny TCP broker). No Docker/k8s/cloud queue.
+- **Isolation is sacred.** A worker can affect *only* its own copy and its own
+  edit-scope — never canonical, never another worker's. Already proven: a corrupted
+  copy aborts compilation with no result line; it cannot fall through to canonical.
+- **Cheap fan + strong gate.** Most workers on a cheap model; a minority of variants
+  on a stronger model as the "good gate."
 
-## 2. What exists to build on (don't re-invent)
+## 2. The model: items that *close* or *grow*
 
-The single-wave primitives already work and should be *extracted*, not rewritten:
+An **item** is a **goal**, not a pipeline stage. A worker that claims an item does
+exactly one of two things:
 
-| Primitive | Where | Keep as |
+- **Close it** — the item is small enough to just do. Carry it out, then **verify**
+  (§3). A closed leaf that passes its oracle is `verified`; it may then be `merged`.
+- **Grow it** — the item is too big or too vague to do in one shot. Split it into
+  child items, put them on the list, and mark this item a **parent** that is `done`
+  only when its children are. Splitting *is the work* here — a model act.
+
+Items form a **tree with dependency edges** (§8): most children of a split are
+independent (parallel), some are ordered (B needs A). An item is **ready** to claim
+only when its dependencies are `verified`.
+
+**Roles are emergent, not fixed stages.** "Implement this surface", "review this
+diff", "merge this group", "figure out how to carve X", "escalate this to a stronger
+model" are all just items — the model, plus the item's shape, decides what kind of
+work an item is. There is no `code → review → merge` assembly line; there is a list,
+and workers that close or grow whatever they pull.
+
+## 3. The membranes: where the traditional code lives
+
+Per §0.2, the deterministic code sits *only* at the list's irreversibility
+boundaries. These are the fixed substrate; everything else is grown.
+
+| Membrane | What it guarantees | CC analog |
 |---|---|---|
-| Per-unit repo copy + fasl wipe | `forms-wave.sh` | `provision(job) -> workdir` |
-| Isolated registry / oracle contract | `forms-worker.sh` | `oracle(job) -> {passed, failed}` |
-| operandi agent loop (Read/Write/Edit/Bash/Eval) | `bin/operandi.lisp` | `agent(job)` step |
-| Diversified variants + keep-best | `forms-wave2.sh` | `plan()` + `reduce()` |
-| Re-verify-in-canonical / keep-if-improves | `forms-merge.sh` | `merge(result)` |
-| Injection-point carve (disjoint self-registering files) | weft `*element-proto-extensions*` | the pattern jobs should target |
+| **Atomic claim** | two workers can never own one item (POSIX `rename`, §6) | tool exec succeeds-or-errors, no negotiation |
+| **Isolation** | a worker touches only its `$WD` + `edit_scope`; canonical is unreachable | read-before-edit; protected paths |
+| **Verify** | a leaf is `verified` **iff its oracle passes** — a model cannot *declare* done | tests as the truth, not model self-report |
+| **Merge** | single-writer to canonical; re-verify-in-canonical, **keep-if-improves**, **reject if it touched outside `edit_scope`** | checkpoint + rewind (reversible); protected paths |
+| **Journal** | the list is durable; a killed worker's item is re-claimable; re-attempt is safe | sessions as JSONL, deterministic resume |
+| **Budget / depth caps** | the breathing must *contract* — bound runaway decomposition and spend | bounded/backgrounded output; timeouts |
 
-The queue is the missing **control plane** around these.
+The single hard rule: **a model's word is never load-bearing at an irreversibility
+boundary.** "I merged it" is not a proof; the oracle re-run in canonical is. This is
+the exact seam Claude Code draws, and it is what makes 100 model-driven workers safe
+against a canonical tree they can't corrupt.
 
-## 3. Job model
+## 4. The item, concretely (the ABI)
 
-A **job** is the atom of work. It is a directory (self-describing, portable):
+An item is a **directory** — self-describing, portable, greppable, crash-surviving.
+The dir is the ABI between every component, so any verb can be reimplemented alone.
 
 ```
-jobs/<job-id>/
-  manifest.json      # everything the worker + merger need (below)
-  task.md            # the natural-language brief handed to the agent
-  status             # pending | claimed | running | done | failed | merged | abandoned
-  lease.json         # {host, pid, heartbeat_ts, deadline_ts}  (present while claimed)
-  result.json        # {passed, failed, oracle_line, artifact_path, tokens, cost_cents, iters}
-  log                # full agent stdout/stderr
-  workdir/           # the isolated repo copy (or a pointer to it; see §6 disk)
+items/<id>/
+  manifest.json    # everything a worker + merger need (below)
+  task.md          # the natural-language goal handed to the agent
+  status           # pending|claimed|running|grown|blocked|verified|merged|failed|abandoned
+  lease.json       # {host, pid, heartbeat_ts, deadline_ts}  (present while claimed)
+  children         # (if grown) newline list of child ids
+  result.json      # {verified, oracle_line, artifact, tokens, cost_cents, iters}
+  log              # full agent stdout/stderr
+  workdir/         # the isolated repo copy (or a pointer; see §7)
 ```
 
 `manifest.json`:
 ```json
 {
   "id": "weft.forms.valueasnumber-a",
-  "group": "weft.forms.valueasnumber",   // sibling variants of the same unit
-  "repo": "/home/claude/weft",           // canonical source to copy
-  "edit_glob": "src/script/forms-valueasnumber.lisp",  // the ONLY file(s) the agent may touch
+  "parent": "weft.forms.valueasnumber",   // null for the seed
+  "group": "weft.forms.valueasnumber",     // sibling variants → reduce keep-best
+  "deps": [],                              // item ids that must be `verified` first
+  "repo": "/home/claude/weft",
+  "edit_scope": ["src/script/forms-valueasnumber.lisp"],  // the ONLY files the agent may touch
   "oracle": "cd $WD && ... forms-oracle.lisp ... (run \"valueasnumber\")",
   "success": {"metric": "failed", "goal": 0, "direction": "min"},
   "model": "deepseek/deepseek-v4-flash",
-  "budget": {"max_iters": 80, "max_cost_cents": 50, "timeout_s": 1500},
+  "budget": {"max_iters": 80, "max_cost_cents": 50, "timeout_s": 1500, "max_depth": 6},
   "merge": {"target": "src/script/forms-valueasnumber.lisp",
             "strategy": "keep-best-of-group | keep-if-improves"},
-  "deps": [],                             // job-ids that must be `merged` first
   "attempt": 1, "max_attempts": 2
 }
 ```
 
-Design notes:
-- **`edit_glob` is enforced**, not trusted: the provisioner can make everything
-  else read-only, or the merger diffs the workdir against the source and rejects
-  any job that touched a file outside `edit_glob` (defense in depth vs. a
-  worker that wanders — cf. the worktree-symlink hazard note).
-- **`group`** ties variants together so `reduce()` can keep-best across a group.
-- **`success`** is a machine-checkable predicate parsed from the oracle's tally
-  line (`UNIT x: P passed, F failed`). Generalize the tally format so any oracle
-  (CSS parser vectors, WPT subtests, test262 slices) emits `PASS=<n> FAIL=<n>`.
+Notes:
+- **`edit_scope` is enforced, not trusted** (§3 merge membrane): the provisioner makes
+  everything else read-only, and the merger rejects any item whose workdir diff touched
+  a file outside `edit_scope` (defense in depth vs. a worker that wanders — cf. the
+  worktree-symlink hazard).
+- **A grown item** carries no `oracle`/`edit_scope` of its own; it's `done` when its
+  `children` are `verified`. Whether the children actually *satisfy* the parent's
+  intent (beyond each passing its own oracle) can be its own **review item** (§9).
+- **`success`** is parsed from the oracle's tally line. Standardize the format so any
+  oracle (CSS vectors, WPT subtests, test262 slices) emits `PASS=<n> FAIL=<n>`.
 
-## 4. Components
+## 5. The pool (fungible workers)
 
-Four small long-lived roles. Each is a plain process; any can run on any host.
-
-### 4.1 `enqueue` (planner / dispatcher)
-- Takes a **plan**: a repo, a carve (list of units), a variant policy (e.g.
-  `a=narrow/cheap, b=extend/cheap, c=full/strong`), budgets. Emits N job dirs
-  into `jobs/` with `status=pending`.
-- Can be re-run to add jobs (loop-until-dry: enqueue a fresh round while any
-  group still has failing oracles and the round budget isn't spent).
-- Pure function of (plan, current results) → new jobs. No side effects beyond
-  writing job dirs.
-
-### 4.2 `worker` (the scaling unit — run 100 of these)
-Daemon loop:
+Elastic `0..N`, stateless beyond the item dir. Each worker daemon:
 ```
 loop:
-  job = claim()                      # atomic; see §5
+  item = claim(next ready)           # atomic; §3, §6
   if none: sleep(jitter); continue
-  provision(job)                     # cp repo -> workdir, wipe fasls, chmod
-  heartbeat_start(job)               # background: touch lease every T seconds
-  run agent(job) with budget         # bin/operandi.lisp --openrouter <model> "<task>"
-  {passed, failed} = oracle(job)     # isolated registry, wiped cache
-  write result.json (+ tokens/cost from operandi's usage summary)
-  status = done (oracle ran) | failed (crash/timeout/over-budget)
-  release(job)
+  provision(item)                    # reflink repo → $WD, wipe fasls, chmod scope
+  heartbeat_start(item)              # background: touch lease every T seconds
+  decision = agent(item)             # run operandi on task.md → CLOSE or GROW
+  if GROW:  write children to items/, status=done-pending-children
+  if CLOSE: {verified} = oracle(item) in isolated registry, wiped cache
+            write result.json; status = verified | failed
+  release(item)                      # roll up: parents whose children all verified → ready to close/merge
 ```
-- Stateless beyond the job dir. Kill -9 at any point → the lease expires → the
-  job is reclaimable. **A dead worker never wedges a job.**
-- Concurrency = number of worker processes. Start them with a supervisor
-  (systemd-less: a `spawn N` script + a respawn loop; note the SBCL
-  `--disable-debugger` gotcha — a background thread's unhandled condition kills
-  the process, so wrap the loop in `handler-case serious-condition` and let the
+- **1 worker = a recursive agent**; **N workers = the same, parallel.** No swarm mode.
+- **Kill -9 safe:** the lease expires → the item is re-claimable. A dead worker never
+  wedges an item.
+- Concurrency = number of worker processes; supervise with a `spawn N` + respawn loop.
+  Mind the SBCL `--disable-debugger` gotcha (a background thread's unhandled condition
+  kills the process — wrap the loop in `handler-case serious-condition`, let the
   supervisor respawn).
-- Per-host worker count is bounded by **RAM** (each oracle load is a fresh SBCL,
-  ~0.5–1 GB peak) and **cores**, not by the queue. The queue just hands out work.
+- **Start each worker/oracle from the dumped core** (`bin/operandi`, ~60 ms) not a cold
+  `sbcl --load` — with the local-projects registry fix that's the difference between a
+  ~16 s and a ~0.3 s floor per invocation, which dominates cost at 100× × iterations.
+- Per-host count is bounded by **RAM** (each oracle load is a fresh SBCL, ~0.5–1 GB peak)
+  and **cores**, not by the queue.
 
-### 4.3 `reap` (supervisor / lease manager)
-- Scans `running/` leases; any whose `heartbeat_ts` is older than `2×interval`
-  or past `deadline_ts` is **requeued** (`status=pending`, `attempt++`) up to
-  `max_attempts`, else `abandoned`.
-- Enforces global caps the workers can't see individually: total concurrency,
-  **per-model rate limits / spend ceiling** (stop claiming new jobs when the
-  running token budget for the day is exhausted — mirror the "+500k" budget
-  ceiling idea).
+## 6. Coordination substrate
 
-### 4.4 `merge` (the only thing that touches canonical — single-writer)
-- Watches for `status=done`. For a group with `keep-best-of-group`, waits until
-  the group is complete (or a quorum), picks the lowest-`failed` variant.
-- **Re-verifies in canonical**: copy the winning file(s) into the real repo,
-  run the oracle against canonical, keep only if `failed` did not regress; else
-  revert. (Exactly `forms-merge.sh`, generalized.)
-- Commits kept results (one commit per group, oracle deltas in the message),
-  using the repo's convention. Runs **serially** — canonical has one writer, so
-  merges never race even with 100 workers.
-- Because jobs target **disjoint injection points** (the self-registering-file
-  pattern), merges are conflict-free by construction. If a plan can't be carved
-  into disjoint files, that's a planning bug, not a merge problem.
+**A. Filesystem (default, zero-dep, local-first).** Claim = **atomic rename**
+(`mv items/<id> running/<host>-<pid>/<id>`; the winner is whoever's rename succeeds,
+everyone else gets ENOENT). State is directories: `items/ running/ verified/ merged/
+failed/`. `ls` is the dashboard, `grep` the query engine; survives reboots and session
+ends. Across hosts over a shared FS if rename is atomic there, else an
+`O_CREAT|O_EXCL` lease file per item.
 
-## 5. Coordination substrate
+**B. Tiny TCP broker (when multi-host FS coordination gets painful).** A single-file
+SBCL broker over `conch` (localhost + LAN) exposing `claim/heartbeat/complete`; the
+item *dir* still holds the payload, the broker only arbitrates claims. Reuse
+`natrium`/`conch` — no redis, consistent with local-over-containers.
 
-Two options; **start with A**, design so B is a drop-in.
+Not Docker, k8s, Celery, or a cloud queue. The point is our boxes, our tools.
 
-**A. Filesystem queue (default, zero-dep, local-first).**
-- Claim = **atomic rename**: `mv jobs/<id> running/<host>-<pid>/<id>` (POSIX
-  rename is atomic within a filesystem; the winner is whoever's rename
-  succeeds — everyone else gets ENOENT and moves on). No lockfiles, no daemon.
-- Works across hosts over a shared FS (NFS/9p) *if* rename is atomic there;
-  otherwise use the `O_CREAT|O_EXCL` lease-file trick per job.
-- State is just directories: `jobs/ running/ done/ failed/ merged/`. `ls` is your
-  dashboard. `grep` is your query engine. Survives reboots and session ends.
+## 7. Disk at 100 workers (the real scaling wall)
 
-**B. Tiny TCP broker (when multi-host FS coordination gets painful).**
-- A single-file SBCL/`conch`-served broker exposing `claim/heartbeat/complete`
-  over localhost + LAN. Same job model; the job *dir* still holds the payload,
-  the broker only arbitrates claims. Reuse `natrium`/`conch` — no redis, no
-  external broker, consistent with local-over-containers.
+100 × a repo copy is the actual constraint, not CPU or the queue (`weft` ≈ 105 MB →
+~10 GB naive, plus fasl caches). Cheapest first:
+1. **`cp --reflink=auto`** on a CoW fs (btrfs/xfs) — copies ~free until written; a
+   worker only diverges by the one file it edits. **Preferred; confirm CoW on the
+   target hosts first — it decides everything else here.**
+2. **`git worktree`** per item — but heed the worktree-symlink hazard (a worker may
+   symlink a gitignored data dir and a later merge clobbers the parent): forbid
+   symlinks, absolute paths, `git show --stat` before any merge.
+3. **overlayfs** (shared RO lower + per-worker upper) — fast, needs mount privileges.
+4. Shared RO base + only `edit_scope` files copied writable, layered by the registry.
 
-Do **not** reach for Docker, k8s, Celery, or a cloud queue. The whole point is
-that this runs on our boxes with tools we already own.
+Cap fasl-cache disk (one wiped `XDG_CACHE_HOME` per worker); GC `verified/merged`
+workdirs on a retention timer (keep `result.json` + `log`, drop `workdir/`).
 
-## 6. Disk at 100 workers (the real scaling wall)
+## 8. The hard parts (where "handwavy" gets pinned)
 
-100 × a full repo copy is the actual constraint, not CPU or the queue.
-`weft` ≈ 105 MB → 100 copies ≈ **10 GB** *if copied naively*, plus fasl caches.
-Options, cheapest first:
+- **Dependencies.** Splits aren't always independent. The grower declares `deps`; an
+  item is claimable only when its deps are `verified` (deterministic readiness). This
+  is the one place it's a tree *with edges*, not a flat list.
+- **Termination / convergence.** The breathing must contract. Bound it: `max_depth`
+  and `max_cost` caps (deterministic), plus an **escalation ladder** — a cheap model
+  that fails to close a leaf N times re-items it on a stronger model; if that fails,
+  `needs-human`. Runaway decomposition (a grower that keeps splitting) is caught by the
+  depth cap.
+- **Disjointness for merge.** Two leaves editing the same file conflict. The split
+  should carve **disjoint injection points** (the weft self-registering-file pattern);
+  where it can't, the parent adds a `dep` to serialize them. The model carves; the
+  merge membrane rejects violations. Conflict-free by construction when carved right,
+  caught deterministically when not.
+- **Redundancy.** Two growers might produce near-duplicate sub-trees. Claiming prevents
+  double-*owning* an item, but not overlapping *decomposition* — so either only one
+  worker owns splitting a given item (claim the split), or a `dedup` review item folds
+  siblings. Seeding a rough carve as a hint (§1) reduces this.
+- **Non-determinism is a feature, not a bug.** Re-running a leaf yields a *different*
+  diff — so `keep-best-of-N` (spawn N variant leaves in a `group`, reduce to the
+  lowest-`failed`) instead of Spark-style deterministic recompute. The oracle is the
+  acceptance test; retry is the fault model.
 
-1. **`cp --reflink=auto`** on a CoW filesystem (btrfs/xfs) — copies are ~free
-   until written; a worker only diverges by the one file it edits. **Preferred.**
-2. **`git worktree`** per job off a shared object store — but heed the
-   worktree-symlink hazard (a worker may symlink a gitignored data dir and a
-   later merge clobbers the parent): forbid symlinks, give absolute paths,
-   `git show --stat` before any merge.
-3. **overlayfs** — shared read-only lower (canonical) + per-worker upper. Fast,
-   but needs mount privileges; keep as a fallback.
-4. Shared **read-only base** + only the `edit_glob` files copied writable, with a
-   registry that layers the writable file over the base tree. Most complex; only
-   if 1–3 are unavailable.
+## 9. Verify vs. judge (models where there's no oracle)
 
-Also: cap total fasl-cache disk (one `XDG_CACHE_HOME` per worker, wiped between
-jobs), and GC `done/merged` workdirs on a retention timer (keep `result.json` +
-`log`, drop `workdir/`).
+Not every item has an objective oracle (a diff can pass tests and still be wrong in
+intent, style, or side-effects tests don't cover). So a **review is just an item**,
+and the grower picks a policy per surface:
+- **oracle-only** — a `verify` item re-runs the oracle (deterministic; the default
+  where a good oracle exists).
+- **judge-only** — a `review` item is a model judgment (used where no oracle can
+  decide; its verdict gates the parent).
+- **oracle-then-judge** — the oracle gates *correctness*, a model judges the rest.
 
-## 7. Observability & cost
+This is where "models over rules" and "determinism at the boundary" coexist without a
+global choice: they're the same job machinery, composed per surface by the model that
+grew the item.
 
-- **`status` command**: counts by state, per-group best-so-far, live worker
-  count, oracle-pass trend, **cumulative tokens + cost** (operandi already prints
-  `[N iters, C¢, prompt/completion tok]` — capture it into `result.json`).
-- One **log per job**; a `tail`-able global event stream (each state transition
-  is one line) suitable for the Monitor pattern (emit on `done|failed|merged`).
-- **Budget ceiling**: a per-day / per-plan spend cap in `reap`; when hit, stop
-  claiming (running jobs finish). Report what was left un-run — never silently
-  truncate coverage.
+## 10. Observability, cost, failure semantics
 
-## 8. Failure semantics (must-haves)
+- **The list *is* the dashboard.** `status` counts by state; the tree's growth then
+  shrinkage is the progress bar. Per-group best-so-far, live worker count, oracle-pass
+  trend, **cumulative tokens + cost** (operandi already prints `[N iters, C¢, tok]` →
+  capture into `result.json`). A `tail`-able event stream (one line per state
+  transition) suits the Monitor pattern.
+- **Budget ceiling** in the reaper: a per-day / per-plan spend cap; when hit, stop
+  *claiming* (running items finish) and **report what was left un-grown — never
+  silently truncate coverage.**
+- **Failure semantics (must-haves):** worker dies → lease expires → item re-queued
+  (bounded attempts), never wedged. Leaf un-closeable → escalation ladder (§8).
+  Merge would regress canonical → revert, mark `needs-human`, keep the artifact.
+  Everything **resumable**: relaunching any worker/reaper/merger picks up from the
+  on-disk list; no in-memory-only progress.
 
-- Worker dies → lease expires → job requeued (bounded attempts). No wedge.
-- Oracle can't pass (feature genuinely beyond the cheap model) → job `done` with
-  `failed>0`; `reduce()` keeps the best variant; planner may escalate the group
-  to a stronger model on the next round (auto-tiering).
-- Merge would regress canonical → revert, mark the group `needs-human`, keep the
-  artifact for inspection. Canonical is never left broken.
-- Everything is **resumable**: relaunching `worker`/`reap`/`merge` after a crash
-  picks up from the on-disk state. No in-memory-only progress.
-
-## 9. Interfaces (target CLI)
+## 11. Interfaces (target CLI)
 
 ```
-operandi-swarm enqueue --plan plan.json          # write jobs/
-operandi-swarm worker  --host $(hostname) [--models flash,pro] [--max-ram 0.7]
-operandi-swarm reap    [--lease-timeout 300 --budget-cents 20000]
-operandi-swarm merge   --repo /home/claude/weft [--commit]
-operandi-swarm status  [--group weft.forms.*] [--watch]
-operandi-swarm spawn   --workers 100             # convenience: fork N supervised workers
+operandi-swarm seed   --repo R --goal task.md [--carve hint.json]   # write items/<root>
+operandi-swarm worker --host $(hostname) [--models flash,pro] [--max-ram 0.7]
+operandi-swarm reap   [--lease-timeout 300 --budget-cents 20000]
+operandi-swarm merge  --repo R [--commit]                            # the single-writer membrane
+operandi-swarm status [--tree | --group weft.forms.* | --watch]
+operandi-swarm spawn  --workers 100                                  # fork N supervised workers
 ```
-`plan.json` is the carve + variant policy; `enqueue` expands it into jobs. Keep
-each verb a small script/Lisp entrypoint; the job dir is the ABI between them, so
-verbs can be reimplemented independently.
+`seed` writes the root item (optionally with a carve hint); everything else is grown.
+Each verb is a small script/Lisp entrypoint; the item dir is the ABI between them.
 
-## 10. Milestones
+## 12. Milestones
 
-1. **Extract** `provision/oracle/agent/merge` from `weft/tools/swarm/forms-*`
-   into reusable operandi entrypoints; keep the forms wave working through them
-   (regression guard).
-2. **Filesystem queue + worker daemon + reap** (§4.2–4.3, substrate A). Re-run
-   the 12-job forms wave through the queue; identical results, now crash-safe.
-3. **`spawn 100` + disk strategy** (§6 option 1). Prove 100 workers on one host
-   against a large carve (e.g. a test262 or WPT subtree) without OOM/disk blowup.
-4. **Planner auto-tiering + loop-until-dry** (§4.1, §8). Enqueue rounds until
-   groups converge or budget caps out.
-5. **`status --watch` dashboard + cost accounting** (§7).
+1. **The item ABI + a close/grow worker + claim + oracle, single-worker.** Port the
+   forms wave: seed one root "make the forms surface pass", let one worker grow it into
+   the six unit leaves and close them. Identical results to `forms-wave.sh`, now
+   grown-not-authored. Regression guard.
+2. **The pool + reap + a durable list** (§5–6, substrate A). Re-run the forms wave with
+   N workers; identical results, now crash-safe and resumable.
+3. **`spawn 100` + disk strategy** (§7 option 1). Prove 100 workers on one host against a
+   large carve (a test262 or WPT subtree) without OOM/disk blowup.
+4. **Grown decomposition + escalation ladder + keep-best** (§2, §8, §9). The seed→tree
+   base case; auto-tiering; `keep-best-of-N`; review items where no oracle exists.
+5. **`status --tree --watch` + cost accounting** (§10).
 6. **(Optional) TCP broker** for multi-host (substrate B), reusing conch.
 
-## 11. Open decisions for the implementer
+## 13. Open decisions for the implementer
 
-- CoW filesystem availability on the target hosts (picks the §6 strategy).
-- Single-host-100 vs. multi-host-fan first? (Multi-host needs substrate B sooner.)
+- CoW filesystem availability on the target hosts (picks §7).
+- Single-host-100 vs. multi-host-fan first (multi-host needs substrate B sooner).
+- How aggressively to seed a carve hint vs. let workers grow from the monolith (start
+  with a light hint to cut early redundancy; lean on pure growth as it proves out).
 - Merge cadence: per-group-complete vs. streaming keep-if-improves.
-- How much planning is static (carve up front) vs. reactive (planner consumes
-  results and emits follow-ups) — start static, add reactive in milestone 4.
-- Where canonical commits land (direct-to-branch vs. an integration branch the
-  human reviews) — default to a per-plan integration branch once volume is high.
+- Where canonical commits land (direct-to-branch vs. a per-plan integration branch a
+  human reviews) — default to an integration branch once volume is high.
 
 ---
 *Prototype to read first:* `weft/tools/swarm/forms-{wave,worker,merge}.sh`,
-`weft/tools/swarm/forms-wave2.sh` (variants + keep-best), and
-`weft/inspect/forms-oracle.lisp` (an oracle emitting the tally line). The queue
-generalizes exactly these into a standing service. `combat/SWARM.md` has the
-operating invariants every job must still honor.
+`forms-wave2.sh` (variants + keep-best), and `weft/inspect/forms-oracle.lisp` (an oracle
+emitting the tally line). The v1 primitives already work — this spec generalizes them
+into a standing agenda. `combat/SWARM.md` has the operating invariants every item must
+still honor. The MCP `operandi_swarm` becomes a thin adapter over this native model.

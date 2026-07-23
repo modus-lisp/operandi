@@ -22,3 +22,14 @@ Three independent layers, weakest→strongest:
 
 Refresh the vendored schema:
 `gh release download schema-vX --repo zed-industries/agent-client-protocol --pattern schema.json`
+
+## Running operandi inside Buzz
+
+`buzz-agent.md` — a runbook for plugging operandi into a
+[Buzz](https://github.com/block/buzz) community (a Nostr-native agent
+workspace) as its ACP agent (`BUZZ_ACP_AGENT_COMMAND=bin/operandi-acp`).
+
+Note: a tool turn both streams output and asks the client for permission
+mid-turn, so the ACP client MUST be async (drain stdout continuously) — real
+hosts (Zed, buzz-acp, Node) are. operandi holds up its end via a dedicated
+output writer thread, so no server producer ever blocks on the stdout pipe.

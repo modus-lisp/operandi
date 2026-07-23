@@ -42,7 +42,17 @@
 
 (defvar *out* nil "Protocol output stream (real stdout). GLOBAL: worker threads write to it.")
 (defvar *log* nil "Where incidental output goes (stderr).")
-(defvar *write-lock* (bt:make-lock "acp-write"))
+;; All output goes through a single writer thread draining a queue. Producers
+;; (the streaming worker, the main loop, the permission gate) ENQUEUE and never
+;; touch the stream — so a slow client filling the stdout pipe can only block the
+;; writer, never a lock-holding producer. Writing under a shared lock instead
+;; deadlocked: the streaming worker blocked mid-write holding the lock, so the
+;; permission request could never be sent and the turn hung.
+(defvar *outq* nil "FIFO of pending output lines (strings).")
+(defvar *outq-lock* (bt:make-lock "acp-outq"))
+(defvar *outq-cv* (bt:make-condition-variable :name "acp-outq"))
+(defvar *writer* nil)
+(defvar *writer-run* nil)
 (defvar *rpc-seq* 0)
 (defvar *rpc-seq-lock* (bt:make-lock "acp-rpc-seq"))
 (defvar *pending* (make-hash-table) "Outbound request id -> reply box.")
@@ -56,10 +66,22 @@
     h))
 
 (defun send-line (message)
-  (bt:with-lock-held (*write-lock*)
-    (write-string (jzon:stringify message) *out*)
-    (write-char #\Newline *out*)
-    (force-output *out*)))
+  "Enqueue MESSAGE for the writer thread. Never blocks on the stream."
+  (let ((s (jzon:stringify message)))
+    (bt:with-lock-held (*outq-lock*)
+      (setf *outq* (nconc *outq* (list s)))
+      (bt:condition-notify *outq-cv*))))
+
+(defun writer-loop ()
+  "The ONE thread that writes to *out*. Blocks only itself on a full pipe."
+  (loop
+    (let ((item (bt:with-lock-held (*outq-lock*)
+                  (loop until (or (not *writer-run*) *outq*)
+                        do (bt:condition-wait *outq-cv* *outq-lock*))
+                  (if *outq* (pop *outq*) :stop))))
+      (when (eq item :stop) (return))
+      (when (stringp item)
+        (write-string item *out*) (write-char #\Newline *out*) (force-output *out*)))))
 
 (defun send-notification (method params)
   (send-line (obj "jsonrpc" "2.0" "method" method "params" params)))
@@ -418,15 +440,21 @@
         *sessions* (make-hash-table :test 'equal)
         *pending* (make-hash-table)
         *rpc-seq* 0 *msg-seq* 0 *tool-seq* 0
-        *tool-ids* (make-hash-table))
-  (let ((*standard-output* *log*))
-    (loop
-      (let ((line (read-line in nil :eof)))
-        (when (eq line :eof) (return))
-        (let ((s (string-trim '(#\Space #\Tab #\Return #\Newline) line)))
-          (when (plusp (length s))
-            (let ((msg (ignore-errors (jzon:parse s))))
-              (if (hash-table-p msg)
-                  (handler-case (handle-message msg)
-                    (error (e) (format *log* "acp: handler error: ~A~%" e)))
-                  (format *log* "acp: unparseable line~%")))))))))
+        *tool-ids* (make-hash-table)
+        *outq* nil *writer-run* t)
+  (setf *writer* (bt:make-thread #'writer-loop :name "acp-writer"))
+  (unwind-protect
+      (let ((*standard-output* *log*))
+        (loop
+          (let ((line (read-line in nil :eof)))
+            (when (eq line :eof) (return))
+            (let ((s (string-trim '(#\Space #\Tab #\Return #\Newline) line)))
+              (when (plusp (length s))
+                (let ((msg (ignore-errors (jzon:parse s))))
+                  (if (hash-table-p msg)
+                      (handler-case (handle-message msg)
+                        (error (e) (format *log* "acp: handler error: ~A~%" e)))
+                      (format *log* "acp: unparseable line~%"))))))))
+    ;; drain + stop the writer
+    (bt:with-lock-held (*outq-lock*) (setf *writer-run* nil) (bt:condition-notify *outq-cv*))
+    (ignore-errors (bt:join-thread *writer*))))

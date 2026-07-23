@@ -29,19 +29,20 @@
 ;; isolate persistence + capture the protocol channel
 (setf (symbol-value (find-symbol "*SESSIONS-DIR*" "OPERANDI.SESSION"))
       (namestring (merge-pathnames "acp-test-sessions/" (uiop:temporary-directory))))
-(setf acp::*out* (make-string-output-stream)
+(setf acp::*out* (make-broadcast-stream)
       acp::*log* (make-broadcast-stream)
       acp::*sessions* (make-hash-table :test 'equal)
       acp::*pending* (make-hash-table)
+      acp::*outq* nil                        ; no writer thread in the oracle
       acp::*rpc-seq* 0 acp::*msg-seq* 0 acp::*tool-seq* 0
       acp::*tool-ids* (make-hash-table))
 
 (defun drain ()
-  "Parse everything written to the wire since the last drain."
-  (let ((s (get-output-stream-string acp::*out*)))
-    (loop for line in (uiop:split-string s :separator '(#\Newline))
-          when (plusp (length (string-trim " " line)))
-          collect (jzon:parse line))))
+  "Parse + clear everything ENQUEUED for the wire since the last drain. (The
+   oracle runs the handlers synchronously without the writer thread, so it reads
+   the output queue directly.)"
+  (prog1 (mapcar (lambda (s) (jzon:parse s)) acp::*outq*)
+    (setf acp::*outq* nil)))
 (defun m@ (m &rest path)
   (dolist (k path m)
     (setf m (cond ((and (integerp k) (vectorp m) (< k (length m))) (aref m k))

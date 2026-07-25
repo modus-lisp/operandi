@@ -39,6 +39,7 @@
            #:*subagent-usage*
            #:*subagents*
            #:*context-token-budget*
+           #:*do-chat-max-tokens*
            #:*tool-result-keep-chars*
            #:*compact-keep-last*
            #:estimate-tokens #:*token-estimator* #:*chars-per-token*

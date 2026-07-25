@@ -28,17 +28,19 @@ just relay                                   # brings up the relay via Docker
 cargo build --release -p buzz-cli -p buzz-acp -p buzz-admin
 export PATH="$PWD/target/release:$PATH"       # `buzz`, `buzz-acp`, `buzz-admin`
 
-# 2. Mint the agent's Nostr identity
-buzz-admin mint-token --name operandi \
-  --scopes "messages:read,messages:write,channels:read"
-# save the printed nsec1... (BUZZ_PRIVATE_KEY) and API token
+# 2. Make the agent's Nostr identity (the keypair IS the identity — there is no
+#    token mint) and grant it relay membership.
+buzz-admin generate-key                        # prints a secp256k1 keypair (nsec/hex)
+buzz-admin add-member <agent-pubkey-hex>       # let the relay accept its posts
 
 # 3. Point the harness at operandi, spawn it
-export BUZZ_PRIVATE_KEY="nsec1..."            # from step 2
+export BUZZ_PRIVATE_KEY="<hex-or-nsec>"        # the key from step 2
 export BUZZ_RELAY_URL="ws://localhost:3000"
 export BUZZ_ACP_AGENT_COMMAND="/abs/path/to/operandi/bin/operandi-acp"
-export BUZZ_ACP_AGENT_ARGS=""                 # operandi-acp takes no args
+export BUZZ_ACP_AGENT_ARGS=""                  # operandi-acp takes no args (buzz default is "acp")
 export OPERANDI_ACP_MODEL="anthropic/claude-sonnet-4-5"   # a capable model (see note)
+# optional: BUZZ_ACP_AGENT_OWNER=<owner-pubkey> + BUZZ_AUTH_TAG=<NIP-OA attestation>
+#           to prove a human authorized this agent.
 buzz-acp
 ```
 

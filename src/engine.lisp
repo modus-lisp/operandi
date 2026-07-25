@@ -393,10 +393,18 @@ another tool or give a final answer.")
 
 (defun ht (&rest pairs) (apply #'llm:ht pairs))
 
-(defparameter *do-chat-max-tokens* 4096
+(defparameter *do-chat-max-tokens* (%env-int "OPERANDI_MAX_TOKENS" 16384)
   "Default max-tokens for each chat call inside the agent loop. Override
-   via DEFPARAMETER or LET when a model (e.g. reasoning-heavy Qwen) needs
-   more headroom for its thinking trace.")
+   via OPERANDI_MAX_TOKENS, DEFPARAMETER, or LET.
+
+   This is a CAP, not an allocation — you pay only for what's emitted — so
+   it should be generous. It used to be 4096, and that silently broke every
+   attempt to write a real source file: the tool_call arguments carrying the
+   file body ran past the cap, the provider returned a TRUNCATED arguments
+   string (while still reporting finish_reason \"tool_calls\"), the JSON
+   failed to parse, and the write no-opped. Reasoning models are worse
+   still — the thinking trace is spent from the same budget before a single
+   argument byte is emitted.")
 
 (defparameter *do-chat-disable-reasoning* nil
   "If T (and backend is OpenRouter), send reasoning.enabled=false in the
@@ -606,6 +614,16 @@ another tool or give a final answer.")
       (and (vectorp choices) (plusp (length choices))
            (gethash "message" (aref choices 0))))))
 
+(defun response-finish-reason (parsed)
+  "The first choice's finish_reason, or NIL. \"length\" means the model was
+   cut off at the output cap — for a reasoning model that can happen before
+   it emits any content or tool call at all, which otherwise reads as a
+   mysterious empty turn."
+  (when (hash-table-p parsed)
+    (let ((choices (gethash "choices" parsed)))
+      (and (vectorp choices) (plusp (length choices))
+           (gethash "finish_reason" (aref choices 0))))))
+
 (defun response-has-error-body-p (parsed)
   "OpenRouter sometimes returns 200 with a body like
    {\"error\":{\"message\":...,\"code\":N}}. Detect that so we can retry."
@@ -663,10 +681,20 @@ another tool or give a final answer.")
     (when (vectorp tcs) (coerce tcs 'list))))
 
 (defun parse-tool-args (tc)
+  "Parse a tool call's arguments. Returns (values args error-string).
+
+   A non-nil second value means the arguments did NOT parse — nearly always
+   because the model ran out of output budget mid-argument and the provider
+   handed back a truncated string (see *DO-CHAT-MAX-TOKENS*). Report that to
+   the model instead of invoking the tool with empty args: a silent no-op
+   looks like success to the agent, which then reasons on top of a write
+   that never happened."
   (let* ((fn (gethash "function" tc))
          (raw (and fn (gethash "arguments" fn))))
-    (handler-case (and raw (jzon:parse raw))
-      (error () (make-hash-table :test 'equal)))))
+    (handler-case (values (and raw (jzon:parse raw)) nil)
+      (error (e)
+        (values (make-hash-table :test 'equal)
+                (format nil "~A chars, ~A" (length (or raw "")) e))))))
 
 (defun tool-call-name (tc)
   (let ((fn (gethash "function" tc)))
@@ -815,10 +843,22 @@ another tool or give a final answer.")
            (loop for tc in tcs
                  for tcid = (gethash "id" tc)
                  for name = (tool-call-name tc)
-                 for args = (parse-tool-args tc)
+                 for (args argerr) = (multiple-value-list (parse-tool-args tc))
                  for over-budget = (and *max-tool-calls*
                                         (>= tool-call-count *max-tool-calls*))
                  for result = (cond
+                                (argerr
+                                 (format nil
+                                         "Your ~A call was NOT executed: its ~
+                                          arguments did not parse (~A). They ~
+                                          were almost certainly cut off by the ~
+                                          output-token limit. Retry with a ~
+                                          smaller payload — write the file in ~
+                                          sections (one Write for the first ~
+                                          chunk, then Edit to append), and keep ~
+                                          any single call under a few hundred ~
+                                          lines."
+                                         name argerr))
                                 (over-budget
                                  (format nil
                                          "Tool budget reached (~A calls). ~
@@ -827,6 +867,10 @@ another tool or give a final answer.")
                                          *max-tool-calls*))
                                 (t (tools:invoke-tool name args)))
                  do (incf tool-call-count)
+                    (when (and argerr verbose)
+                      (format t "~&[operandi] TRUNCATED tool args for ~A (~A); ~
+                                 telling the model to retry smaller~%"
+                              name argerr))
                     (when (and over-budget verbose)
                       (format t "~&[operandi] tool budget exhausted; injecting stop~%"))
                     (setf messages
@@ -840,6 +884,24 @@ another tool or give a final answer.")
            (when verbose (format t "~&[operandi] done after ~A iter~%" n))
            (return (values text messages n
                            (llm:usage-incf (llm:copy-usage usage) *subagent-usage*))))
+          ((equal (response-finish-reason parsed) "length")
+           ;; Not a stall — the model was CUT OFF at the output cap, and on a
+           ;; reasoning model the trace can eat the whole budget before any
+           ;; content appears. Say so and let it try again; counting this as
+           ;; an empty turn would end the run over a budget problem.
+           (when verbose
+             (format t "~&[operandi] turn truncated at the output cap (~A tok); retrying~%"
+                     *do-chat-max-tokens*))
+           (setf messages
+                 (append messages
+                         (list (ht "role" "user" "content"
+                                   (format nil
+                                           "Your last turn was cut off at the ~A-token ~
+                                            output limit before you produced anything ~
+                                            usable. Think less and act: take the single ~
+                                            next step, and keep each tool call's payload ~
+                                            well under that limit."
+                                           *do-chat-max-tokens*))))))
           ((< empty-turns *max-empty-turns*)
            ;; No tool call AND no text — the model stalled (often a
            ;; null-content message). Nudge it back to work instead of

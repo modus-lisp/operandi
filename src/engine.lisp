@@ -48,12 +48,19 @@
 
 (in-package #:operandi.engine)
 
-(defparameter *max-iterations* 80
+(defun %env-int (name default)
+  "DEFAULT unless env var NAME parses as an integer — lets a caller (e.g. a swarm
+   worker driving a large-context frontier model) raise these limits per-run
+   without editing the source: OPERANDI_MAX_ITERS / OPERANDI_CONTEXT_BUDGET."
+  (let ((v (uiop:getenv name)))
+    (or (and v (ignore-errors (parse-integer v :junk-allowed t))) default)))
+
+(defparameter *max-iterations* (%env-int "OPERANDI_MAX_ITERS" 80)
   "Hard cap on the agentic loop. Frontier models doing real analysis
    (e.g. computing correlations across thousands of rows) commonly
    want 30+ tool calls; with auto-compaction keeping context bounded
    the cost is manageable. The model returning text without a tool
-   call exits sooner.")
+   call exits sooner.  Override via OPERANDI_MAX_ITERS.")
 
 (defparameter *chat-retries* 2
   "Number of retries on apparent transient errors (HTTP 5xx, empty
@@ -63,12 +70,15 @@
 (defparameter *chat-retry-sleep* 0.5
   "Initial sleep before retry, in seconds. Doubles per retry.")
 
-(defparameter *context-token-budget* 24000
+(defparameter *context-token-budget* (%env-int "OPERANDI_CONTEXT_BUDGET" 24000)
   "Primary compaction trigger: when the running conversation's estimated
    tokens exceed this, compact. Message count is a poor proxy — a single
    50KB tool result is ~12k tokens, so a few big outputs blow the model's
    window long before any message-count trigger. Set to roughly half the
-   model's context so there's headroom for the reply.")
+   model's context so there's headroom for the reply.  The 24k default suits
+   a small LOCAL model; a large-context frontier worker should raise it
+   (OPERANDI_CONTEXT_BUDGET) — a too-small budget makes an agent THRASH:
+   compaction evicts earlier findings faster than it can act on them.")
 
 (defparameter *compact-keep-last* 14
   "Number of recent messages preserved verbatim during compaction.")

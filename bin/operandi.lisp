@@ -43,24 +43,32 @@
 (defpackage #:operandi-cli
   (:use #:cl)
   (:local-nicknames (#:eng #:operandi.engine)
-                    (#:llm #:operandi.llm)))
+                    (#:llm #:operandi.llm)
+                    (#:tools #:operandi.tools)))
 (in-package #:operandi-cli)
 
-(defun display-run (prompt)
+(defun %csv (s) (and s (mapcar (lambda (x) (string-trim " " x)) (uiop:split-string s :separator ","))))
+(defun %tools-allow (csv) "The tool set for --tools: exactly the named tools." (%csv csv))
+(defun %tools-deny (csv)  "The tool set for --no-tools: the defaults minus the named tools."
+  (let ((deny (%csv csv)))
+    (remove-if (lambda (n) (member n deny :test #'string-equal)) (tools:default-tools))))
+
+(defun display-run (prompt &optional (tool-names (tools:default-tools)))
   "Run PROMPT streaming tokens live to stdout, then print metrics. The
    final answer is reprinted only if it differs from what already streamed
-   (a synthetic '[max-iterations…]' result, or blocking mode)."
+   (a synthetic '[max-iterations…]' result, or blocking mode).  TOOL-NAMES is the
+   available-tools allow-list handed to the agent."
   (let* ((buf (make-string-output-stream))
          (eng:*on-token* (lambda (s) (write-string s buf) (write-string s) (force-output))))
-    (multiple-value-bind (text history iters usage) (eng:run prompt)
+    (multiple-value-bind (text history iters usage) (eng:run prompt :tool-names tool-names)
       (declare (ignore history))
       (let ((streamed (string-right-trim '(#\Space #\Newline) (get-output-stream-string buf))))
         (unless (string= (string-right-trim '(#\Space #\Newline) (or text "")) streamed)
           (format t "~&~A" text)))
       (format t "~&~%[~A iters, ~A]~%" iters (llm:usage-summary usage)))))
 
-(defun run-once (prompt)
-  (handler-case (display-run prompt)
+(defun run-once (prompt &optional (tool-names (tools:default-tools)))
+  (handler-case (display-run prompt tool-names)
     (#+sbcl sb-sys:interactive-interrupt #-sbcl error ()
       (format t "~&interrupted.~%")
       (sb-ext:exit :code 130))))
@@ -87,7 +95,8 @@
 
 (let* ((raw (remove "--" (uiop:command-line-arguments) :test #'string=))
        (resume nil)
-       ;; Strip leading flags (--openrouter [model], --resume [id]) in any order.
+       (tool-names (tools:default-tools))     ; available-tools allow-list (default = all)
+       ;; Strip leading flags (--openrouter [model], --resume [id], --tools/--no-tools) in any order.
        (args (let ((acc raw))
                (loop
                  (cond
@@ -102,6 +111,11 @@
                     (let* ((tail (rest acc)) (next (first tail)))
                       (cond ((session-id-like next) (setf resume next    acc (rest tail)))
                             (t                       (setf resume :latest acc tail)))))
+                   ;; --tools A,B,C  -> ONLY those tools; --no-tools X,Y -> defaults minus X,Y.
+                   ((and acc (string= (first acc) "--tools"))
+                    (setf tool-names (%tools-allow (second acc)) acc (cddr acc)))
+                   ((and acc (string= (first acc) "--no-tools"))
+                    (setf tool-names (%tools-deny (second acc)) acc (cddr acc)))
                    (t (return))))
                acc))
        (cmd (first args)))
@@ -117,11 +131,13 @@
      (format t "  operandi.lisp -- tui              (interactive REPL: streaming, tools, /commands)~%")
      (format t "  operandi.lisp -- --resume [ID] tui  (resume a saved session; latest if no ID)~%")
      (format t "  operandi.lisp -- --openrouter [MODEL] \"task\"~%")
+     (format t "  operandi.lisp -- --tools Read,Write,Edit,Bash,Grep \"task\"   (allow-list)~%")
+     (format t "  operandi.lisp -- --no-tools Fan,Task,Spawn \"task\"           (defaults minus these)~%")
      (format t "~%--openrouter reads token from ~~/.operandi/openrouter.token.~%")
      (format t "Sessions are saved under ~~/.operandi/sessions/; --resume continues one.~%")
      (format t "Default backend is a local llama.cpp on http://127.0.0.1:8081.~%"))
     ((member cmd '("tui" "shell" "repl") :test #'string-equal) (run-shell))
-    (t (run-once (format nil "~{~A~^ ~}" args)))))
+    (t (run-once (format nil "~{~A~^ ~}" args) tool-names))))
 
 ;; Exit cleanly once the command is done. Without this, an invocation that
 ;; lacks --non-interactive (e.g. `sbcl --noinform --load bin/operandi.lisp`)

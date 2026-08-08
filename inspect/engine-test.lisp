@@ -122,6 +122,36 @@
          (null (operandi.engine::msg-text (llm:ht "content" "   ")))
          (string= "x" (operandi.engine::msg-text (llm:ht "content" "x")))))
 
+  ;; --- OpenRouter 200-with-error-body (exhausted grant / refusal) ---
+  ;; The regression: a refused turn came back BLANK while a usage.cost echoed in
+  ;; the body got billed on our side even though OpenRouter charged nothing.
+  (flet ((error-body (msg code &optional cost)
+           (let ((e (llm:ht "error" (llm:ht "message" msg "code" code))))
+             (when cost (setf (gethash "usage" e) (llm:ht "cost" cost "prompt_tokens" 12)))
+             e)))
+    (check "an error-body turn surfaces the provider reason, not a blank"
+      (let ((r (final (error-body "Insufficient credits" 402))))
+        (and (stringp r) (search "Insufficient credits" r))))
+
+    (check "an error-body turn charges NOTHING (no fabricated cost)"
+      (progn
+        (install-mock (list (error-body "Insufficient credits" 402 0.0031d0)))
+        (multiple-value-bind (text history iters usage) (eng:run "task" :verbose nil)
+          (declare (ignore text history iters))
+          (and (typep usage 'llm:usage)
+               (zerop (llm:usage-cost-usd usage))     ; the echoed cost is NOT counted
+               (zerop (llm:usage-calls usage))))))     ; a refused call isn't a real call
+
+    (check "a REAL turn still counts its reported cost (guard didn't over-fire)"
+      (let ((resp (assistant-resp :content "OK")))
+        (setf (gethash "usage" resp) (llm:ht "cost" 0.0020d0 "prompt_tokens" 5))
+        (install-mock (list resp))
+        (multiple-value-bind (text history iters usage) (eng:run "task" :verbose nil)
+          (declare (ignore text history iters))
+          (and (typep usage 'llm:usage)
+               (> (llm:usage-cost-usd usage) 0.0d0)
+               (>= (llm:usage-calls usage) 1))))))
+
   (format t "~&~%~D passed, ~D failed~%" *pass* *fail*)
   (zerop *fail*))
 

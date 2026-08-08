@@ -31,6 +31,7 @@
                     (#:hooks #:operandi.hooks)
                     (#:sf    #:operandi.safefetch))
   (:export #:run
+           #:preflight-model
            #:*max-iterations*
            #:*max-empty-turns*
            #:*prompt-cache*
@@ -524,11 +525,18 @@ another tool or give a final answer.")
 (defstruct sse-state
   (content (make-string-output-stream))
   (tcs (make-hash-table))                ; index -> (list id name args-stream)
-  finish usage)
+  finish usage error)
 
 (defun sse-fold (state evt)
   "Fold one parsed SSE event hash into STATE; fire *ON-TOKEN* for content
    tokens as they arrive."
+  ;; OpenRouter can stream a provider error as a 200 SSE event carrying an
+  ;; {\"error\":{...}} object (e.g. an exhausted grant / 402 in the body).
+  ;; Capture it so sse-finalize surfaces the same 200-with-error-body shape the
+  ;; blocking path produces — otherwise the turn silently finalizes blank while
+  ;; a usage event still bills a few cents.
+  (let ((err (gethash "error" evt)))
+    (when err (setf (sse-state-error state) err)))
   (let ((u (gethash "usage" evt)))
     (when (hash-table-p u) (setf (sse-state-usage state) u)))
   (let* ((ch (gethash "choices" evt))
@@ -558,24 +566,34 @@ another tool or give a final answer.")
 
 (defun sse-finalize (state)
   "Turn accumulated STATE into a parsed response identical in shape to the
-   blocking path: {choices:[{message, finish_reason}], usage?}."
-  (let ((msg (ht "role" "assistant"
-                 "content" (get-output-stream-string (sse-state-content state))))
-        (tcs (sse-state-tcs state)))
-    (when (plusp (hash-table-count tcs))
-      (setf (gethash "tool_calls" msg)
-            (coerce (loop for i in (sort (loop for k being the hash-keys of tcs collect k) #'<)
-                          for e = (gethash i tcs)
-                          collect (ht "id" (or (first e) (format nil "call_~A" i))
-                                      "type" "function"
-                                      "function" (ht "name" (or (second e) "")
-                                                     "arguments" (get-output-stream-string (third e)))))
-                    'vector)))
-    (let ((parsed (ht "choices" (vector (ht "message" msg
-                                            "finish_reason" (sse-state-finish state))))))
-      (when (sse-state-usage state)
-        (setf (gethash "usage" parsed) (sse-state-usage state)))
-      parsed)))
+   blocking path: {choices:[{message, finish_reason}], usage?}. If the stream
+   carried a provider error and produced no content or tool calls, finalize it
+   as a 200-with-error-body ({error, usage?}) — NO choices — so it flows through
+   response-has-error-body-p / do-chat-with-retries instead of masquerading as a
+   blank but 'successful' turn."
+  (let* ((content (get-output-stream-string (sse-state-content state)))
+         (tcs (sse-state-tcs state))
+         (has-tcs (plusp (hash-table-count tcs))))
+    ;; Provider error with nothing usable → surface the error body.
+    (when (and (sse-state-error state) (not has-tcs) (zerop (length content)))
+      (let ((parsed (ht "error" (sse-state-error state))))
+        (when (sse-state-usage state) (setf (gethash "usage" parsed) (sse-state-usage state)))
+        (return-from sse-finalize parsed)))
+    (let ((msg (ht "role" "assistant" "content" content)))
+      (when has-tcs
+        (setf (gethash "tool_calls" msg)
+              (coerce (loop for i in (sort (loop for k being the hash-keys of tcs collect k) #'<)
+                            for e = (gethash i tcs)
+                            collect (ht "id" (or (first e) (format nil "call_~A" i))
+                                        "type" "function"
+                                        "function" (ht "name" (or (second e) "")
+                                                       "arguments" (get-output-stream-string (third e)))))
+                      'vector)))
+      (let ((parsed (ht "choices" (vector (ht "message" msg
+                                              "finish_reason" (sse-state-finish state))))))
+        (when (sse-state-usage state)
+          (setf (gethash "usage" parsed) (sse-state-usage state)))
+        parsed))))
 
 (defun do-chat-stream (messages tools-vec &key (max-tokens *do-chat-max-tokens*)
                                                (temperature 0.0))
@@ -632,6 +650,64 @@ another tool or give a final answer.")
        (gethash "error" parsed)
        (not (gethash "choices" parsed))))
 
+(defun provider-error-text (parsed)
+  "Human-readable text of a 200-with-error-body, e.g.
+   \"[provider error] Insufficient credits (402)\" — so the user sees WHY a turn
+   came back empty instead of a bare blank. NIL if PARSED has no error object."
+  (let ((err (and (hash-table-p parsed) (gethash "error" parsed))))
+    (when err
+      (let* ((msg  (and (hash-table-p err) (gethash "message" err)))
+             (code (and (hash-table-p err) (gethash "code" err))))
+        (format nil "[provider error] ~A~@[ (~A)~]"
+                (if (stringp msg) msg (princ-to-string err))
+                (and code (princ-to-string code)))))))
+
+(defun http-error->parsed (e)
+  "Turn a dex:http-request-failed into an error-body parsed ({error:{message,code}}),
+   preferring the provider's own JSON error message from the response body. So a
+   404/402/401 surfaces its real reason via provider-error-text rather than a bare
+   '[empty response from model]'. Non-retryable 4xx are marked so the loop stops."
+  (let* ((code (ignore-errors (dex:response-status e)))
+         (raw (ignore-errors (dex:response-body e)))
+         (body (cond ((stringp raw) raw)
+                     ((typep raw '(vector (unsigned-byte 8)))
+                      (ignore-errors (sb-ext:octets-to-string raw :external-format :utf-8)))
+                     ;; streaming request (:want-stream t) → body is a stream; slurp it.
+                     ((and raw (streamp raw))
+                      (ignore-errors
+                        (with-output-to-string (o)
+                          (loop for line = (read-line raw nil nil) while line
+                                do (write-line line o)))))
+                     (t nil)))
+         (parsed (and body (ignore-errors (jzon:parse body))))
+         (inner (and (hash-table-p parsed) (gethash "error" parsed)))
+         (msg (cond ((and (hash-table-p inner) (stringp (gethash "message" inner)))
+                     (gethash "message" inner))
+                    ((and (stringp body) (plusp (length body))) (subseq body 0 (min 300 (length body))))
+                    (t (format nil "HTTP ~A" code)))))
+    (llm:ht "error" (llm:ht "message" msg "code" (or code 0)))))
+
+(defun preflight-model (&key (timeout 12))
+  "Startup preflight: confirm the CURRENT backend/model/token can actually serve a
+   request, so a bad model slug / exhausted grant / provider-allowlist miss / a
+   local server that isn't up fails LOUD at launch instead of blank-per-turn.
+   Sends one 1-token, tool-less ping and reads the provider's error reason.
+   Returns (values OK-P REASON). Never signals."
+  (handler-case
+      (let* ((msgs (list (ht "role" "user" "content" "ping")))
+             (parsed (handler-case
+                         (let ((*stream* nil))
+                           (do-chat-blocking msgs #() :max-tokens 1))
+                       (dex:http-request-failed (e) (http-error->parsed e)))))
+        (cond
+          ((response-has-error-body-p parsed)
+           (values nil (or (provider-error-text parsed) "provider returned an error")))
+          ;; A 200 (even empty content) means the model is accepted + usable.
+          ((and (hash-table-p parsed) (gethash "choices" parsed)) (values t nil))
+          (t (values t nil))))              ; couldn't tell → don't block launch
+    (error (e)
+      (values nil (format nil "cannot reach ~A (~A)" llm:*llm-url* (type-of e))))))
+
 (defun do-chat-with-retries (messages tools-vec &key (verbose nil))
   "Wrap do-chat with up to *CHAT-RETRIES* retries on apparent transient
    failures: HTTP errors, OpenRouter 200-with-error-body, or responses
@@ -640,6 +716,16 @@ another tool or give a final answer.")
         (sleep *chat-retry-sleep*))
     (loop
       (let* ((parsed (handler-case (do-chat messages tools-vec)
+                       (dex:http-request-failed (e)
+                         ;; A real HTTP 4xx/5xx (e.g. OpenRouter 404 "No allowed
+                         ;; providers", 402 grant, 401 bad key). dex discards the
+                         ;; body into the condition — recover it as an error-body
+                         ;; parsed so provider-error-text surfaces the REAL reason
+                         ;; instead of a mysterious "[empty response from model]".
+                         (when verbose
+                           (format t "~&[operandi] http ~A (try ~A)~%"
+                                   (ignore-errors (dex:response-status e)) (1+ attempt)))
+                         (http-error->parsed e))
                        (error (e)
                          (when verbose
                            (format t "~&[operandi] http err (try ~A): ~A~%"
@@ -802,8 +888,13 @@ another tool or give a final answer.")
              (text (msg-text msg)))
         ;; Fold this turn's usage (calls/tokens/cost) into the run total, and
         ;; calibrate the token estimator against the prompt_tokens the API
-        ;; just reported for the messages we sent.
-        (llm:fold-usage usage parsed)
+        ;; just reported for the messages we sent. SKIP a 200-with-error-body:
+        ;; OpenRouter echoes a `usage.cost` for the prompt tokens it ingested
+        ;; even when it REFUSES the generation (exhausted grant, etc.) and then
+        ;; bills nothing — folding it fabricates a charge that never happened
+        ;; (the reported-cents / no-actual-charge bug). A refused turn is free.
+        (unless (response-has-error-body-p parsed)
+          (llm:fold-usage usage parsed))
         (let ((u (and (hash-table-p parsed) (gethash "usage" parsed))))
           (when (hash-table-p u)
             (let ((pt (gethash "prompt_tokens" u)))
@@ -823,7 +914,8 @@ another tool or give a final answer.")
                                    (length
                                     (handler-case (jzon:stringify parsed)
                                       (error () (princ-to-string parsed))))))))
-          (return (values "[empty response from model]" messages n
+          (return (values (or (provider-error-text parsed) "[empty response from model]")
+                          messages n
                           (llm:usage-incf (llm:copy-usage usage) *subagent-usage*))))
         ;; Append the assistant turn no matter what — the protocol
         ;; requires it.

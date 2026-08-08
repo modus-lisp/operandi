@@ -87,6 +87,23 @@
       (format t "~&interrupted.~%")
       (sb-ext:exit :code 130))))
 
+(defun preflight-or-die ()
+  "Confirm the configured model/backend can actually serve a request BEFORE
+   entering the loop, so a bad model slug / provider-allowlist miss / unreachable
+   local server fails loud here instead of blank-per-turn. Skippable with
+   OPERANDI_NO_PREFLIGHT=1."
+  (unless (uiop:getenv "OPERANDI_NO_PREFLIGHT")
+    (multiple-value-bind (ok reason) (eng:preflight-model)
+      (unless ok
+        (format *error-output* "~&operandi: cannot use model ~A on ~A:~%  ~A~%~%"
+                (or llm:*llm-model* "(default)")
+                (string-downcase (symbol-name llm:*llm-backend*))
+                reason)
+        (format *error-output*
+                "Fix the model (e.g. --openrouter deepseek/deepseek-v4-flash) or the ~
+                 backend, then retry. Set OPERANDI_NO_PREFLIGHT=1 to skip this check.~%")
+        (sb-ext:exit :code 2)))))
+
 (defun session-id-like (s)
   "True if S looks like a session id (YYYYMMDD-HHMMSS), so `--resume <id>` can
    tell an id apart from a following command/task."
@@ -119,6 +136,8 @@
                    (t (return))))
                acc))
        (cmd (first args)))
+  ;; Preflight the model on any path that will actually run a turn (not bare help).
+  (when (or resume cmd) (preflight-or-die))
   (cond
     ;; --resume alone or with an explicit tui command → resumed interactive TUI
     ((and resume (or (null cmd) (member cmd '("tui" "shell" "repl") :test #'string-equal)))

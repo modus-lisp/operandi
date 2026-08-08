@@ -101,6 +101,38 @@
     (let ((m (eng::extract-message (fold-all (list (content-delta "done") (finish-delta "stop"))))))
       (and (hash-table-p m) (string= (gethash "content" m) "done"))))
 
+  ;; --- OpenRouter 200-with-error-body streamed as an SSE event ---
+  ;; This is the regression: an exhausted-grant / 402 arrives as a data: event
+  ;; carrying {error:{...}}, often alongside a usage chunk. It must NOT finalize
+  ;; as a blank-but-successful turn (which billed cents and returned "").
+  (flet ((error-evt (msg code)
+           (llm:ht "error" (llm:ht "message" msg "code" code))))
+    (check "streamed error with no content finalizes as an error body (no choices)"
+      (let ((parsed (fold-all (list (error-evt "Insufficient credits" 402)))))
+        (and (eng::response-has-error-body-p parsed)
+             (null (gethash "choices" parsed)))))
+
+    (check "extract-message is NIL for a streamed error (no fake blank message)"
+      (null (eng::extract-message
+             (fold-all (list (error-evt "Insufficient credits" 402))))))
+
+    (check "provider-error-text surfaces the real reason + code"
+      (let ((txt (eng::provider-error-text
+                  (fold-all (list (error-evt "Insufficient credits" 402))))))
+        (and (search "Insufficient credits" txt) (search "402" txt))))
+
+    (check "usage on an error event still rides the error body (so cost is attributable)"
+      (let ((parsed (fold-all (list (error-evt "Insufficient credits" 402)
+                                    (usage-delta 50)))))
+        (and (eng::response-has-error-body-p parsed)
+             (= 50 (gethash "prompt_tokens" (gethash "usage" parsed))))))
+
+    (check "a real completion that merely mentions no error still wins over a spurious error field"
+      ;; content present -> normal message, even if a stray error object appeared
+      (let ((m (eng::extract-message
+                (fold-all (list (content-delta "real answer") (error-evt "late warn" 0))))))
+        (and (hash-table-p m) (string= (gethash "content" m) "real answer")))))
+
   (format t "~&~%~D passed, ~D failed~%" *pass* *fail*)
   (zerop *fail*))
 

@@ -37,5 +37,6 @@
      (:file "subagent" :depends-on ("llm" "tools" "engine"))  ; operandi.subagent
      (:file "cron"     :depends-on ("engine"))                ; operandi.cron
      (:file "session"  :depends-on ("llm"))                   ; operandi.session
+     (:file "sessiontree")                                    ; operandi.sessiontree
      (:file "tui"      :depends-on ("engine" "tools" "llm" "hooks" "session"))  ; operandi.tui
      (:file "acp"      :depends-on ("engine" "tools" "llm" "hooks" "session"))))))  ; operandi.acp

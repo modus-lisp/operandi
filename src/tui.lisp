@@ -734,13 +734,12 @@
          (resumed (when resume (session:resume-session! sess resume))))
     (cond
       (once (run-turn sess once) nil)
-      ;; The concurrent UI pins an input line with a scroll region + absolute
-      ;; cursor positioning (ESC7/ESC8, ESC[r). That's fragile on some real
-      ;; terminals — notably phone/SSH clients where `stty size` misreports or
-      ;; DECSC/DECRC don't survive auto-wrap — where it corrupts the banner and
-      ;; streams agent output to an overwritten/off-screen row. OPERANDI_SIMPLE_TUI=1
-      ;; forces the robust line REPL (plain writes, no positioning) on a real tty.
-      ((and (stdin-tty-p) (stdout-tty-p) (not (uiop:getenv "OPERANDI_SIMPLE_TUI")))
+      ;; Default: the robust line REPL (plain writes, no cursor positioning) —
+      ;; correct on every terminal. The concurrent UI (pinned input line via a
+      ;; scroll region + absolute ESC7/ESC8 positioning) gives type-while-working
+      ;; but corrupts output under some terminal/multiplexer combos (e.g. tmux
+      ;; scroll-region + DECSC interactions), so it's OPT-IN via OPERANDI_FANCY_TUI=1.
+      ((and (stdin-tty-p) (stdout-tty-p) (uiop:getenv "OPERANDI_FANCY_TUI"))
        (handler-case (repl-concurrent sess :greet greet :resume resume :resumed resumed)
          (error ()
            (ignore-errors (raw-off))

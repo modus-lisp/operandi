@@ -363,12 +363,13 @@
       (%plain-read prompt)))
 
 (defun prompt-string (sess)
+  ;; PLAIN — no ANSI. This is the linedit/simple-REPL prompt, and linedit both
+  ;; mis-counts prompt width and leaks stray codes (e.g. a literal "2m") when the
+  ;; prompt contains SGR escapes. The concurrent UI uses input-prompt instead.
   (let ((cost (gethash :cost sess)))
-    (format nil "~A~A ~A "
-            (paint (model-label) :green)
-            (if (plusp cost)
-                (paint (format nil " ~,2F¢" (* 100 cost)) :gray) "")
-            (paint "›" :br-cyan))))
+    (format nil "~A~A › "
+            (model-label)
+            (if (plusp cost) (format nil " ~,2F¢" (* 100 cost)) ""))))
 
 ;;; ---------------- concurrent raw-mode UI (interactive tty) ----------------
 ;;; Pins the input on the bottom terminal row (via a scroll region) while agent

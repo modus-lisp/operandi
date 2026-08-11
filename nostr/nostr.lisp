@@ -27,9 +27,9 @@
                     (#:nip59  #:cl-nostr.nip59)
                     (#:bt     #:bordeaux-threads))
   (:export #:*owner-nip05* #:*relays* #:*system-prompt* #:*tool-names* #:*model*
-           #:*key-file* #:*state-file* #:*max-reply-chars*
+           #:*key-file* #:*state-file* #:*max-reply-chars* #:*greeting*
            #:agent-npub #:agent-pubkey #:start #:stop #:running-p #:run-loop
-           #:process-item))
+           #:process-item #:send-dm))
 (in-package #:operandi.nostr)
 
 ;;; ------------------------------- config -------------------------------
@@ -63,6 +63,9 @@ plainly; never fabricate a value to fill a hole."
 (defparameter *state-file*
   (merge-pathnames ".operandi/nostr-agent.state" (user-homedir-pathname)))
 (defparameter *max-reply-chars* 3500)
+(defparameter *greeting* "operandi is online and listening — DM me anytime."
+  "One-line DM sent to the operator on startup when START is called with :greet t,
+   so you know the agent came up.")
 
 ;;; --------------------------- agent identity ---------------------------
 (defvar *agent-kp* nil "the agent's cl-nostr keypair.")
@@ -177,7 +180,7 @@ plainly; never fabricate a value to fill a hole."
       (when item (destructuring-bind (created text) item (process-item created text))))))
 
 ;;; ------------------------------- lifecycle ----------------------------
-(defun start (&key (nip05 *owner-nip05*) (model *model*) (announce t) (publish-meta t))
+(defun start (&key (nip05 *owner-nip05*) (model *model*) (announce t) (publish-meta t) (greet nil))
   "Resolve the operator's NIP-05, connect the relay pool, (optionally) advertise
    our DM relays, and start answering the operator's NIP-17 DMs. Returns after
    wiring up the subscription + worker; use RUN-LOOP to block the process."
@@ -210,7 +213,9 @@ plainly; never fabricate a value to fill a hole."
     (when announce
       (format t "~&[operandi.nostr] live over NIP-17.~%  agent npub: ~A~%  operator:   ~A (~A)~%  relays:     ~{~A~^ ~}~%  model:      ~A~%"
               (agent-npub) nip05 (b32:npub-encode *owner-pubkey*) relays (or model "(caller-configured)"))
-      (force-output)))
+      (force-output))
+    ;; greet the operator so they know it came up (best-effort; never blocks start)
+    (when greet (ignore-errors (send-dm *greeting*))))
   :started)
 
 (defun stop ()

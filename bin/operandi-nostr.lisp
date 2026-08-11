@@ -31,4 +31,7 @@
                     (append *relays* (uiop:split-string extra :separator ","))
                     :test #'equal)))
   (setf *owner-nip05* nip05 *model* model)
-  (run-loop :nip05 nip05 :model model))
+  ;; greet the operator on startup unless OPERANDI_NOSTR_GREET is 0/no/off
+  (let ((greet (let ((g (uiop:getenv "OPERANDI_NOSTR_GREET")))
+                 (not (member g '("0" "no" "off" "false") :test #'equalp)))))
+    (run-loop :nip05 nip05 :model model :greet greet)))

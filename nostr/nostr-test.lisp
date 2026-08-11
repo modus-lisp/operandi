@@ -46,7 +46,7 @@
 (defparameter *owner* (keys:generate-keypair))
 (defparameter *stranger* (keys:generate-keypair))
 (setf (sv "*OWNER-PUBKEY*") (keys:public-hex *owner*)
-      (sv "*WATERMARK*") 1000
+      (sv "*FLOOR*") 1000
       (sv "*QUEUE*") nil
       (sv "*SEEN*") (make-hash-table :test 'equal))
 
@@ -98,10 +98,10 @@
 (check "a STRANGER's DM is rejected (not enqueued)" (= 1 (length (q))))
 
 (format t "~&== stale messages (<= watermark) are skipped ==~%")
-(setf (sv "*WATERMARK*") 9999999999)
+(setf (sv "*FLOOR*") 9999999999)
 (call-na "ON-GIFTWRAP" (wrap-from *owner* "old news") nil)
 (check "a message at/under the watermark is skipped" (= 1 (length (q))))
-(setf (sv "*WATERMARK*") 1000)
+(setf (sv "*FLOOR*") 1000)
 
 (format t "~&== reply round-trips: only the operator can read it, authored by the agent ==~%")
 (destructuring-bind (created text) (first (q))
@@ -115,7 +115,7 @@
            (null (ignore-errors (nip59:unwrap-giftwrap (keys:keypair-secret-key *stranger*) *captured*))))))
 
 (format t "~&== duplicate gift-wrap is processed once ==~%")
-(setf (sv "*QUEUE*") nil (sv "*WATERMARK*") 1000)
+(setf (sv "*QUEUE*") nil (sv "*FLOOR*") 1000)
 (let ((w (wrap-from *owner* "twice?")))
   (call-na "ON-GIFTWRAP" w nil)
   (call-na "ON-GIFTWRAP" w nil)

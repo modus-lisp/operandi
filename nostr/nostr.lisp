@@ -94,8 +94,12 @@ plainly; never fabricate a value to fill a hole."
 ;;; ------------------------------- state --------------------------------
 (defvar *owner-pubkey* nil)
 (defvar *pool* nil)
-(defvar *watermark* 0 "highest RUMOR created_at answered (gift-wrap created_at is
-   randomized, so we watermark on the real inner timestamp).")
+(defvar *floor* 0 "FIXED at startup: skip anything older (the pre-startup backlog /
+   messages from while we were down). Does NOT advance during a session, so
+   out-of-order live gift-wraps aren't skipped — dedup is by event id (*seen*).")
+(defvar *watermark* 0 "highest RUMOR created_at answered; persisted so the next
+   restart's *floor* skips what we already handled. Advances, but is NOT the live
+   admission test (that's *floor* + *seen*).")
 (defvar *seen* (make-hash-table :test 'equal) "processed gift-wrap event ids.")
 (defvar *history* nil "threaded conversation history (engine message list).")
 (defvar *queue* nil) (defvar *qlock* (bt:make-lock "nostr-q")) (defvar *qcv* (bt:make-condition-variable))
@@ -172,21 +176,19 @@ plainly; never fabricate a value to fill a hole."
    message newer than the watermark. Cheap work only; the LLM turn runs on the
    worker thread. Never signals."
   (declare (ignore relay))
-  (handler-case
-      (let ((id (ev:event-id event)))
-        (unless (gethash id *seen*)
-          (multiple-value-bind (text sender created) (nip59:unwrap-giftwrap
-                                                       (keys:keypair-secret-key (ensure-agent-key)) event)
-            (setf (gethash id *seen*) t)
-            (when (and (equal sender *owner-pubkey*)
-                       (integerp created) (> created *watermark*)
-                       (stringp text) (plusp (length (string-trim " " text))))
-              (log-msg "< operator:" text)
-              (bt:with-lock-held (*qlock*)
-                (setf *queue* (nconc *queue* (list (list created text))))
-                (bt:condition-notify *qcv*))))))
-    (serious-condition (e)
-      (format *error-output* "~&[operandi.nostr] unwrap error: ~A~%" e))))
+  (let ((id (ev:event-id event)))
+    (unless (gethash id *seen*)
+      (setf (gethash id *seen*) t)          ; dedup by id — set BEFORE unwrap
+      (multiple-value-bind (text sender created)
+          ;; a wrap we can't decrypt isn't ours (spam / mistargeted #p) — ignore quietly
+          (ignore-errors (nip59:unwrap-giftwrap (keys:keypair-secret-key (ensure-agent-key)) event))
+        (when (and (equal sender *owner-pubkey*)
+                   (integerp created) (> created *floor*)   ; FIXED floor, not advancing watermark
+                   (stringp text) (plusp (length (string-trim " " text))))
+          (log-msg "< operator:" text)
+          (bt:with-lock-held (*qlock*)
+            (setf *queue* (nconc *queue* (list (list created text))))
+            (bt:condition-notify *qcv*)))))))
 
 (defun process-item (created text)
   "Answer one operator message and send the reply; advance the watermark. Never
@@ -230,8 +232,9 @@ plainly; never fabricate a value to fill a hole."
                           :tags (mapcar (lambda (u) (list "relay" u)) relays)))))
     ;; add the operator's advertised DM relays too (so replies reach them)
     (dolist (u (owner-dm-relays)) (ignore-errors (pool:add-relay *pool* u)))
-    (setf *watermark* (or (read-watermark) (- (get-universal-time)
-                                              (encode-universal-time 0 0 0 1 1 1970 0)))
+    (setf *floor* (or (read-watermark)
+                      (- (get-universal-time) (encode-universal-time 0 0 0 1 1 1970 0)))
+          *watermark* *floor*                 ; advances from here; *floor* stays put
           (gethash :init *seen*) t
           *running* t
           *worker* (bt:make-thread #'worker-loop :name "operandi-nostr-worker"))

@@ -144,6 +144,26 @@ different loader with `OPERANDI_ROOT` (default: the repo root above `mcp/`).
 cd mcp && npm install && node server.js
 ```
 
+## Nostr DM agent (optional)
+
+`operandi/nostr` is a separate ASDF system — a headless agent that chats with its
+operator over **Nostr private DMs (NIP-17)**. The operator is identified by a
+**NIP-05** address; only that cryptographically-authenticated key is answered,
+and replies are gift-wrapped so only the operator can read them. It keeps the core
+lean by pulling [cl-nostr](https://github.com/modus-lisp/cl-nostr) only for this
+system.
+
+```
+OPERANDI_NOSTR_NIP05=you@example.com \
+OPERANDI_NOSTR_MODEL=deepseek/deepseek-v4-flash \
+  sbcl --non-interactive --load bin/operandi-nostr.lisp
+```
+
+It prints the agent's `npub` on startup — DM that from any NIP-17 client. Or drive
+it from Lisp: `(asdf:load-system "operandi/nostr")` then
+`(operandi.nostr:run-loop :nip05 "you@example.com")`. Offline oracle:
+`nostr/nostr-test.lisp`.
+
 ## Tests
 
 `inspect/robustness-test.lisp` is the tool-sandbox oracle — it asserts that

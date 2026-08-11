@@ -40,3 +40,16 @@
      (:file "sessiontree")                                    ; operandi.sessiontree
      (:file "tui"      :depends-on ("engine" "tools" "llm" "hooks" "session"))  ; operandi.tui
      (:file "acp"      :depends-on ("engine" "tools" "llm" "hooks" "session"))))))  ; operandi.acp
+
+;;; Optional: a headless agent that chats over Nostr private DMs (NIP-17). Kept a
+;;; SEPARATE system so the core stays dependency-light — this one pulls cl-nostr
+;;; (github.com/modus-lisp/cl-nostr) for the wire mechanics.
+;;;   (asdf:load-system "operandi/nostr")  ; then (operandi.nostr:run-loop :nip05 "you@example.com")
+(asdf:defsystem "operandi/nostr"
+  :description "Headless operandi agent over Nostr NIP-17 private DMs."
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("operandi" "cl-nostr" "bordeaux-threads")
+  :pathname "nostr"
+  :serial t
+  :components ((:file "nostr")))                              ; operandi.nostr

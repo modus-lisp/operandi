@@ -62,6 +62,10 @@ plainly; never fabricate a value to fill a hole."
   (merge-pathnames ".operandi/nostr-agent.key" (user-homedir-pathname)))
 (defparameter *state-file*
   (merge-pathnames ".operandi/nostr-agent.state" (user-homedir-pathname)))
+(defparameter *transcript-file*
+  (merge-pathnames ".operandi/nostr-agent.transcript" (user-homedir-pathname))
+  "Human-readable DM transcript: every inbound operator message and every reply
+   the agent sends, timestamped. NIL disables. Also echoed to stdout (the log).")
 (defparameter *max-reply-chars* 3500)
 (defparameter *greeting* "operandi is online and listening — DM me anytime."
   "One-line DM sent to the operator on startup when START is called with :greet t,
@@ -98,6 +102,22 @@ plainly; never fabricate a value to fill a hole."
 (defvar *running* nil) (defvar *worker* nil)
 (defun running-p () *running*)
 
+(defun log-msg (arrow text)
+  "Append one ARROW-prefixed transcript line (timestamped) to the transcript file
+   and echo it to stdout (captured in the nohup log). ARROW is \"<\" (inbound) or
+   \">\" (reply). Never signals."
+  (ignore-errors
+    (multiple-value-bind (s mi h d mo y) (decode-universal-time (get-universal-time))
+      (let ((line (format nil "~4,'0d-~2,'0d-~2,'0d ~2,'0d:~2,'0d:~2,'0d  ~a ~a"
+                          y mo d h mi s arrow
+                          (substitute #\Space #\Newline text))))
+        (format t "~&~a~%" line) (force-output)
+        (when *transcript-file*
+          (ensure-directories-exist *transcript-file*)
+          (with-open-file (o *transcript-file* :direction :output
+                             :if-exists :append :if-does-not-exist :create :external-format :utf-8)
+            (write-line line o)))))))
+
 (defun read-watermark ()
   (ignore-errors
     (when (probe-file *state-file*)
@@ -121,11 +141,18 @@ plainly; never fabricate a value to fill a hole."
 
 ;;; ------------------------------- brain --------------------------------
 (defun answer (text)
-  "Run one operandi turn on TEXT (threading history), return the reply string."
+  "Run one operandi turn on TEXT (threading history), return the reply string.
+   NOTE: eng:run IGNORES its prompt arg when :history is non-NIL — the caller must
+   append the new user message to the history itself (same as the TUI). Passing
+   *history* alone would drop this message and the model would answer the PREVIOUS
+   turn (the 'Going well! How about you?' bug)."
   (multiple-value-bind (reply hist)
-      (eng:run text :history *history* :system *system-prompt*
-                    :tool-names (or *tool-names* (tools:default-tools))
-                    :verbose nil)
+      (eng:run text
+               :history (when *history*
+                          (append *history* (list (llm:ht "role" "user" "content" text))))
+               :system *system-prompt*
+               :tool-names (or *tool-names* (tools:default-tools))
+               :verbose nil)
     (setf *history* hist)
     (let ((s (string-trim '(#\Space #\Newline #\Return #\Tab) (or reply ""))))
       (when (zerop (length s)) (setf s "(no reply produced)"))
@@ -154,6 +181,7 @@ plainly; never fabricate a value to fill a hole."
             (when (and (equal sender *owner-pubkey*)
                        (integerp created) (> created *watermark*)
                        (stringp text) (plusp (length (string-trim " " text))))
+              (log-msg "< operator:" text)
               (bt:with-lock-held (*qlock*)
                 (setf *queue* (nconc *queue* (list (list created text))))
                 (bt:condition-notify *qcv*))))))
@@ -165,6 +193,7 @@ plainly; never fabricate a value to fill a hole."
    signals (a brain/send failure becomes an apology DM / a logged line)."
   (let ((reply (handler-case (answer text)
                  (serious-condition (e) (format nil "Sorry — I hit an error: ~A" e)))))
+    (log-msg "> operandi:" reply)
     (handler-case (send-dm reply)
       (serious-condition (e)
         (format *error-output* "~&[operandi.nostr] send failed: ~A~%" e)))

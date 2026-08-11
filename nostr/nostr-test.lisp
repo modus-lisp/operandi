@@ -35,7 +35,8 @@
 
 ;; isolate persistence to a scratch dir
 (setf (sv "*KEY-FILE*")   (merge-pathnames "operandi-nostr-key"   (uiop:temporary-directory))
-      (sv "*STATE-FILE*") (merge-pathnames "operandi-nostr-state" (uiop:temporary-directory)))
+      (sv "*STATE-FILE*") (merge-pathnames "operandi-nostr-state" (uiop:temporary-directory))
+      (sv "*TRANSCRIPT-FILE*") nil)   ; don't touch the real transcript during tests
 (ignore-errors (delete-file (sv "*KEY-FILE*")))
 
 ;; identities — let ensure-agent-key MINT + PERSIST the agent (real persistence test)
@@ -48,6 +49,31 @@
       (sv "*WATERMARK*") 1000
       (sv "*QUEUE*") nil
       (sv "*SEEN*") (make-hash-table :test 'equal))
+
+(defun ht (&rest kv) (apply (find-symbol "HT" :operandi.llm) kv))
+
+(format t "~&== answer threads history: turn 2 gets the NEW message + prior context ==~%")
+;; Regression for the 'Going well! How about you?' bug: eng:run IGNORES its prompt
+;; when :history is set, so answer() must fold the new user message into history.
+;; Stub eng:run to capture the messages it's handed, run two turns via REAL answer.
+(let ((caps nil))
+  (setf (sv "*HISTORY*") nil)
+  (setf (fdefinition (find-symbol "RUN" :operandi.engine))
+        (lambda (prompt &key history &allow-other-keys)
+          (push history caps)
+          (values (format nil "ack:~a" prompt)
+                  (append (or history (list (ht "role" "system" "content" "s")
+                                            (ht "role" "user" "content" prompt)))
+                          (list (ht "role" "assistant" "content" "a"))))))
+  (funcall (find-symbol "ANSWER" :operandi.nostr) "first question")
+  (funcall (find-symbol "ANSWER" :operandi.nostr) "second question")
+  (let ((turn2 (first caps)))          ; the :history eng:run got on turn 2
+    (check "turn 2 threads a non-nil history" turn2)
+    (check "turn 2's LAST message IS the new user text (not dropped)"
+           (let ((m (car (last turn2))))
+             (and (equal (gethash "role" m) "user") (equal (gethash "content" m) "second question"))))
+    (check "turn 2 also carries turn 1's user message (context preserved)"
+           (some (lambda (m) (equal (gethash "content" m) "first question")) turn2))))
 
 ;; stub the brain (no LLM) + capture the published reply (no network)
 (defparameter *captured* nil)

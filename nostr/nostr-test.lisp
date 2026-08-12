@@ -77,8 +77,10 @@
 
 ;; stub the brain (no LLM) + capture the published reply (no network)
 (defparameter *captured* nil)
+(defparameter *captured-list* nil)
 (setf (fdefinition (find-symbol "ANSWER" :operandi.nostr)) (lambda (text) (format nil "echo: ~a" text)))
-(setf (fdefinition 'pool:pool-publish) (lambda (p e &rest r) (declare (ignore p r)) (setf *captured* e)))
+(setf (fdefinition 'pool:pool-publish)
+      (lambda (p e &rest r) (declare (ignore p r)) (push e *captured-list*) (setf *captured* e)))
 
 (defun q () (sv "*QUEUE*"))
 (defun wrap-from (kp text) (nip59:build-giftwrap (keys:keypair-secret-key kp) (keys:public-hex *agent*) text))
@@ -113,6 +115,29 @@
       (check "reply is authenticated as the AGENT" (equal sender (keys:public-hex *agent*))))
     (check "a stranger CANNOT unwrap the reply"
            (null (ignore-errors (nip59:unwrap-giftwrap (keys:keypair-secret-key *stranger*) *captured*))))))
+
+(format t "~&== a long reply is SPLIT into ordered, numbered DMs (not truncated) ==~%")
+(let* ((long (with-output-to-string (o)
+               (dotimes (i 50) (format o "Paragraph ~a with several words to fill some space.~%~%" i))))
+       (chunks (na:split-text long 200)))
+  (check "split-text respects the max size" (every (lambda (c) (<= (length c) 200)) chunks))
+  (check "split-text drops no non-whitespace content"
+         (flet ((nw (s) (remove-if (lambda (c) (member c '(#\Space #\Newline #\Return #\Tab))) s)))
+           (string= (nw long) (nw (apply #'concatenate 'string chunks)))))
+  (check "split-text never cuts mid-word (chunks end at a boundary)"
+         (every (lambda (c) (let ((n (length c))) (or (< n 200)
+                                                      (member (char c (1- n)) '(#\. #\Space)))))
+                (butlast chunks)))
+  ;; send a long reply -> several ordered wraps the owner reads in sequence
+  (setf *captured-list* nil (sv "*CHUNK-CHARS*") 200)
+  (call-na "SEND-DM" long)
+  (let ((wraps (reverse *captured-list*)))
+    (check "a long reply becomes multiple DMs (no single-message truncation)" (> (length wraps) 1))
+    (check "chunk created_at strictly increases (correct display order)"
+           (apply #'< (mapcar #'cl-nostr.event:event-created-at wraps)))
+    (let ((parts (mapcar (lambda (w) (nip59:unwrap-giftwrap (keys:keypair-secret-key *owner*) w)) wraps)))
+      (check "every part is numbered (i/N)" (every (lambda (p) (and (find #\/ p) (find #\( p))) parts))))
+  (setf (sv "*CHUNK-CHARS*") 1800))
 
 (format t "~&== duplicate gift-wrap is processed once ==~%")
 (setf (sv "*QUEUE*") nil (sv "*FLOOR*") 1000)

@@ -27,9 +27,9 @@
                     (#:nip59  #:cl-nostr.nip59)
                     (#:bt     #:bordeaux-threads))
   (:export #:*owner-nip05* #:*relays* #:*system-prompt* #:*tool-names* #:*model*
-           #:*key-file* #:*state-file* #:*max-reply-chars* #:*greeting*
+           #:*key-file* #:*state-file* #:*chunk-chars* #:*max-chunks* #:*greeting*
            #:agent-npub #:agent-pubkey #:start #:stop #:running-p #:run-loop
-           #:process-item #:send-dm))
+           #:process-item #:send-dm #:split-text))
 (in-package #:operandi.nostr)
 
 ;;; ------------------------------- config -------------------------------
@@ -66,7 +66,13 @@ plainly; never fabricate a value to fill a hole."
   (merge-pathnames ".operandi/nostr-agent.transcript" (user-homedir-pathname))
   "Human-readable DM transcript: every inbound operator message and every reply
    the agent sends, timestamped. NIL disables. Also echoed to stdout (the log).")
-(defparameter *max-reply-chars* 3500)
+(defparameter *chunk-chars* 1800
+  "Max characters per outbound DM. A longer reply is SPLIT into several messages
+   on natural boundaries (paragraph > line > sentence > word) — never truncated
+   mid-word. Multi-part replies are numbered (i/N) and ordered via build-giftwrap
+   :after so they display in sequence.")
+(defparameter *max-chunks* 8
+  "Safety cap on how many DMs one reply may become; beyond it the tail is elided.")
 (defparameter *greeting* "operandi is online and listening — DM me anytime."
   "One-line DM sent to the operator on startup when START is called with :greet t,
    so you know the agent came up.")
@@ -159,16 +165,51 @@ plainly; never fabricate a value to fill a hole."
                :verbose nil)
     (setf *history* hist)
     (let ((s (string-trim '(#\Space #\Newline #\Return #\Tab) (or reply ""))))
-      (when (zerop (length s)) (setf s "(no reply produced)"))
-      (if (> (length s) *max-reply-chars*)
-          (concatenate 'string (subseq s 0 *max-reply-chars*) " …")
-          s))))
+      (if (zerop (length s)) "(no reply produced)" s))))
+
+(defun %break-point (s max)
+  "Index (<= MAX) to cut S at, preferring a paragraph, then line, then sentence,
+   then word boundary near the end of the window; hard MAX only if none is found."
+  (let* ((limit (min max (length s)))
+         (win (max 0 (- limit 500))))    ; look for a boundary in the tail of the window
+    (labels ((rfind (needle) (search needle s :from-end t :end2 limit :start2 win)))
+      (cond ((let ((p (rfind (format nil "~%~%")))) (and p (+ p 2))))
+            ((let ((p (rfind (string #\Newline)))) (and p (+ p 1))))
+            ((let ((p (rfind ". "))) (and p (+ p 2))))
+            ((let ((p (rfind " "))) (and p (+ p 1))))
+            (t limit)))))
+
+(defun split-text (text &optional (max *chunk-chars*))
+  "Split TEXT into <=MAX-char chunks on natural boundaries (never mid-word unless a
+   single run exceeds MAX). Returns a list of clean chunks."
+  (let ((out '()) (s (string-trim '(#\Space #\Newline) text)))
+    (loop
+      (when (<= (length s) max) (when (plusp (length s)) (push s out)) (return))
+      (let ((cut (%break-point s max)))
+        (push (string-right-trim '(#\Space #\Newline) (subseq s 0 cut)) out)
+        (setf s (string-left-trim '(#\Space #\Newline) (subseq s cut)))))
+    (nreverse out)))
 
 (defun send-dm (text)
-  "Gift-wrap TEXT to the operator (NIP-17) and publish it to the DM relays."
-  (let ((wrap (nip59:build-giftwrap (keys:keypair-secret-key (ensure-agent-key))
-                                    *owner-pubkey* text)))
-    (pool:pool-publish *pool* wrap)))
+  "Gift-wrap TEXT to the operator (NIP-17) and publish it, splitting a long reply
+   into several ordered, numbered DMs instead of truncating it."
+  (let* ((chunks (split-text text))
+         (chunks (if (> (length chunks) *max-chunks*)
+                     (append (subseq chunks 0 (1- *max-chunks*))
+                             (list (format nil "…[~a more part~:p elided]"
+                                           (- (length chunks) (1- *max-chunks*)))))
+                     chunks))
+         (m (length chunks))
+         (after nil))
+    (loop for c in chunks for i from 1 do
+      (let* ((body (if (> m 1) (format nil "(~a/~a) ~a" i m c) c))
+             (wrap (if after
+                       (nip59:build-giftwrap (keys:keypair-secret-key (ensure-agent-key))
+                                             *owner-pubkey* body :after after)
+                       (nip59:build-giftwrap (keys:keypair-secret-key (ensure-agent-key))
+                                             *owner-pubkey* body))))
+        (pool:pool-publish *pool* wrap)
+        (setf after (ev:event-created-at wrap))))))
 
 ;;; --------------------------- receive + dispatch -----------------------
 (defun on-giftwrap (event relay)

@@ -59,7 +59,7 @@
   (let ((v (uiop:getenv name)))
     (or (and v (ignore-errors (parse-integer v :junk-allowed t))) default)))
 
-(defparameter *max-iterations* (%env-int "OPERANDI_MAX_ITERS" 80)
+(defparameter *max-iterations* (%env-int "OPERANDI_MAX_ITERS" 500)
   "Hard cap on the agentic loop. Frontier models doing real analysis
    (e.g. computing correlations across thousands of rows) commonly
    want 30+ tool calls; with auto-compaction keeping context bounded
@@ -373,6 +373,63 @@ completed). Do not shorten for brevity — nothing may be lost.")
           (namestring path)))
     (error () nil)))
 
+(defparameter *stall-repeat* 4
+  "How many times the SAME (tool, arguments) pair may repeat before the run is
+   treated as stalled. Four rather than two: a retry is normal, a second look at
+   a file after editing it is normal, and a legitimate sweep can read the same
+   path twice. Four identical calls in a row is not a sweep.")
+
+(defparameter *stall-window* 12
+  "How many recent tool calls the no-progress check looks at. If a window this
+   long contains no call the run has not already made, nothing new is being
+   touched.")
+
+(defun %tool-call-sig (tc)
+  "A tool call as (name . arguments), which is what `the same call again' means."
+  (let ((fn (gethash "function" tc)))
+    (and fn (cons (gethash "name" fn) (gethash "arguments" fn)))))
+
+(defun %stall-reason (sigs)
+  "SIGS is every tool-call signature this run has issued, oldest first. Returns a
+   sentence naming what looks stuck, or NIL.
+
+   WHY STRUCTURE AND NOT A MODEL. A count of iterations cannot tell a long job
+   from a stuck one, which is the whole defect this replaces — but repetition
+   can, it costs nothing, and it is not a judgement that can be wrong in an
+   interesting way. Only the shapes below stop a run; anything subtler is left
+   to the iteration backstop rather than guessed at."
+  (let ((n (length sigs)))
+    (cond
+      ((< n *stall-repeat*) nil)
+      ;; the classic spin: the same call, with the same arguments, over and over
+      ((let ((tail (last sigs *stall-repeat*)))
+         (and (every (lambda (x) (equal x (first tail))) tail)
+              (car (first tail))))
+       (format nil "the last ~D tool calls were all ~A with identical arguments"
+               *stall-repeat* (car (car (last sigs)))))
+      ;; nothing new in a long while: every call in the window is one already made
+      ((and (>= n (* 2 *stall-window*))
+            (let* ((window (last sigs *stall-window*))
+                   (earlier (subseq sigs 0 (- n *stall-window*))))
+              (every (lambda (x) (member x earlier :test #'equal)) window)))
+       (format nil "the last ~D tool calls repeat work already done — nothing new ~
+                    has been touched" *stall-window*))
+      (t nil))))
+
+(defun %bare-continuation-p (c)
+  "True for a user turn that carries no task of its own — only permission to keep
+   going. These are answers to an interruption, not instructions, and they mean
+   nothing without the interruption beside them."
+  (member (string-downcase (string-trim " .!?" c))
+          '("continue" "go on" "keep going" "proceed" "carry on" "resume" "continue.")
+          :test #'string=))
+
+(defun %first-sentence (s)
+  "S up to its first period, trimmed — enough of an engine nudge to say what it was."
+  (let* ((s (string-trim '(#\Space #\Newline #\Tab) s))
+         (dot (position #\. s)))
+    (if dot (subseq s 0 dot) s)))
+
 (defun render-user-turns (turns)
   "The user messages in TURNS, verbatim, as a block to carry across compaction.
    The summarizer is told to report facts, not requirements — so instructions
@@ -381,14 +438,32 @@ completed). Do not shorten for brevity — nothing may be lost.")
    they ARE the task; keep them word for word. Synthetic user nudges from the
    engine (see the output-cap / empty-turn paths) start with \"Your last\" and
    are skipped."
-  (let ((users (loop for m in turns
-                     for c = (gethash "content" m)
-                     when (and (equal (gethash "role" m) "user")
-                               (stringp c) (plusp (length c))
-                               (not (uiop:string-prefix-p "Your last" c)))
-                       collect c)))
+  (let ((users '())
+        (note nil))                     ; the engine nudge most recently seen, if any
+    (dolist (m turns)
+      (let ((c (gethash "content" m)))
+        (when (and (equal (gethash "role" m) "user") (stringp c) (plusp (length c)))
+          (cond
+            ;; An engine nudge is not an instruction, so it does not get a line of
+            ;; its own — but it is the REASON for any bare "continue" after it, so
+            ;; hold on to it rather than dropping it on the floor.
+            ((uiop:string-prefix-p "Your last" c) (setf note c))
+            ;; "continue" alone says nothing about WHAT to continue.  Carried bare
+            ;; into the brief it reads as one more instruction competing with the
+            ;; real ones above it, and the model picks up whichever it likes --
+            ;; which in practice was the oldest.  Pair it with the interruption it
+            ;; was answering and it says what it always meant.
+            ((%bare-continuation-p c)
+             (push (if note
+                       (format nil "~A  [answering an interruption: ~A]" c (%first-sentence note))
+                       (format nil "~A  [the previous turn was interrupted]" c))
+                   users)
+             (setf note nil))
+            (t (push c users) (setf note nil))))))
+    (setf users (nreverse users))
     (when users
-      (format nil "## User instructions from the compacted span (verbatim, in order)~%~{  - ~A~%~}"
+      (format nil "## User instructions from the compacted span (verbatim, in order; ~
+                   the LAST one is the live task)~%~{  - ~A~%~}"
               users))))
 
 (defun render-files-touched (turns)
@@ -1024,6 +1099,8 @@ another tool or give a final answer.")
          (n 0)
          (tool-call-count 0)
          (empty-turns 0)
+         (call-sigs '())      ; every tool call issued this run, newest first
+         (stall-warned nil)   ; the one free correction has been spent
          (usage (llm:make-usage))
          (*subagent-usage* (llm:make-usage))
          (*subagents* (make-hash-table :test 'equal))
@@ -1043,8 +1120,69 @@ another tool or give a final answer.")
         (when verbose
           (format t "~&[operandi] hit max-iterations ~A; stopping~%"
                   max-iterations))
+        ;; SAY SO IN THE HISTORY, not only in the return value.  The reply string
+        ;; goes to whoever called RUN; the MESSAGES go on to the next turn, and
+        ;; without this the model's view is a tool result followed, for no stated
+        ;; reason, by the operator saying "continue" — so it guesses what to
+        ;; continue, and guessing wrong looks like it forgot the task.  The
+        ;; output-cap path below already does this; the iteration cap is the same
+        ;; kind of interruption and deserves the same sentence.  "Your last"
+        ;; prefix is load-bearing: RENDER-USER-TURNS keys on it to tell an engine
+        ;; nudge from something the operator actually asked for.
+        (setf messages
+              (append messages
+                      (list (ht "role" "user" "content"
+                                (format nil
+                                        "Your last turn was stopped at the ~A-iteration cap ~
+                                         before it finished. Nothing is wrong and nothing was ~
+                                         lost — the work is simply unfinished. Pick up from the ~
+                                         last completed step; say what remains before continuing ~
+                                         it." max-iterations)))))
+        ;; ...and hand back a history that is under budget, like every other exit
+        ;; from this loop.  The compaction below runs before each SEND, so bailing
+        ;; out here used to be the one path that returned an uncompacted history
+        ;; for the caller to persist.
+        (setf messages (maybe-compact messages verbose))
         (return (values "[max-iterations exceeded]" messages n
                         (llm:usage-incf (llm:copy-usage usage) *subagent-usage*))))
+      ;; STUCK, NOT LONG.  The iteration cap above is a runaway-cost backstop and
+      ;; nothing more: it fires on length, and length is a bad proxy for trouble --
+      ;; a real job trips it while a four-call spin never does.  This is the check
+      ;; that actually means something, and it gets ONE free correction first,
+      ;; because naming the loop is usually enough for the model to leave it (the
+      ;; output-cap path works the same way).  A second trip stops the run and
+      ;; says what looked stuck, which beats "[max-iterations exceeded]".
+      (let ((reason (%stall-reason (reverse call-sigs))))
+        (when reason
+          (cond
+            ((not stall-warned)
+             (setf stall-warned t)
+             (when verbose
+               (format t "~&[operandi] possible stall: ~A; nudging~%" reason))
+             (setf messages
+                   (append messages
+                           (list (ht "role" "user" "content"
+                                     (format nil
+                                             "Your last turns look stuck: ~A. Stop and say, in ~
+                                              one line, what you are trying to establish and why ~
+                                              the repeat did not settle it — then either do ~
+                                              something different or give your final answer."
+                                             reason))))))
+            (t
+             (when verbose
+               (format t "~&[operandi] stalled: ~A; stopping~%" reason))
+             (setf messages
+                   (append messages
+                           (list (ht "role" "user" "content"
+                                     (format nil
+                                             "Your last turn was stopped because the run stalled: ~
+                                              ~A. Nothing is wrong and nothing was lost — the work ~
+                                              is simply unfinished. Pick up from the last ~
+                                              completed step; say what remains before continuing ~
+                                              it." reason)))))
+             (setf messages (maybe-compact messages verbose))
+             (return (values (format nil "[stalled: ~A]" reason) messages n
+                             (llm:usage-incf (llm:copy-usage usage) *subagent-usage*)))))))
       ;; Keep the context under the token budget BEFORE every send, so a
       ;; turn that just appended a huge tool result gets compacted before
       ;; it can blow the model's window.
@@ -1099,6 +1237,9 @@ another tool or give a final answer.")
                            (let* ((fn (gethash "function" tc))
                                   (raw (and fn (gethash "arguments" fn))))
                              (subseq (or raw "") 0 (min 80 (length (or raw ""))))))))
+           ;; Remember what was called, so the stall check at the top of the next
+           ;; iteration can see repetition.  Signatures only — no results kept.
+           (dolist (tc tcs) (push (%tool-call-sig tc) call-sigs))
            ;; Execute every tool_call, append each result. If the budget
            ;; cap is hit, short-circuit with a synthetic result so the
            ;; model knows to stop searching and finalize.

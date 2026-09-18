@@ -467,6 +467,37 @@ completed). Do not shorten for brevity — nothing may be lost.")
                     has been touched" *stall-window*))
       (t nil))))
 
+(defparameter +brief-marker+ "[Context was compacted:"
+  "How a compaction brief announces itself.  OFFLOAD-MIDDLE writes it and
+   RENDER-USER-TURNS reads it, so the two must not drift apart.")
+
+(defparameter +instructions-heading+ "## User instructions from the compacted span"
+  "Heading of the verbatim-instruction block inside a brief, so a LATER
+   compaction can find it and carry those instructions forward.")
+
+(defun %carried-instructions (brief)
+  "The bullet lines of BRIEF's verbatim-instruction block.
+
+   A brief is appended with role USER by design — it reads as something to
+   continue from rather than as the model's own prior claim.  The cost is that
+   the NEXT compaction sees it as a user turn: without this, the new brief's
+   instruction list was the old brief's HEADER, one line, and every real
+   instruction the operator had given vanished from the list while the brief
+   itself doubled by nesting.  Measured on a live session: 7,045 -> 14,514
+   tokens in one pass, with the live task no longer in the list at all."
+  (let ((at (search +instructions-heading+ brief)))
+    (when at
+      (let ((lines '()))
+        (with-input-from-string (in (subseq brief at))
+          (read-line in nil)                        ; the heading itself
+          (loop for l = (read-line in nil)
+                while l
+                do (let ((tl (string-left-trim '(#\Space #\Tab) l)))
+                     (cond ((uiop:string-prefix-p "- " tl) (push (subseq tl 2) lines))
+                           ((zerop (length tl)))     ; blank lines inside the block
+                           (t (return))))))          ; the next section starts
+        (nreverse lines)))))
+
 (defun %bare-continuation-p (c)
   "True for a user turn that carries no task of its own — only permission to keep
    going. These are answers to an interruption, not instructions, and they mean
@@ -488,7 +519,8 @@ completed). Do not shorten for brevity — nothing may be lost.")
    surviving only as whatever the summary happened to quote. They're short and
    they ARE the task; keep them word for word. Synthetic user nudges from the
    engine (see the output-cap / empty-turn paths) start with \"Your last\" and
-   are skipped."
+   are skipped, and an earlier BRIEF is not an instruction either — its own list
+   is lifted into this one instead (see %CARRIED-INSTRUCTIONS)."
   (let ((users '())
         (note nil))                     ; the engine nudge most recently seen, if any
     (dolist (m turns)
@@ -499,6 +531,12 @@ completed). Do not shorten for brevity — nothing may be lost.")
             ;; its own — but it is the REASON for any bare "continue" after it, so
             ;; hold on to it rather than dropping it on the floor.
             ((uiop:string-prefix-p "Your last" c) (setf note c))
+            ;; A previous brief is not an instruction either — but it CONTAINS
+            ;; them, so lift its list into this one and let the instructions
+            ;; survive however many compactions the run takes.
+            ((uiop:string-prefix-p +brief-marker+ c)
+             (dolist (i (%carried-instructions c)) (push i users))
+             (setf note nil))
             ;; "continue" alone says nothing about WHAT to continue.  Carried bare
             ;; into the brief it reads as one more instruction competing with the
             ;; real ones above it, and the model picks up whichever it likes --
@@ -582,8 +620,8 @@ completed). Do not shorten for brevity — nothing may be lost.")
                      ;; reads as their own possibly-wrong prior claim.
                      (list (ht "role" "user"
                                "content"
-                               (format nil "[Context was compacted: ~D messages replaced by the brief below~@[; the raw messages are OFFLOADED (not lost) to ~A — Read that file if you need a detail the brief dropped~]. Continue the work from where the brief leaves off; do not re-derive what it establishes.]~@[~%~%~A~]~@[~%~%~A~]~@[~%~%~A~]~@[~%~%~A~]"
-                                       (length middle) path
+                               (format nil "~a ~D messages replaced by the brief below~@[; the raw messages are OFFLOADED (not lost) to ~A — Read that file if you need a detail the brief dropped~]. Continue the work from where the brief leaves off; do not re-derive what it establishes.]~@[~%~%~A~]~@[~%~%~A~]~@[~%~%~A~]~@[~%~%~A~]"
+                                       +brief-marker+ (length middle) path
                                        (render-pinned-todos)
                                        (render-user-turns middle)
                                        (render-files-touched middle)

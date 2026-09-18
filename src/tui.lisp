@@ -198,6 +198,34 @@
     (:openrouter (or llm:*llm-model* "openrouter"))
     (t "llama.cpp")))
 
+(defun salvage-interrupted (before live)
+  "History to keep after Ctrl-C: LIVE (the engine's in-flight message list)
+   if it got past BEFORE, made protocol-valid and marked. The work the agent
+   did before the interrupt — reads, edits, decisions — stays in context;
+   dropping it left the next turn talking to a model that didn't know it had
+   just changed the files on disk. A trailing assistant message with
+   tool_calls must be followed by one tool result per call, so any call that
+   never ran gets a synthetic result saying so."
+  (if (or (null live) (<= (length live) (length before)))
+      before
+      (let* ((last-asst (find "assistant" live :key (lambda (m) (gethash "role" m))
+                                                 :test #'equal :from-end t))
+             (tcs (and last-asst (eng:message-tool-calls last-asst)))
+             (missing (loop for tc in tcs
+                            for id = (gethash "id" tc)
+                            unless (find-if (lambda (m) (equal (gethash "tool_call_id" m) id))
+                                            live)
+                              collect id)))
+        ;; Tool results are appended one at a time, so a partially-run batch
+        ;; has some results present; only the rest need stand-ins.
+        (append live
+                (mapcar (lambda (id)
+                          (eng:tool-result-msg id "[not run: the user interrupted the turn]"))
+                        missing)
+                (list (llm:ht "role" "assistant"
+                              "content"
+                              "[turn interrupted by the user (Ctrl-C). The tool calls above did run and their effects stand; anything after them did not happen.]"))))))
+
 (defun run-turn (sess prompt)
   "Run one agent turn on PROMPT, streaming to the terminal, threading
    SESS's history and folding usage. Ctrl-C aborts just this turn."
@@ -211,10 +239,23 @@
          (hooks:*pre-tool-hooks*  (cons #'tui-pre-hook hooks:*pre-tool-hooks*))
          (hooks:*post-tool-hooks* (cons #'tui-post-hook hooks:*post-tool-hooks*))
          (eng:*stream* t)
-         (eng:*on-token* #'on-token))
+         (eng:*on-token* #'on-token)
+         (eng:*on-compact*
+           (lambda (before after path)
+             (fresh)
+             (emit (paint (format nil "  ⟲ compacted context ~Dk → ~Dk tokens~@[ (raw kept in ~A)~]~%"
+                                  (round before 1000) (round after 1000) path)
+                          :gray))
+             (force-output)))
+         ;; Snapshot of the engine's in-flight history, taken by a HANDLER-BIND
+         ;; while still inside ENG:RUN — *live-messages* is bound there, so by
+         ;; the time HANDLER-CASE has unwound to its clause it's gone.
+         (live nil))
     (handler-case
         (multiple-value-bind (text hist* iters usage)
-            (eng:run prompt :history messages :verbose nil)
+            (handler-bind ((#+sbcl sb-sys:interactive-interrupt #-sbcl error
+                             (lambda (c) (declare (ignore c)) (setf live eng:*live-messages*))))
+              (eng:run prompt :history messages :verbose nil))
           (setf (session:session-history sess) hist*)
           (incf (gethash :turns sess))
           (session:session-add-usage sess usage)
@@ -233,11 +274,15 @@
                        :gray))
           (force-output))
       (#+sbcl sb-sys:interactive-interrupt #-sbcl error ()
-        ;; The engine's in-flight state is discarded; the conversation
-        ;; history is left as it was before this turn, so the next prompt
-        ;; starts clean.
+        ;; Keep what the agent got done before the interrupt (see
+        ;; SALVAGE-INTERRUPTED); usage for the partial turn isn't recoverable.
+        (let ((kept (salvage-interrupted messages live)))
+          (when (> (length kept) (length messages))
+            (setf (session:session-history sess) kept)
+            (incf (gethash :turns sess))
+            (session:persist-session sess)))
         (fresh)
-        (emit (paint "  ⎋ interrupted — turn abandoned, session kept." :yellow))
+        (emit (paint "  ⎋ interrupted — partial turn kept in context." :yellow))
         (emit (string #\Newline))
         (force-output)))))
 
@@ -251,6 +296,7 @@
                  ("/resume [id]"   "resume a saved session (latest if no id)")
                  ("/cost"          "session cost + token totals")
                  ("/model [id]"    "show or switch model (id like vendor/name → OpenRouter)")
+                 ("/effort [lvl]"  "show or set reasoning effort: off, low, medium, high, default")
                  ("/system"        "print the active system prompt")
                  ("/tools"         "list the tools the agent can call")
                  ("/quit  /exit"   "leave (Ctrl-D also works)")))
@@ -282,18 +328,36 @@
         (format t "~&~A~%"
                 (paint "no such session to resume — try /sessions" :yellow)))))
 
+(defun effort-label ()
+  (if llm:*llm-effort* (string-downcase (symbol-name llm:*llm-effort*)) "default"))
+
 (defun cmd-model (arg)
   (cond
     ((null arg)
-     (format t "~&model: ~A  (backend ~A)~%"
-             (paint (model-label) :cyan) llm:*llm-backend*))
+     (format t "~&model: ~A  (backend ~A, effort ~A, context budget ~Dk)~%"
+             (paint (model-label) :cyan) llm:*llm-backend* (effort-label)
+             (round eng:*context-token-budget* 1000)))
     ((find #\/ arg)                       ; vendor/model → OpenRouter
      (llm:use-openrouter :model arg)
+     (eng:apply-backend-defaults)
      (format t "~&→ OpenRouter ~A~%" (paint arg :cyan)))
     ((string-equal arg "llama")
      (llm:use-llama)
+     (eng:apply-backend-defaults)
      (format t "~&→ local llama.cpp~%"))
     (t (format t "~&unknown model spec ~S — give a 'vendor/name' id or 'llama'.~%" arg))))
+
+(defun cmd-effort (arg)
+  (if (null arg)
+      (format t "~&effort: ~A~A~%" (paint (effort-label) :cyan)
+              (case llm:*llm-backend*
+                (:openrouter "  (OpenRouter: off → reasoning disabled; low/medium/high → reasoning.effort)")
+                (t "  (llama.cpp: off/default → no thinking; low/medium/high → thinking on)")))
+      (multiple-value-bind (e ok) (llm:parse-effort arg)
+        (if ok
+            (progn (setf llm:*llm-effort* e)
+                   (format t "~&→ effort ~A~%" (paint (effort-label) :cyan)))
+            (format t "~&~A~%" (paint "effort takes off, low, medium, high, or default" :yellow))))))
 
 (defun cmd-system (sess)
   (declare (ignore sess))
@@ -327,6 +391,7 @@
       ((string-equal verb "/sessions") (cmd-sessions) t)
       ((string-equal verb "/resume") (cmd-resume sess arg) t)
       ((string-equal verb "/model") (cmd-model arg) t)
+      ((string-equal verb "/effort") (cmd-effort arg) t)
       ((string-equal verb "/system") (cmd-system sess) t)
       ((string-equal verb "/tools") (cmd-tools) t)
       (t (format t "~&unknown command ~A — try /help~%" (paint verb :yellow)) t))))
@@ -337,10 +402,15 @@
 
 (defun try-load-linedit ()
   "Load linedit for line editing/history — but only on an interactive tty.
-   Under a pipe or --non-interactive we want the plain read-line path."
+   Under a pipe or --non-interactive we want the plain read-line path.
+   Skip the quickload when linedit is already in the image (bin/operandi
+   bakes it into the core): quickload would still make ASDF stat the
+   sources under ~/quicklisp, which the sandbox hides, and the resulting
+   compile error — swallowed here — left us with no line editing at all."
   (when (and (not *linedit*) (stdin-tty-p))
     (ignore-errors
-     (funcall (read-from-string "ql:quickload") "linedit" :silent t)
+     (unless (find-package "LINEDIT")
+       (funcall (read-from-string "ql:quickload") "linedit" :silent t))
      (setf *linedit* (find-symbol "LINEDIT" "LINEDIT")))))
 
 (defun %plain-read (prompt)
@@ -412,12 +482,21 @@
     (setf (sb-posix:termios-lflag tio)
           (logandc2 (sb-posix:termios-lflag tio)
                     (logior sb-posix:icanon sb-posix:echo sb-posix:isig)))
+    ;; Clear ICRNL so CR and LF stay distinct bytes: Enter (CR) submits the
+    ;; line, Ctrl-J (LF) inserts a newline — multiline paste/editing.
+    (setf (sb-posix:termios-iflag tio)
+          (logandc2 (sb-posix:termios-iflag tio) sb-posix:icrnl))
     (let ((cc (sb-posix:termios-cc tio)))
       (setf (aref cc sb-posix:vmin) 1 (aref cc sb-posix:vtime) 0))
-    (sb-posix:tcsetattr 0 sb-posix:tcsanow tio)))
+    (sb-posix:tcsetattr 0 sb-posix:tcsanow tio))
+  ;; Ask the terminal for bracketed paste: pasted text arrives wrapped in
+  ;; ESC[200~ … ESC[201~ so we can insert it verbatim (newlines and all)
+  ;; instead of each line's CR submitting the buffer.
+  (raw-write (format nil "~A[?2004h" (string #\Escape))))
 
 (defun raw-off ()
   (when *raw-saved*
+    (raw-write (format nil "~A[?2004l" (string #\Escape)))
     (ignore-errors (sb-posix:tcsetattr 0 sb-posix:tcsanow *raw-saved*))
     (setf *raw-saved* nil)))
 
@@ -436,18 +515,33 @@
     (if (and c (plusp c)) (format nil "~,2F¢ › " (* 100 c)) "› ")))
 
 (defun paint-input (&key focus)
-  "Draw the input line on the bottom row (windowed to one row, caret kept in
-   view). FOCUS T leaves the terminal caret in the input line (idle typing);
-   FOCUS NIL saves/restores the agent cursor so streaming output is undisturbed."
+  "Draw the input line on the bottom row(s) (windowed, caret kept in view).
+   Multiline buffers render bottom-anchored: the caret's row sits on the last
+   terminal row, earlier lines above it. FOCUS T leaves the terminal caret in
+   the input line (idle typing); FOCUS NIL saves/restores the agent cursor so
+   streaming output is undisturbed."
   (let* ((e (string #\Escape))
          (p (input-prompt)) (pw (length p))
+         (lines (ui-split-lines *buf*))
+         (crow (ui-row-of *buf* *cur*))          ; 0-based line the caret is on
+         (ccol (- *cur* (ui-line-start *buf* *cur*)))
          (avail (max 1 (- *cols* pw 1)))
-         (start (if (< *cur* avail) 0 (1+ (- *cur* avail))))
-         (view (subseq *buf* start (min (length *buf*) (+ start avail))))
-         (caret (+ 1 pw (- *cur* start)))
-         (body (format nil "~A[~D;1H~A[2K~A~A" e *rows* e p view)))
+         ;; window the caret's line horizontally
+         (start (if (< ccol avail) 0 (1+ (- ccol avail))))
+         (view (subseq (nth crow lines) start (min (length (nth crow lines))
+                                                   (+ start avail))))
+         (caret-col (+ 1 pw (- ccol start)))
+         ;; rows to show above the caret row (most recent first)
+         (above (loop for i from (1- crow) downto (max 0 (- crow (- *rows* 2)))
+                      collect (nth i lines)))
+         (top-row (- *rows* (length above)))
+         (body (with-output-to-string (s)
+                 (loop for line in (reverse above)
+                       for r from top-row
+                       do (format s "~A[~D;1H~A[2K~A" e r e line))
+                 (format s "~A[~D;1H~A[2K~A~A" e *rows* e p view))))
     (raw-write (if focus
-                   (format nil "~A~A[~D;~DH" body e *rows* caret)
+                   (format nil "~A~A[~D;~DH" body e *rows* caret-col)
                    (format nil "~A7~A~A8" e body e)))))
 
 (defun ui-write-concurrent (s)
@@ -518,11 +612,32 @@
 
 ;;; --- input editing (main thread) ---
 
+(defun ui-split-lines (s)
+  "Split S on LF into a list of line strings (no empty trailing element)."
+  (let ((out '()) (start 0))
+    (loop for i = (position #\Linefeed s :start start)
+          do (push (subseq s start (or i (length s))) out)
+          until (null i)
+          do (setf start (1+ i)))
+    (nreverse out)))
+
+(defun ui-line-start (s pos)
+  "Index of the start of the line containing position POS."
+  (or (position #\Linefeed s :end pos :from-end t) -1))
+
+(defun ui-row-of (s pos)
+  "0-based row index of the line containing POS."
+  (count #\Linefeed s :end pos))
+
 (defun ui-clear-input () (setf *buf* "" *cur* 0 *hist-idx* nil) (ui-repaint))
-(defun ui-insert (ch)
-  (setf *buf* (concatenate 'string (subseq *buf* 0 *cur*) (string ch) (subseq *buf* *cur*))
-        *cur* (1+ *cur*) *hist-idx* nil)
-  (ui-repaint))
+(defun ui-insert-string (s)
+  "Insert S (possibly multiline) at the caret; returns T if *buf* changed."
+  (when (plusp (length s))
+    (setf *buf* (concatenate 'string (subseq *buf* 0 *cur*) s (subseq *buf* *cur*))
+          *cur* (+ *cur* (length s))
+          *hist-idx* nil)
+    (ui-repaint)))
+(defun ui-insert (ch) (ui-insert-string (string ch)))
 (defun ui-backspace ()
   (when (> *cur* 0)
     (setf *buf* (concatenate 'string (subseq *buf* 0 (1- *cur*)) (subseq *buf* *cur*))
@@ -591,11 +706,44 @@
 
 ;;; --- key decoding + the main input loop ---
 
+(defun read-paste ()
+  "Read the body of a bracketed paste (already past ESC[200~) up to the
+   ESC[201~ terminator. Returns the pasted text with CR/CRLF normalised to
+   LF; on EOF returns what was gathered."
+      (declare (ignore e))
+  (let ((acc (make-string-output-stream))
+        (e (string #\Escape)))
+    (flet ((term-p ()
+             ;; peek for the 201~ terminator: ESC [ 2 0 1 ~
+             (and (char= (or (read-char *standard-input* nil :eof) :eof) #\Escape)
+                  (char= (or (read-char *standard-input* nil :eof) :eof) #\[)
+                  (char= (or (read-char *standard-input* nil :eof) :eof) #\2)
+                  (char= (or (read-char *standard-input* nil :eof) :eof) #\0)
+                  (char= (or (read-char *standard-input* nil :eof) :eof) #\1)
+                  (char= (or (read-char *standard-input* nil :eof) :eof) #\~))))
+      (loop
+        (let ((c (read-char *standard-input* nil :eof)))
+          (cond ((eq c :eof) (return))
+                ;; CR or CRLF inside a paste becomes a single LF
+                ((char= c #\Return)
+                 (when (char= (peek-char nil *standard-input* nil :eof) #\Linefeed)
+                   (read-char *standard-input*))
+                 (write-char #\Linefeed acc))
+                (t (write-char c acc)))))
+      (get-output-stream-string acc))))
+
 (defun read-csi ()
   (let ((acc (make-string-output-stream)))
     (loop for c = (read-char *standard-input* nil :eof)
           do (cond
                ((eq c :eof) (return :escape))
+               ((and (char= c #\2) (char= (peek-char nil *standard-input* nil :eof) #\0))
+                ;; 200~ = bracketed paste start
+                (read-char *standard-input*)
+                (when (char= (read-char *standard-input* nil :eof) #\0)
+                  (when (char= (read-char *standard-input* nil :eof) #\~)
+                    (return (cons :paste (read-paste)))))
+                :ignore)
                ((or (char<= #\A c #\Z) (char<= #\a c #\z) (char= c #\~))
                 (return (let ((params (get-output-stream-string acc)))
                           (cond ((char= c #\A) :up) ((char= c #\B) :down)
@@ -615,6 +763,7 @@
        (let ((n (read-char *standard-input* nil :eof)))
          (if (member n '(#\[ #\O)) (read-csi) :escape)))
       ((or (char= c #\Return) (char= c #\Newline)) :enter)
+      ((char= c #\Linefeed) :newline)
       ((or (char= c #\Rubout) (char= c (code-char 8))) :backspace)
       ((char= c (code-char 3)) :ctrl-c)
       ((char= c (code-char 4)) :ctrl-d)
@@ -661,6 +810,7 @@
               (:ctrl-d (when (zerop (length *buf*)) (return)))
               (:ctrl-c (ui-interrupt))
               (:enter (ui-submit sess))
+              (:newline (ui-insert-string (string #\Linefeed)))
               (:backspace (ui-backspace))
               (:delete (ui-delete))
               (:left (ui-move -1))
@@ -669,10 +819,16 @@
               (:end (ui-end))
               (:kill (ui-kill))
               (:kill-eol (ui-kill-eol))
-              (:up (ui-history -1))
-              (:down (ui-history 1))
+              (:up (if (plusp (ui-row-of *buf* *cur*))
+                       (ui-move (-
+                                 (ui-line-start *buf* *cur*)
+                                 *cur*))
+                       (ui-history -1)))
+              (:down (let ((nl (position #\Linefeed *buf* :start *cur*)))
+                       (if nl (ui-move (1+ (- nl *cur*))) (ui-history 1))))
               (:redraw (ui-repaint))
               ((:ignore :escape) nil)
+              ((cons :paste s) (ui-insert-string s))
               (t (when (characterp key) (ui-insert key))))
             (when *quit* (return)))))
     ;; teardown: stop the worker (aborting a turn in flight), restore terminal.

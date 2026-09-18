@@ -39,6 +39,8 @@
            #:*on-token*
            #:*subagent-usage*
            #:*subagents*
+           #:*live-messages* #:message-tool-calls #:tool-result-msg
+           #:*on-compact* #:*compaction-max-tokens* #:apply-backend-defaults
            #:*context-token-budget*
            #:*do-chat-max-tokens*
            #:*tool-result-keep-chars*
@@ -81,6 +83,11 @@
    a small LOCAL model; a large-context frontier worker should raise it
    (OPERANDI_CONTEXT_BUDGET) — a too-small budget makes an agent THRASH:
    compaction evicts earlier findings faster than it can act on them.")
+
+(defvar *live-messages* nil
+  "The running message list of the RUN in progress, updated after every
+   append/compaction. Lets a host that aborts a turn (Ctrl-C in the TUI)
+   salvage what the agent did before the interrupt instead of dropping it.")
 
 (defparameter *compact-keep-last* 14
   "Number of recent messages preserved verbatim during compaction.")
@@ -148,47 +155,136 @@
            messages))
 
 (defparameter *compaction-prompt*
-  "You are the compaction summarizer for an autonomous agent. Read
-the conversation snippet below — a sequence of assistant messages,
-tool calls, and tool results — and produce a TERSE summary in 100-200
-words covering: (1) what the agent learned or established as fact,
-(2) what tool calls succeeded or failed and why, (3) any persistent
-state changes (files written, notes recorded). DO NOT recap the
-original task or the agent's reasoning style. Pure facts. The output
-will replace the snippet in the agent's running conversation, so the
-agent should be able to continue with just the summary as context.")
+  "You are compacting the context of an autonomous coding agent so it can
+continue a task in a fresh context window with nothing else to go on. Below
+is a span of its conversation: assistant messages, tool calls, tool results,
+and any user messages. It may also contain an earlier compaction brief —
+if so, carry everything from it forward, merged with what came after.
+
+Write a CONTINUATION BRIEF with exactly these sections, in this order. It
+replaces the span entirely; anything you leave out is gone. Use the agent's
+own file paths, symbol names, commands, and error text verbatim — never
+paraphrase an identifier. The short sections come first so they survive
+even if the output is cut off; keep them tight and put the bulk in 9.
+
+## 1. Primary request and intent
+What the user asked for, including constraints and preferences they
+expressed along the way. Quote them where the wording matters.
+
+## 2. All user messages
+Every user message in the span, verbatim, in order. Skip only synthetic
+nudges from the runtime (they begin \"Your last\").
+
+## 3. Pending tasks
+What the user asked for that is not yet done, in order.
+
+## 4. Current work
+Exactly what was in progress at the end of the span: which file, which
+function, what the last tool call was and what came back.
+
+## 5. Next step
+The single concrete action that continues the current work — and only if
+it follows directly from the span; do not invent new work.
+
+## 6. Key technical concepts
+Technologies, libraries, architectures, conventions of this codebase the
+agent needed to know.
+
+## 7. Errors and how they were resolved
+Each error hit, what it turned out to be, what fixed it. Include user
+corrections of the agent's approach — those are the most expensive things
+to relearn.
+
+## 8. Problem solving
+What was established as fact (measurements, test results, confirmed
+behaviors) and what was ruled out.
+
+## 9. Files and code
+Every file read, created, or edited: full path, why it matters, and the
+CURRENT state of what changed — not a replay of each edit. Include the
+code the next step depends on (the exact snippet, not a description);
+summarize the rest.")
+
+(defparameter *compaction-merge-prompt*
+  "Below are several continuation briefs, each covering a consecutive span
+of the same agent conversation, in order. Merge them into ONE brief with
+the same nine numbered sections, keeping every file path, snippet, error,
+decision, and user message from all of them. Later spans supersede earlier
+ones where they conflict (a task that was pending and then completed is
+completed). Do not shorten for brevity — nothing may be lost.")
+
+(defparameter *compaction-max-tokens* 8192
+  "Output cap for one summarizer call. The brief has nine sections and
+   quotes code, and on OpenRouter a reasoning model's thinking counts
+   against this too; 4096 cut section 3 off mid-snippet.")
+
+(defun render-turn-for-summary (m)
+  "One message as the summarizer sees it: role, text, and each tool call as
+   name(args) — the call is what tells the reader which file was touched."
+  (let* ((role (gethash "role" m))
+         (raw  (gethash "content" m))
+         (content (cond ((null raw) "") ((stringp raw) raw) (t (princ-to-string raw))))
+         (tcs (gethash "tool_calls" m)))
+    (with-output-to-string (s)
+      (format s "[~A] ~A~%" role
+              ;; Tool results are bounded by the Read budget already; this
+              ;; is a backstop for pathological ones.
+              (if (> (length content) 24000)
+                  (concatenate 'string (subseq content 0 24000) "...[truncated]")
+                  content))
+      (when (and tcs (or (vectorp tcs) (listp tcs)))
+        (map nil (lambda (tc)
+                   (let ((fn (and (hash-table-p tc) (gethash "function" tc))))
+                     (when (hash-table-p fn)
+                       (format s "    -> ~A(~A)~%" (gethash "name" fn) (gethash "arguments" fn)))))
+             (if (listp tcs) (coerce tcs 'vector) tcs))))))
+
+(defun chunk-turns (turns max-tokens)
+  "Split TURNS into consecutive chunks each estimated at or under MAX-TOKENS
+   (a single oversized message is a chunk by itself). The summarizer has the
+   same window as the agent, so a middle that overflowed the budget can't be
+   sent to it in one piece."
+  (let ((chunks '()) (cur '()) (cur-tok 0))
+    (dolist (m turns)
+      (let ((tok (estimate-tokens (list m))))
+        (when (and cur (> (+ cur-tok tok) max-tokens))
+          (push (nreverse cur) chunks)
+          (setf cur '() cur-tok 0))
+        (push m cur) (incf cur-tok tok)))
+    (when cur (push (nreverse cur) chunks))
+    (nreverse chunks)))
+
+(defun summarize-chunk (turns prompt)
+  "One summarizer call over TURNS (or, with the merge prompt, over strings).
+   Returns the text, or NIL on error."
+  (let ((rendered (with-output-to-string (s)
+                    (dolist (m turns)
+                      (write-string (if (stringp m) m (render-turn-for-summary m)) s)
+                      (terpri s)))))
+    (handler-case
+        (values (llm:llm-chat rendered :system prompt
+                                       :max-tokens *compaction-max-tokens*
+                                       :temperature 0.0
+                                       :effort :low))
+      (error () nil))))
 
 (defun summarize-turns (turns)
-  "Call llm-chat to compress a list of message hash-tables into a
-   single string. Returns the summary as a string, or NIL on error."
-  (let* ((rendered (with-output-to-string (s)
-                     (dolist (m turns)
-                       (let* ((role (gethash "role" m))
-                              (raw  (gethash "content" m))
-                              ;; Content can be NIL on assistant turns
-                              ;; that issued only tool_calls (no text).
-                              ;; Coerce to string before LENGTH.
-                              (content (cond
-                                         ((null raw) "")
-                                         ((stringp raw) raw)
-                                         (t (princ-to-string raw)))))
-                         (format s "[~A] ~A~%" role
-                                 ;; Tool results are already bounded by the Read
-                                 ;; budget; keep enough that the summarizer sees the
-                                 ;; substance instead of a stub of each turn.
-                                 (if (> (length content) 16000)
-                                     (concatenate 'string
-                                                  (subseq content 0 16000)
-                                                  "...[truncated]")
-                                     content)))))))
-    (handler-case
-        (multiple-value-bind (text)
-            (llm:llm-chat rendered :system *compaction-prompt*
-                                   :max-tokens 512
-                                   :temperature 0.0
-                                   :think nil)
-          text)
-      (error () nil))))
+  "Compress a list of message hash-tables into a continuation brief (see
+   *COMPACTION-PROMPT*). The span is summarized in window-sized chunks and,
+   if there was more than one, the partial briefs are merged by a second
+   pass. Returns the brief as a string, or NIL if every call failed."
+  (let* ((chunk-tokens (max 4000 (floor *context-token-budget* 2)))
+         (chunks (chunk-turns turns chunk-tokens))
+         (partials (remove nil (mapcar (lambda (c) (summarize-chunk c *compaction-prompt*))
+                                       chunks))))
+    (cond ((null partials) nil)
+          ((null (rest partials)) (first partials))
+          (t (or (summarize-chunk
+                  (loop for p in partials for i from 1
+                        collect (format nil "=== Brief ~D of ~D ===~%~A~%" i (length partials) p))
+                  *compaction-merge-prompt*)
+                 ;; merge failed: concatenating loses nothing, just costs tokens
+                 (format nil "~{~A~^~%~%~}" partials))))))
 
 (defun safe-tail-start (messages keep-last)
   "Compute the index where the preserved tail should begin. Snaps
@@ -277,6 +373,63 @@ agent should be able to continue with just the summary as context.")
           (namestring path)))
     (error () nil)))
 
+(defun render-user-turns (turns)
+  "The user messages in TURNS, verbatim, as a block to carry across compaction.
+   The summarizer is told to report facts, not requirements — so instructions
+   given mid-session (\"remove the pin too\", \"drop the carto layers\") were
+   surviving only as whatever the summary happened to quote. They're short and
+   they ARE the task; keep them word for word. Synthetic user nudges from the
+   engine (see the output-cap / empty-turn paths) start with \"Your last\" and
+   are skipped."
+  (let ((users (loop for m in turns
+                     for c = (gethash "content" m)
+                     when (and (equal (gethash "role" m) "user")
+                               (stringp c) (plusp (length c))
+                               (not (uiop:string-prefix-p "Your last" c)))
+                       collect c)))
+    (when users
+      (format nil "## User instructions from the compacted span (verbatim, in order)~%~{  - ~A~%~}"
+              users))))
+
+(defun render-files-touched (turns)
+  "Paths named in Read/Edit/Write/Glob/Grep calls across TURNS, deduplicated
+   in first-seen order. The contents were in the tool results being dropped;
+   the next Edit needs a fresh Read anyway (the run's read-guard still holds),
+   so tell the agent which files those were rather than let it rediscover."
+  (let ((paths '()))
+    (dolist (m turns)
+      (let ((tcs (gethash "tool_calls" m)))
+        (when (and tcs (or (vectorp tcs) (listp tcs)))
+          (map nil (lambda (tc)
+                     (let* ((fn (and (hash-table-p tc) (gethash "function" tc)))
+                            (raw (and (hash-table-p fn) (gethash "arguments" fn)))
+                            (args (and (stringp raw) (ignore-errors (jzon:parse raw)))))
+                       (when (hash-table-p args)
+                         (let ((p (or (gethash "path" args) (gethash "file_path" args))))
+                           (when (and (stringp p) (plusp (length p)))
+                             (pushnew p paths :test #'string=))))))
+               (if (listp tcs) (coerce tcs 'vector) tcs)))))
+    (when paths
+      (format nil "## Files touched in the compacted span (re-Read before editing)~%~{  - ~A~%~}"
+              (reverse paths)))))
+
+(defun apply-backend-defaults ()
+  "Re-derive backend-dependent defaults after the model/backend changes:
+   the 24k compaction budget is sized for a local llama; a frontier model
+   through OpenRouter gets 96k. An explicit OPERANDI_CONTEXT_BUDGET wins."
+  (unless (uiop:getenv "OPERANDI_CONTEXT_BUDGET")
+    (setf *context-token-budget*
+          (if (eq llm:*llm-backend* :openrouter) 96000 24000))))
+
+(defvar *last-offload-path* nil
+  "Set by OFFLOAD-MIDDLE for the *ON-COMPACT* hook; NIL after a tier-1-only pass.")
+
+(defvar *on-compact* nil
+  "Optional (lambda (before-tokens after-tokens offload-path)) called after a
+   compaction, so a host UI can show it happened — the TUI runs with VERBOSE
+   off, and a silent context reset is exactly the kind of thing a user should
+   see.")
+
 (defun offload-middle (messages)
   "Tier-2 compaction, REVERSIBLE: write the displaced middle to a file (so
    nothing is destroyed — the agent can Read it back) and replace it with a
@@ -295,12 +448,20 @@ agent should be able to continue with just the summary as context.")
            messages
            (let ((path (offload-write middle))
                  (summary (summarize-turns middle)))
+             (setf *last-offload-path* path)
              (append head
-                     (list (ht "role" "assistant"
+                     ;; USER role, not assistant: the brief reads as
+                     ;; instructions to continue from, and models weight a
+                     ;; user turn as ground truth where an assistant turn
+                     ;; reads as their own possibly-wrong prior claim.
+                     (list (ht "role" "user"
                                "content"
-                               (format nil "[~D earlier turns compacted to save context~@[; OFFLOADED (not lost) to ~A — Read that file to recover detail~].~@[~%~%~A~]~@[~%~%Summary:~%~A~]"
+                               (format nil "[Context was compacted: ~D messages replaced by the brief below~@[; the raw messages are OFFLOADED (not lost) to ~A — Read that file if you need a detail the brief dropped~]. Continue the work from where the brief leaves off; do not re-derive what it establishes.]~@[~%~%~A~]~@[~%~%~A~]~@[~%~%~A~]~@[~%~%~A~]"
                                        (length middle) path
-                                       (render-pinned-todos) summary)))
+                                       (render-pinned-todos)
+                                       (render-user-turns middle)
+                                       (render-files-touched middle)
+                                       summary)))
                      tail)))))))
 
 (defun compact-messages (messages)
@@ -325,6 +486,10 @@ agent should be able to continue with just the summary as context.")
           (format t "~&[operandi] compacted ~D->~D tok (~D->~D msgs)~%"
                   (estimate-tokens messages) (estimate-tokens out)
                   (length messages) (length out)))
+        (when *on-compact*
+          (ignore-errors
+           (funcall *on-compact* (estimate-tokens messages) (estimate-tokens out)
+                    (shiftf *last-offload-path* nil))))
         out)))
 
 (defparameter *base-system-prompt*
@@ -488,12 +653,13 @@ another tool or give a final answer.")
       (setf (gethash "stream" body) t)
       ;; ask providers to send a final usage chunk in the stream
       (setf (gethash "stream_options" body) (ht "include_usage" t)))
-    (when (eq llm:*llm-backend* :llama)              ; Qwen-only; openrouter 400s
-      (setf (gethash "chat_template_kwargs" body) (ht "enable_thinking" nil)))
+    ;; Reasoning: /effort, --effort, OPERANDI_EFFORT (see LLM:*LLM-EFFORT*);
+    ;; the legacy *DO-CHAT-DISABLE-REASONING* still means :OFF if nothing
+    ;; explicit was chosen.
+    (llm:apply-reasoning body (or llm:*llm-effort*
+                                  (and *do-chat-disable-reasoning* :off)))
     (when (eq llm:*llm-backend* :openrouter)         ; cost/token accounting
       (setf (gethash "usage" body) (ht "include" t)))
-    (when (and (eq llm:*llm-backend* :openrouter) *do-chat-disable-reasoning*)
-      (setf (gethash "reasoning" body) (ht "enabled" nil)))
     (when llm:*llm-model* (setf (gethash "model" body) llm:*llm-model*))
     body))
 
@@ -862,7 +1028,8 @@ another tool or give a final answer.")
          (*subagent-usage* (llm:make-usage))
          (*subagents* (make-hash-table :test 'equal))
          (sf:*fetch-history* (make-hash-table :test 'equal))
-         (sf:*fetch-raw-cache* (make-hash-table :test 'equal)))
+         (sf:*fetch-raw-cache* (make-hash-table :test 'equal))
+         (*live-messages* messages))
     (declare (special hooks:*current-run-id*
                        tools:*file-read-state*
                        tools:*todos*
@@ -881,7 +1048,8 @@ another tool or give a final answer.")
       ;; Keep the context under the token budget BEFORE every send, so a
       ;; turn that just appended a huge tool result gets compacted before
       ;; it can blow the model's window.
-      (setf messages (maybe-compact messages verbose))
+      (setf messages (maybe-compact messages verbose)
+            *live-messages* messages)
       (let* ((parsed (do-chat-with-retries messages tools-vec :verbose verbose))
              (msg (extract-message parsed))
              (tcs (message-tool-calls msg))
@@ -919,7 +1087,8 @@ another tool or give a final answer.")
                           (llm:usage-incf (llm:copy-usage usage) *subagent-usage*))))
         ;; Append the assistant turn no matter what — the protocol
         ;; requires it.
-        (setf messages (append messages (list (assistant-msg-from-response msg))))
+        (setf messages (append messages (list (assistant-msg-from-response msg)))
+              *live-messages* messages)
         (cond
           (tcs
            (setf empty-turns 0)   ; a tool-calling turn is progress, not a stall
@@ -968,7 +1137,8 @@ another tool or give a final answer.")
                       (format t "~&[operandi] tool budget exhausted; injecting stop~%"))
                     (setf messages
                           (append messages
-                                  (list (tool-result-msg tcid result)))))
+                                  (list (tool-result-msg tcid result)))
+                          *live-messages* messages))
            ;; Continue loop (compaction happens at the top of the next
            ;; iteration, before the next send).
            )

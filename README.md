@@ -73,7 +73,15 @@ init files skipped — **≈60ms to a ready agent** instead of ~16s.
 bin/operandi tui
 bin/operandi "your task here"
 bin/operandi --openrouter deepseek/deepseek-v4-flash "task"
+bin/operandi --openrouter deepseek/deepseek-v4-flash --effort low tui
 ```
+
+`--effort off|low|medium|high|default` (or `OPERANDI_EFFORT`) sets the
+model's reasoning: on OpenRouter `off` sends `reasoning.enabled=false` and
+the levels send `reasoning.effort`; on llama.cpp anything but `off`/`default`
+turns Qwen-style thinking on. The context-compaction budget follows the
+backend (24k tokens on llama, 96k on OpenRouter) unless
+`OPERANDI_CONTEXT_BUDGET` is set.
 
 The core (`operandi.core`, gitignored) is built on first run and rebuilt
 automatically whenever a source file changes. Same arguments as the `.lisp`
@@ -98,7 +106,9 @@ inline terminal UI:
   `/clear`,
 - a per-turn metrics line and a **running session cost** in the prompt,
 - **Ctrl-C aborts the current turn** and returns to the prompt (Ctrl-D quits),
-- slash commands: `/help /clear /sessions /resume [id] /cost /model [id] /system /tools /quit`,
+- **Ctrl-C keeps the partial turn** — the tool calls that ran stay in context,
+  marked as interrupted, so the next prompt knows what already happened,
+- slash commands: `/help /clear /sessions /resume [id] /cost /model [id] /effort [lvl] /system /tools /quit`,
 - each session is saved to `~/.operandi/sessions/<id>.{md,json}`, updated after
   every turn (so a crash never loses it); `/clear` starts a new one. `/sessions`
   lists them and `/resume [id]` continues one (the latest if no id) — or resume

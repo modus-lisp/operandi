@@ -24,6 +24,7 @@
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:export #:*llm-url* #:*llm-default-max-tokens* #:*llm-read-timeout*
            #:*llm-auth-token* #:*llm-model* #:*llm-backend*
+           #:*llm-effort* #:parse-effort #:apply-reasoning
            #:llm-chat #:ht #:extract-json
            #:use-openrouter #:use-llama
            #:with-llama #:with-openrouter #:openrouter-credits
@@ -42,6 +43,45 @@
   ":LLAMA = local llama.cpp at *llm-url* (default).
    :OPENROUTER = OpenRouter API; *llm-url*, *llm-auth-token*, and
    *llm-model* must be set. Use USE-OPENROUTER to flip.")
+
+(defparameter *llm-effort* nil
+  "Reasoning effort for the AGENT LOOP: NIL (leave it to the provider/model
+   default), :OFF, :LOW, :MEDIUM, or :HIGH. Seeded from OPERANDI_EFFORT; the
+   CLI's --effort and the TUI's /effort set it. What it means per backend:
+     OpenRouter — reasoning.enabled=false for :OFF, reasoning.effort for the
+       rest (ignored by models without reasoning; models that REQUIRE it,
+       e.g. Minimax M2.x, 400 on :OFF).
+     llama.cpp — chat_template_kwargs.enable_thinking (Qwen): on for
+       :LOW/:MEDIUM/:HIGH, off for :OFF — and off for NIL too, which is the
+       long-standing default there: a small local model's trace eats the
+       output budget before the first tool_call byte.")
+
+(defun parse-effort (s)
+  "\"off\"|\"low\"|\"medium\"|\"high\" -> keyword; \"default\" -> NIL.
+   Second value NIL if S wasn't one of those."
+  (let ((k (and (stringp s) (string-downcase (string-trim " " s)))))
+    (cond ((member k '("off" "none" "no" "0") :test #'string=) (values :off t))
+          ((string= k "low")     (values :low t))
+          ((string= k "medium")  (values :medium t))
+          ((string= k "high")    (values :high t))
+          ((member k '("default" "auto") :test #'string=) (values nil t))
+          (t (values nil nil)))))
+
+(setf *llm-effort* (let ((e (uiop:getenv "OPERANDI_EFFORT"))) (and e (parse-effort e))))
+
+(defun apply-reasoning (body &optional (effort *llm-effort*))
+  "Set the backend-specific reasoning fields on request BODY (a hash table)
+   for EFFORT, and return BODY. The single place the two dialects live."
+  (case *llm-backend*
+    (:openrouter
+     (case effort
+       (:off (setf (gethash "reasoning" body) (ht "enabled" nil)))
+       ((:low :medium :high)
+        (setf (gethash "reasoning" body) (ht "effort" (string-downcase (symbol-name effort)))))))
+    (:llama
+     (setf (gethash "chat_template_kwargs" body)
+           (ht "enable_thinking" (and (member effort '(:low :medium :high)) t)))))
+  body)
 
 (defparameter *llm-auth-token* nil
   "Bearer token for the LLM endpoint, or NIL. Required for openrouter.")
@@ -172,12 +212,18 @@
 (defun llm-chat (prompt &key system
                              (max-tokens *llm-default-max-tokens*)
                              (temperature 0.0)
-                             think
+                             (think nil think-p)
+                             (effort nil effort-p)
                              extra)
   "POST a chat completion. Backend-aware: on :LLAMA includes
    chat_template_kwargs.enable_thinking; on :OPENROUTER sends
    model + Authorization. Returns (values content reasoning timings
-   raw-parsed)."
+   raw-parsed).
+
+   EFFORT overrides *LLM-EFFORT* for this call. THINK is the older switch
+   the side-callers (summarizer, safefetch) use: NIL means :OFF on llama
+   as it always did, but only :LOW on OpenRouter — these are cheap utility
+   calls, and :OFF would 400 on a model that requires reasoning."
   (let* ((msgs (let ((acc '()))
                  (when system
                    (push (ht "role" "system" "content" system) acc))
@@ -186,10 +232,12 @@
          (body-ht (ht "messages" msgs
                       "max_tokens" max-tokens
                       "temperature" temperature)))
-    ;; Local llama.cpp respects this Qwen kwarg; openrouter would 400.
-    (when (eq *llm-backend* :llama)
-      (setf (gethash "chat_template_kwargs" body-ht)
-            (ht "enable_thinking" (if think t nil))))
+    (apply-reasoning body-ht
+                     (cond (effort-p effort)
+                           (think-p (cond (think :medium)
+                                          ((eq *llm-backend* :llama) :off)
+                                          (t :low)))
+                           (t *llm-effort*)))
     (when *llm-model*
       (setf (gethash "model" body-ht) *llm-model*))
     ;; OpenRouter only reports real USD cost when asked; harmless to llama.

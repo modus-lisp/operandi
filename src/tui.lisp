@@ -839,7 +839,7 @@
     (ui-exit)
     (raw-off)
     (setf *ui-out* (lambda (s) (write-string s) (force-output)))
-    (when greet (format t "~&~A~%" (paint "bye." :gray)))))
+    (when greet (farewell sess))))
 
 ;;; -------------------------------- repl ------------------------------
 
@@ -851,6 +851,27 @@
                  :gray)
           (paint (format nil "· session log: ~A~A.md" session:*sessions-dir* (gethash :id sess))
                  :gray)))
+
+(defun resume-command (sess)
+  "The shell command that brings SESS back, model flag included — a bare
+   --resume would reopen it on the default backend, not the one it ran on."
+  (format nil "operandi~@[ --openrouter ~A~]~@[ --effort ~A~] --resume ~A tui"
+          (and (eq llm:*llm-backend* :openrouter) llm:*llm-model*)
+          (and llm:*llm-effort* (effort-label))
+          (gethash :id sess)))
+
+(defun farewell (sess)
+  "Printed on exit. A session with turns is saved and resumable; say how,
+   so the id doesn't have to be dug out of /sessions later."
+  (if (plusp (or (session:session-turns sess) 0))
+      (format t "~&~A~%~A~%  ~A~%~A~%"
+              (paint "bye." :gray)
+              (paint (format nil "session ~A saved (~A turn~:P). to pick it up again:"
+                             (gethash :id sess) (session:session-turns sess))
+                     :gray)
+              (paint (resume-command sess) :cyan)
+              (paint "(or --resume with no id for the latest session; /sessions lists them)" :gray))
+      (format t "~&~A~%" (paint "bye." :gray))))
 
 (defun repl-simple (sess &key (greet t) resume resumed)
   "The synchronous line-at-a-time REPL: read a task, run it to completion, read
@@ -877,8 +898,7 @@
              ((eq cmd :quit) (return))
              (cmd)
              (t (run-turn sess line))))))))
-  (when greet
-    (format t "~&~A~%" (paint "bye." :gray))))
+  (when greet (farewell sess)))
 
 (defun repl (&key (greet t) resume once)
   "Start the interactive operandi REPL. RESUME (a session id or :LATEST) loads a

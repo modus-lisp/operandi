@@ -39,7 +39,7 @@
            #:*on-token*
            #:*subagent-usage*
            #:*subagents*
-           #:*live-messages* #:message-tool-calls #:tool-result-msg
+           #:*live-messages* #:*steer-fn* #:message-tool-calls #:tool-result-msg
            #:*on-compact* #:*compaction-max-tokens* #:apply-backend-defaults
            #:*context-token-budget* #:*context-headroom* #:compact-threshold
            #:*do-chat-max-tokens*
@@ -117,6 +117,23 @@
    pass leaves the margin it was supposed to create instead of landing on the
    line and re-firing on the next tool result."
   (max 1000 (floor (* *context-token-budget* (- 1.0 *context-headroom*)))))
+
+(defvar *steer-fn* nil
+  "A function of no arguments, bound by the HOST, called once per iteration just
+   before the next send.  Anything it returns as a non-blank string is appended
+   to the running conversation as a user turn — so a message written while the
+   agent is working lands INSIDE the turn and redirects it, instead of waiting
+   behind it.
+
+   This is the only way a host can get a word in edgeways: the loop is otherwise
+   a closed cycle of send / tool / send, and a queued message cannot be seen
+   until the turn it is queued behind has finished — which, for a long run, is
+   exactly when it is no longer the thing you wanted to say.
+
+   Called between a tool-result append and the next send, so the history it
+   appends to always ends in a complete assistant/tool exchange.  Errors from it
+   are swallowed: steering is a convenience, and a host bug in it must not take
+   down a run that is otherwise fine.")
 
 (defvar *live-messages* nil
   "The running message list of the RUN in progress, updated after every
@@ -1217,6 +1234,13 @@ another tool or give a final answer.")
              (setf messages (maybe-compact messages verbose))
              (return (values (format nil "[stalled: ~A]" reason) messages n
                              (llm:usage-incf (llm:copy-usage usage) *subagent-usage*)))))))
+      ;; STEERING.  Before compaction, so anything just said is part of what gets
+      ;; measured and sent rather than arriving after the window was sized.
+      (when *steer-fn*
+        (let ((s (ignore-errors (funcall *steer-fn*))))
+          (when (and (stringp s) (plusp (length (string-trim '(#\Space #\Newline #\Tab) s))))
+            (when verbose (format t "~&[operandi] steer: ~A~%" s))
+            (setf messages (append messages (list (ht "role" "user" "content" s)))))))
       ;; Keep the context under the token budget BEFORE every send, so a
       ;; turn that just appended a huge tool result gets compacted before
       ;; it can blow the model's window.

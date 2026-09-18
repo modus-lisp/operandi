@@ -41,7 +41,7 @@
            #:*subagents*
            #:*live-messages* #:message-tool-calls #:tool-result-msg
            #:*on-compact* #:*compaction-max-tokens* #:apply-backend-defaults
-           #:*context-token-budget*
+           #:*context-token-budget* #:*context-headroom* #:compact-threshold
            #:*do-chat-max-tokens*
            #:*tool-result-keep-chars*
            #:*compact-keep-last*
@@ -82,7 +82,41 @@
    model's context so there's headroom for the reply.  The 24k default suits
    a small LOCAL model; a large-context frontier worker should raise it
    (OPERANDI_CONTEXT_BUDGET) — a too-small budget makes an agent THRASH:
-   compaction evicts earlier findings faster than it can act on them.")
+   compaction evicts earlier findings faster than it can act on them.
+
+   This is a CEILING, not the trigger: compaction fires at COMPACT-THRESHOLD,
+   which is this less *CONTEXT-HEADROOM*.")
+
+(defparameter *context-headroom*
+  (let ((e (uiop:getenv "OPERANDI_CONTEXT_HEADROOM")))
+    (or (and e (ignore-errors (let ((v (read-from-string e)))
+                                (and (realp v) (< -0.001 v 0.9) (float v 1.0)))))
+        0.2))
+  "Fraction of *CONTEXT-TOKEN-BUDGET* kept free, so compaction fires with room
+   to spare instead of at the line.
+
+   Compacting exactly AT the budget means the send immediately before it is the
+   largest one the run will ever make, and the trigger is an ESTIMATE — a
+   character count divided by a calibrated ratio, not the model's tokenizer.
+   Estimate low by a few percent at the moment the history is already full and
+   the request is rejected for length, which is the one failure that loses the
+   turn rather than degrading it.  A margin costs a slightly earlier compaction
+   and buys never discovering the error from the provider.
+
+   What it is NOT for is the reply: *CONTEXT-TOKEN-BUDGET* is already meant to
+   sit at roughly half the model's window, so the answer's room comes out of the
+   gap between budget and window, not out of this.  This margin covers the two
+   things that happen BETWEEN checks — a single tool result arriving several
+   thousand tokens larger than anything before it, and the estimator drifting
+   against a tokenizer it cannot see.  0.2 of 96k is ~19k, which absorbs a large
+   file read; 0.2 of a 24k local budget is ~4.8k, which absorbs a normal one.")
+
+(defun compact-threshold ()
+  "The estimated-token count at which compaction fires: the budget less its
+   headroom.  Compaction also TARGETS this number rather than the budget, so a
+   pass leaves the margin it was supposed to create instead of landing on the
+   line and re-firing on the next tool result."
+  (max 1000 (floor (* *context-token-budget* (- 1.0 *context-headroom*)))))
 
 (defvar *live-messages* nil
   "The running message list of the RUN in progress, updated after every
@@ -545,16 +579,16 @@ completed). Do not shorten for brevity — nothing may be lost.")
    still over budget: OFFLOAD the middle (reversibly — raw kept in a file)
    with a summary pointer. Returns a list at or below budget where
    possible; never grows the input."
-  (if (<= (estimate-tokens messages) *context-token-budget*)
+  (if (<= (estimate-tokens messages) (compact-threshold))
       messages
       (let ((trimmed (trim-old-tool-results messages *compact-keep-last*)))
-        (if (<= (estimate-tokens trimmed) *context-token-budget*)
+        (if (<= (estimate-tokens trimmed) (compact-threshold))
             trimmed
             (offload-middle trimmed)))))
 
 (defun maybe-compact (messages verbose)
   "Compact MESSAGES if it's over the token budget; else return it as-is."
-  (if (<= (estimate-tokens messages) *context-token-budget*)
+  (if (<= (estimate-tokens messages) (compact-threshold))
       messages
       (let ((out (compact-messages messages)))
         (when verbose

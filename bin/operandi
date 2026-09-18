@@ -36,6 +36,10 @@ if needs_build; then
     --eval "(save-lisp-and-die \"$CORE\")" >/dev/null
 fi
 
+# A sandboxed launcher can't rebuild (no ~/quicklisp, no fasl cache), so it
+# runs us unsandboxed with this set to do the freshness check first.
+[ -n "${OPERANDI_BUILD_ONLY:-}" ] && exit 0
+
 # Launch from the core. --no-userinit/--no-sysinit skips the init files (and
 # thus the whole-home ASDF tree scan); operandi is already in the image, so
 # bin/operandi.lisp's load is a no-op and only the CLI dispatch runs.

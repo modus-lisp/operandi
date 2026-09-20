@@ -247,10 +247,11 @@
   "(values text image-paths): every whitespace-delimited @token in PROMPT that
    names an existing image file, plus anything queued by /paste. Tokens that
    don't resolve are left alone — @ is common enough in prose. A resolved
-   token is rewritten to [attached image: name] in the text: left as @name
-   the model reads it as a file to go and find, and starts globbing for it
-   instead of looking at the image part right next to it."
-  (let ((images '()) (out '()))
+   token is rewritten to [attached image N] in the text — numbered, not
+   named: left as @name (or even named in the marker) the model reads it
+   as a file to go and find, and starts globbing and decoding it instead
+   of looking at the image part right next to it."
+  (let ((images '()) (out '()) (n 0))
     (dolist (tok (uiop:split-string prompt :separator '(#\Space)))
       (let* ((bare (and (> (length tok) 1) (char= (char tok 0) #\@)
                         (string-right-trim ",.;:!?)" (subseq tok 1))))
@@ -259,11 +260,12 @@
         (if true
             (let ((suffix (subseq tok (1+ (length bare)))))   ; the trimmed punctuation
               (push (namestring true) images)
-              (push (format nil "[attached image: ~A]~A" (file-namestring true) suffix) out))
+              (push (format nil "[attached image ~D]~A" (incf n) suffix) out))
             (push tok out))))
     (let ((pending (shiftf *pending-images* '())))
-      (values (format nil "~{~A~^ ~}~{~%[attached image: ~A]~}"
-                      (nreverse out) (mapcar #'file-namestring pending))
+      (values (format nil "~{~A~^ ~}~{~%[attached image ~D]~}"
+                      (nreverse out)
+                      (loop for p in pending collect (incf n)))
               (append (reverse images) pending)))))
 
 (defun clipboard-image ()

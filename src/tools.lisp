@@ -482,15 +482,13 @@ Literal by default; prefix '/' for regex. First 200 matching lines."
                             "pattern" (llm:ht "type" "string"
                                                "description" "Pattern to search for")
                             "path"    (llm:ht "type" "string"
-                                               "description" "Path to search (default: cwd). Rejects '/'"))
+                                               "description" "File or directory to search (absolute or relative; default: cwd)."))
               "required" (vector "pattern")))
   (let* ((pat (gethash "pattern" args))
          (raw-path (gethash "path" args))
          (path (if (and (stringp raw-path) (plusp (length raw-path))) raw-path ".")))
     (cond
       ((not (stringp pat)) "Grep: pattern must be a string")
-      ((and (stringp raw-path) (plusp (length raw-path)) (char= (char raw-path 0) #\/))
-       (format nil "Error: path must be relative, got absolute path '~A'" raw-path))
       (t
        ;; Pattern and path go as ARGV, never a shell string — no injection.
        ;; `--` stops a leading-dash pattern being read as a flag. Bounded by

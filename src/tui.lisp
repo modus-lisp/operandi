@@ -411,6 +411,11 @@
     (ignore-errors
      (unless (find-package "LINEDIT")
        (funcall (read-from-string "ql:quickload") "linedit" :silent t))
+     ;; multi-line editing (src/linedit-ext.lisp) — in the core already when
+     ;; launched via bin/operandi; loaded here otherwise
+     (unless (find-package "OPERANDI.LINEDIT-EXT")
+       (let ((ext (asdf:system-relative-pathname :operandi "src/linedit-ext.lisp")))
+         (when (probe-file ext) (load ext))))
      (setf *linedit* (find-symbol "LINEDIT" "LINEDIT")))))
 
 (defun %plain-read (prompt)

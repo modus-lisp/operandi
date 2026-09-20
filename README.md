@@ -108,6 +108,9 @@ inline terminal UI:
 - **Ctrl-C aborts the current turn** and returns to the prompt (Ctrl-D quits),
 - **Ctrl-C keeps the partial turn** — the tool calls that ran stay in context,
   marked as interrupted, so the next prompt knows what already happened,
+- **multi-line input**: Ctrl-J inserts a newline, Enter submits; Up/Down move
+  between lines of the buffer and reach history from the first/last line.
+  A pasted block arrives as one message,
 - slash commands: `/help /clear /sessions /resume [id] /cost /model [id] /effort [lvl] /system /tools /quit`,
 - each session is saved to `~/.operandi/sessions/<id>.{md,json}`, updated after
   every turn (so a crash never loses it); `/clear` starts a new one. `/sessions`

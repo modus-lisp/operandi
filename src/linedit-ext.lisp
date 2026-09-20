@@ -142,6 +142,59 @@
   (declare (ignore chord))
   (linedit::add-char #\Newline editor))
 
+;;; --- history: one entry per line in the file, newlines escaped ---------
+;;; linedit's buffer-push WRITE-LINEs the entry and ensure-buffer READ-LINEs
+;;; the file back, so a multi-line entry survives the session but comes back
+;;; as one entry per line after a restart. Escape on the way out, decode on
+;;; the way in; entries without newlines are written exactly as before.
+
+(defun escape-entry (string)
+  (with-output-to-string (o)
+    (loop for c across string
+          do (case c
+               (#\Newline (write-string "\\n" o))
+               (#\\ (write-string "\\\\" o))
+               (t (write-char c o))))))
+
+(defun unescape-entry (line)
+  (if (not (find #\\ line))
+      line
+      (with-output-to-string (o)
+        (loop with i = 0
+              while (< i (length line))
+              do (let ((c (char line i)))
+                   (cond ((and (char= c #\\) (< (1+ i) (length line)))
+                          (let ((n (char line (1+ i))))
+                            (cond ((char= n #\n) (write-char #\Newline o) (incf i 2))
+                                  ((char= n #\\) (write-char #\\ o) (incf i 2))
+                                  (t (write-char c o) (incf i)))))
+                         (t (write-char c o) (incf i))))))))
+
+(defun linedit::ensure-buffer (datum)
+  (if (typep datum 'linedit::buffer)
+      datum
+      (let ((buffer (make-instance 'linedit::buffer :pathname datum)))
+        (when datum
+          (with-open-file (f datum :direction :input :if-does-not-exist nil
+                                   :external-format :utf-8)
+            (when f
+              (loop for line = (read-line f nil)
+                    while line
+                    do (push (unescape-entry line) (linedit::%buffer-list buffer)))
+              (setf (linedit::%buffer-prev buffer) (linedit::%buffer-list buffer)))))
+        buffer)))
+
+(defun linedit::buffer-push (string buffer)
+  (unless (equal string (car (linedit::%buffer-list buffer)))
+    (push string (linedit::%buffer-list buffer))
+    (let ((pathname (linedit::%buffer-pathname buffer)))
+      (when pathname
+        (with-open-file (f pathname :direction :output :if-does-not-exist :create
+                                    :if-exists :append :external-format :utf-8)
+          (write-line (escape-entry string) f))))
+    (setf (linedit::%buffer-next buffer) nil
+          (linedit::%buffer-prev buffer) (linedit::%buffer-list buffer))))
+
 (defun install ()
   (setf (gethash "Up-arrow" linedit::*commands*) 'up-or-history
         (gethash "Down-arrow" linedit::*commands*) 'down-or-history

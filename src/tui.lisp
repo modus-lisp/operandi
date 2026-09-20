@@ -871,7 +871,9 @@
                      :gray)
               (paint (resume-command sess) :cyan)
               (paint "(or --resume with no id for the latest session; /sessions lists them)" :gray))
-      (format t "~&~A~%" (paint "bye." :gray))))
+      (format t "~&~A~%~A~%"
+              (paint "bye." :gray)
+              (paint "(no turns, so nothing was saved; `operandi --resume tui` reopens the latest saved session)" :gray))))
 
 (defun repl-simple (sess &key (greet t) resume resumed)
   "The synchronous line-at-a-time REPL: read a task, run it to completion, read

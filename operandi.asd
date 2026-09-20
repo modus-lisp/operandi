@@ -30,7 +30,7 @@
     ((:file "text")                                           ; operandi.text
      (:file "llm")                                            ; operandi.llm
      (:file "store")                                          ; operandi.store
-     (:file "search")                                         ; operandi.search
+     (:file "search"   :depends-on ("llm"))                   ; operandi.search
      (:file "safefetch" :depends-on ("llm" "text"))           ; operandi.safefetch
      (:file "hooks"    :depends-on ("store"))                 ; operandi.hooks
      (:file "tools"    :depends-on ("llm" "search" "hooks" "safefetch" "text"))  ; operandi.tools

@@ -115,7 +115,12 @@ inline terminal UI:
   the terminal to paste its path); **Ctrl-V** pulls an image off the clipboard
   (`brew install pngpaste`), as does `/paste`. Needs a vision model —
   `deepseek/deepseek-v4.1-flash` and the Qwen-VL family on OpenRouter are,
-- slash commands: `/help /clear /sessions /resume [id] /cost /model [id] /effort [lvl] /paste /system /tools /quit`,
+- **web search** follows the model: on OpenRouter the `WebSearch` tool uses
+  OpenRouter's web plugin (same credential, ~$4/1000 results); on local llama
+  it uses a SearXNG at `SEARXNG_URL` (default `http://127.0.0.1:8080`) if one
+  answers, else Brave. `OPERANDI_SEARCH=openrouter|searxng|brave` or `/search`
+  forces one,
+- slash commands: `/help /clear /sessions /resume [id] /cost /model [id] /effort [lvl] /paste /search [be] /system /tools /quit`,
 - each session is saved to `~/.operandi/sessions/<id>.{md,json}`, updated after
   every turn (so a crash never loses it); `/clear` starts a new one. `/sessions`
   lists them and `/resume [id]` continues one (the latest if no id) — or resume
@@ -197,7 +202,7 @@ sbcl --non-interactive --load inspect/robustness-test.lisp
 | What | Where |
 |------|-------|
 | OpenRouter token | `~/.operandi/openrouter.token` |
-| Brave Search token | `~/.operandi/brave-search.token` |
+| Brave Search token | `BRAVE_API_KEY`, else `~/.operandi/brave-search.token` |
 | Agent audit log DB | `~/.operandi/operandi.db` |
 | Persistent agent notes | `~/.operandi/operandi-notes.md` |
 | TUI session transcripts | `~/.operandi/sessions/` |

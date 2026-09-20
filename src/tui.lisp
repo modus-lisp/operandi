@@ -286,6 +286,15 @@
             (t (values nil (string-trim '(#\Newline #\Space)
                                         (if (plusp (length (or err ""))) err "no image on the clipboard"))))))))
 
+(defun cmd-search (arg)
+  (if (null arg)
+      (format t "~&search: ~A~%" (paint (operandi.search:backend-status) :cyan))
+      (multiple-value-bind (b ok) (operandi.search:parse-backend arg)
+        (if ok
+            (progn (setf operandi.search:*backend* b)
+                   (format t "~&→ search: ~A~%" (paint (operandi.search:backend-status) :cyan)))
+            (format t "~&~A~%" (paint "search takes openrouter, searxng, brave, or auto" :yellow))))))
+
 (defun cmd-paste ()
   (multiple-value-bind (path reason) (clipboard-image)
     (if path
@@ -381,6 +390,7 @@
                  ("/resume [id]"   "resume a saved session (latest if no id)")
                  ("/cost"          "session cost + token totals")
                  ("/paste"         "attach the clipboard image to your next message (Ctrl-V does this inline)")
+                 ("/search [be]"   "show or set the web-search backend: openrouter, searxng, brave, auto")
                  ("/model [id]"    "show or switch model (id like vendor/name → OpenRouter)")
                  ("/effort [lvl]"  "show or set reasoning effort: off, low, medium, high, default")
                  ("/system"        "print the active system prompt")
@@ -475,6 +485,7 @@
        (format t "~&~A~%" (paint "— conversation cleared (new session) —" :gray)) t)
       ((string-equal verb "/cost") (cmd-cost sess) t)
       ((string-equal verb "/paste") (cmd-paste) t)
+      ((string-equal verb "/search") (cmd-search arg) t)
       ((string-equal verb "/sessions") (cmd-sessions) t)
       ((string-equal verb "/resume") (cmd-resume sess arg) t)
       ((string-equal verb "/model") (cmd-model arg) t)

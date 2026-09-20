@@ -100,6 +100,7 @@
 (allow network-outbound (remote tcp "*:*"))
 (deny  network-outbound (remote tcp "localhost:*"))
 (allow network-outbound (remote tcp "localhost:8081"))
+(allow network-outbound (remote tcp "localhost:8080"))   ; SearXNG, for WebSearch
 
 (allow network-outbound (literal "/private/var/run/mDNSResponder"))
 

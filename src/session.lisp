@@ -96,7 +96,7 @@
       (let ((role (gethash "role" m)) (c (gethash "content" m))
             (tcs (gethash "tool_calls" m)))
         (unless (string= role "system")
-          (format o "**~A:** ~A~%~%" role (%clip (or (and (stringp c) c) "") 6000))
+          (format o "**~A:** ~A~%~%" role (%clip (llm:content-text c) 6000))
           (when (and tcs (or (vectorp tcs) (listp tcs)))
             (map nil (lambda (tc)
                        (let ((fn (and (hash-table-p tc) (gethash "function" tc))))

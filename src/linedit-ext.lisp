@@ -195,10 +195,24 @@
     (setf (linedit::%buffer-next buffer) nil
           (linedit::%buffer-prev buffer) (linedit::%buffer-list buffer))))
 
+(defun paste-image (chord editor)
+  "Ctrl-V: save the clipboard image and insert its @path into the buffer, so
+   it rides along with the message like a dragged-in file would. With no
+   image on the clipboard, beep — Cmd-V is the terminal's own text paste."
+  (declare (ignore chord))
+  (multiple-value-bind (path reason)
+      (funcall (find-symbol "CLIPBOARD-IMAGE" "OPERANDI.TUI"))
+    (declare (ignore reason))
+    (if path
+        (loop for c across (format nil "@~A " path)
+              do (linedit::add-char c editor))
+        (linedit::beep editor))))
+
 (defun install ()
   (setf (gethash "Up-arrow" linedit::*commands*) 'up-or-history
         (gethash "Down-arrow" linedit::*commands*) 'down-or-history
         (gethash "C-J" linedit::*commands*) 'insert-newline
+        (gethash "C-V" linedit::*commands*) 'paste-image
         ;; LF was "Return"; CR (13) keeps that translation
         (gethash 10 linedit::*terminal-translations*) "C-J")
   t)

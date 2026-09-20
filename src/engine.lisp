@@ -173,12 +173,18 @@
                             (+ (* (- 1d0 alpha) *chars-per-token*)
                                (* alpha observed))))))))
 
+(defparameter *image-tokens* 1500
+  "Estimated prompt tokens per attached image. Providers bill a screenshot
+   at roughly 1-2k regardless of its base64 length, which is what the
+   content string would otherwise be measured by.")
+
 (defun msg-chars (m)
   "Character weight of one message: content + tool_call arguments + a small
-   per-message overhead."
+   per-message overhead. Images count a fixed *IMAGE-TOKENS* each."
   (let ((chars 4))
     (let ((c (gethash "content" m)))
-      (when (stringp c) (incf chars (length c))))
+      (incf chars (length (llm:content-text c)))
+      (incf chars (round (* (llm:content-images c) *image-tokens* *chars-per-token*))))
     (let ((tcs (gethash "tool_calls" m)))
       (when (and tcs (or (vectorp tcs) (listp tcs)))
         (map nil (lambda (tc)
@@ -274,7 +280,7 @@ completed). Do not shorten for brevity — nothing may be lost.")
    name(args) — the call is what tells the reader which file was touched."
   (let* ((role (gethash "role" m))
          (raw  (gethash "content" m))
-         (content (cond ((null raw) "") ((stringp raw) raw) (t (princ-to-string raw))))
+         (content (llm:content-text raw))
          (tcs (gethash "tool_calls" m)))
     (with-output-to-string (s)
       (format s "[~A] ~A~%" role
@@ -402,7 +408,7 @@ completed). Do not shorten for brevity — nothing may be lost.")
       (let ((role (gethash "role" m)) (c (gethash "content" m))
             (tcs (gethash "tool_calls" m)))
         (format s "[~A] ~A~%" role
-                (cond ((stringp c) c) ((null c) "") (t (princ-to-string c))))
+                (llm:content-text c))
         (when (and tcs (or (vectorp tcs) (listp tcs)))
           (map nil (lambda (tc)
                      (let ((fn (and (hash-table-p tc) (gethash "function" tc))))
@@ -524,8 +530,8 @@ completed). Do not shorten for brevity — nothing may be lost.")
   (let ((users '())
         (note nil))                     ; the engine nudge most recently seen, if any
     (dolist (m turns)
-      (let ((c (gethash "content" m)))
-        (when (and (equal (gethash "role" m) "user") (stringp c) (plusp (length c)))
+      (let ((c (llm:content-text (gethash "content" m))))
+        (when (and (equal (gethash "role" m) "user") (plusp (length c)))
           (cond
             ;; An engine nudge is not an instruction, so it does not get a line of
             ;; its own — but it is the REASON for any bare "continue" after it, so

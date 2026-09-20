@@ -19,6 +19,7 @@
   :version "0.1.0"
   :depends-on ("com.inuoe.jzon"
                "dexador"
+               "cl-base64"
                "cl-ppcre"
                "sqlite"
                "bordeaux-threads")

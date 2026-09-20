@@ -10,23 +10,6 @@
 
 (allow file-read-data file-read-metadata (path "/" "/Users" "/Users/vinnyfiano"))
 (allow file-read-data file-read-metadata (subpath "/usr" "/opt" "/Users/vinnyfiano/.cache/common-lisp"))
-;; The rest of the OS, read-only: /bin and /sbin for the coreutils the agent's
-;; Bash tool leans on (ls, cat, sleep…), /System and /Library for the dylibs,
-;; frameworks and Command Line Tools that anything non-trivial (perl, python3,
-;; node, git) links against, /private/var/select for /bin/sh's shell choice.
-(allow file-read-data file-read-metadata
-  (subpath "/bin" "/sbin" "/System" "/Library" "/private/var/select"))
-(allow file-read* (literal "/dev/random" "/dev/urandom"))
-;; Scratch space (the xcrun shims behind /usr/bin/git etc. also cache here),
-;; and the user's git identity so commits inside the project work.
-(allow file-read* file-write* (subpath "/private/tmp"))
-;; The per-user temp/cache dirs (confstr DARWIN_USER_TEMP_DIR — resolved via
-;; the dirhelper service); without them git/xcrun/python warn on every call.
-(allow mach-lookup (global-name "com.apple.bsd.dirhelper"))
-(allow file-read* file-write* (subpath "/private/var/folders/9m/1ylshs2s2y14754pxfxhxf4h0000gp/T"
-                                       "/private/var/folders/9m/1ylshs2s2y14754pxfxhxf4h0000gp/C"))
-(allow file-read* (literal "/Users/vinnyfiano/.gitconfig" "/Users/vinnyfiano/.gitignore_global")
-                  (subpath "/Users/vinnyfiano/.config/git"))
 
 ;; realpath()/getcwd() stat every component on the way up, so each subpath
 ;; grant below needs metadata-only access on all of its ancestors — one missing
@@ -41,6 +24,27 @@
   (if (> (string-length p) 1)
       (begin (allow file-read-metadata (literal p))
              (allow-ancestor-metadata (parent-dir p)))))
+
+;; The rest of the OS, read-only: /bin and /sbin for the coreutils the agent's
+;; Bash tool leans on (ls, cat, sleep…), /System and /Library for the dylibs,
+;; frameworks and Command Line Tools that anything non-trivial (perl, python3,
+;; node, git) links against, /private/var/select for /bin/sh's shell choice.
+(allow file-read-data file-read-metadata
+  (subpath "/bin" "/sbin" "/System" "/Library" "/private/var/select"))
+(allow file-read* (literal "/dev/random" "/dev/urandom"))
+;; Scratch space (the xcrun shims behind /usr/bin/git etc. also cache here),
+;; and the user's git identity so commits inside the project work.
+(allow-ancestor-metadata "/private/tmp")
+(allow file-read* file-write* (subpath "/private/tmp"))
+;; The per-user temp/cache dirs (confstr DARWIN_USER_TEMP_DIR — resolved via
+;; the dirhelper service); without them git/xcrun/python warn on every call.
+(allow mach-lookup (global-name "com.apple.bsd.dirhelper"))
+(allow-ancestor-metadata "/private/var/folders/9m/1ylshs2s2y14754pxfxhxf4h0000gp/T")
+(allow-ancestor-metadata "/private/var/folders/9m/1ylshs2s2y14754pxfxhxf4h0000gp/C")
+(allow file-read* file-write* (subpath "/private/var/folders/9m/1ylshs2s2y14754pxfxhxf4h0000gp/T"
+                                       "/private/var/folders/9m/1ylshs2s2y14754pxfxhxf4h0000gp/C"))
+(allow file-read* (literal "/Users/vinnyfiano/.gitconfig" "/Users/vinnyfiano/.gitignore_global")
+                  (subpath "/Users/vinnyfiano/.config/git"))
 
 ;; The agent's own world — writable, since it self-modifies
 (allow-ancestor-metadata "/Users/vinnyfiano/workspace/modus-lisp")
@@ -63,6 +67,14 @@
 
 ;; Local timezone, so session-log timestamps aren't UTC
 (allow file-read* (literal "/private/etc/localtime") (subpath "/private/var/db/timezone"))
+
+;; The clipboard, so Ctrl-V in the TUI can pull in a pasted image
+;; (pngpaste needs only the pasteboard service — osascript would drag in
+;; LaunchServices and half a dozen more)
+(allow mach-lookup (global-name "com.apple.pasteboard.1"
+                                ;; read-only LaunchServices type map, for the
+                                ;; TIFF->PNG conversion of a screenshot
+                                "com.apple.lsd.mapdb"))
 
 ;; Don't let it drive Finder/Terminal/browsers via AppleScript
 (deny appleevent-send)

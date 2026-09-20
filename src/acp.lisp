@@ -127,6 +127,25 @@
 
 (defun text-block (s) (obj "type" "text" "text" (or s "")))
 
+(defun blocks->content (blocks)
+  "A prompt's ContentBlock array as message content: the text blocks
+   flattened to one string (BLOCKS->TEXT), plus an image_url part per
+   image block — ACP hands those over as base64 + mimeType, which is a
+   data: URL away from what the chat API wants."
+  (let ((text (blocks->text blocks))
+        (images (when (vectorp blocks)
+                  (loop for b across blocks
+                        when (and (hash-table-p b) (equal (gethash "type" b) "image")
+                                  (stringp (gethash "data" b)))
+                          collect (llm:ht "type" "image_url"
+                                          "image_url"
+                                          (llm:ht "url" (format nil "data:~A;base64,~A"
+                                                                (or (gethash "mimeType" b) "image/png")
+                                                                (gethash "data" b))))))))
+    (if images
+        (coerce (cons (llm:text-part text) images) 'vector)
+        text)))
+
 (defun blocks->text (blocks)
   "Flatten a prompt's ContentBlock array to a single user string."
   (with-output-to-string (o)
@@ -143,7 +162,7 @@
                                 (gethash "uri" r) (or (gethash "text" r) "")))))
                    ((equal type "resource_link")
                     (format o "~A (~A)" (or (gethash "name" b) "") (gethash "uri" b)))
-                   ((equal type "image") (format o "[image omitted]"))
+                   ((equal type "image") (format o "[attached image]"))
                    ((equal type "audio") (format o "[audio omitted]"))))))))
 
 (defparameter +tool-kind+
@@ -333,7 +352,7 @@
       ((null p) (send-error req-id -32602 (format nil "unknown sessionId ~A" sid)))
       (t
        (let* ((cwd (getf p :cwd))
-              (text (blocks->text (gethash "prompt" params))))
+              (text (blocks->content (gethash "prompt" params))))
          (when cwd (ignore-errors (uiop:chdir cwd)))
          (let ((w (bt:make-thread
                    (lambda ()
@@ -380,7 +399,7 @@
   (setf *client-caps* (and (hash-table-p params) (gethash "clientCapabilities" params)))
   (obj "protocolVersion" *protocol-version*
        "agentCapabilities" (obj "loadSession" t
-                                "promptCapabilities" (obj "image" nil "audio" nil "embeddedContext" t)
+                                "promptCapabilities" (obj "image" t "audio" nil "embeddedContext" t)
                                 "mcpCapabilities" (obj "http" nil "sse" nil))
        "agentInfo" (obj "name" "operandi" "title" "operandi" "version" "0.1.0")
        "authMethods" #()))

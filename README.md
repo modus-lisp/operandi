@@ -111,7 +111,11 @@ inline terminal UI:
 - **multi-line input**: Ctrl-J inserts a newline, Enter submits; Up/Down move
   between lines of the buffer and reach history from the first/last line.
   A pasted block arrives as one message,
-- slash commands: `/help /clear /sessions /resume [id] /cost /model [id] /effort [lvl] /system /tools /quit`,
+- **images**: `@path/to/shot.png` in a prompt attaches it (drag a file onto
+  the terminal to paste its path); **Ctrl-V** pulls an image off the clipboard
+  (`brew install pngpaste`), as does `/paste`. Needs a vision model —
+  `deepseek/deepseek-v4.1-flash` and the Qwen-VL family on OpenRouter are,
+- slash commands: `/help /clear /sessions /resume [id] /cost /model [id] /effort [lvl] /paste /system /tools /quit`,
 - each session is saved to `~/.operandi/sessions/<id>.{md,json}`, updated after
   every turn (so a crash never loses it); `/clear` starts a new one. `/sessions`
   lists them and `/resume [id]` continues one (the latest if no id) — or resume

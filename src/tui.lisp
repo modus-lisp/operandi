@@ -33,7 +33,7 @@
                     (#:jzon  #:com.inuoe.jzon)
                     (#:bt    #:bordeaux-threads)
                     (#:session #:operandi.session))
-  (:export #:repl #:*color*))
+  (:export #:repl #:*color* #:clipboard-image))
 
 (in-package #:operandi.tui)
 
@@ -226,9 +226,92 @@
                               "content"
                               "[turn interrupted by the user (Ctrl-C). The tool calls above did run and their effects stand; anything after them did not happen.]"))))))
 
+;;; ---- images -----------------------------------------------------------
+;;; Two ways in: an @path token in the prompt (drag a file onto the terminal
+;;; and it pastes its path), or /paste and Ctrl-V, which pull a PNG off the
+;;; clipboard via pngpaste into ~/.operandi/paste/ and hand it over the same
+;;; way. The message then goes out as a text part plus image_url parts.
+
+(defvar *pending-images* '()
+  "Image paths queued by /paste for the next prompt.")
+
+(defparameter *paste-dir*
+  (merge-pathnames ".operandi/paste/" (user-homedir-pathname)))
+
+(defun expand-tilde (path)
+  (if (and (> (length path) 1) (char= (char path 0) #\~) (char= (char path 1) #\/))
+      (namestring (merge-pathnames (subseq path 2) (user-homedir-pathname)))
+      path))
+
+(defun resolve-attachments (prompt)
+  "(values text image-paths): every whitespace-delimited @token in PROMPT that
+   names an existing image file, plus anything queued by /paste. Tokens that
+   don't resolve are left alone — @ is common enough in prose. A resolved
+   token is rewritten to [attached image: name] in the text: left as @name
+   the model reads it as a file to go and find, and starts globbing for it
+   instead of looking at the image part right next to it."
+  (let ((images '()) (out '()))
+    (dolist (tok (uiop:split-string prompt :separator '(#\Space)))
+      (let* ((bare (and (> (length tok) 1) (char= (char tok 0) #\@)
+                        (string-right-trim ",.;:!?)" (subseq tok 1))))
+             (path (and bare (expand-tilde bare)))
+             (true (and path (llm:image-file-p path) (probe-file path))))
+        (if true
+            (let ((suffix (subseq tok (1+ (length bare)))))   ; the trimmed punctuation
+              (push (namestring true) images)
+              (push (format nil "[attached image: ~A]~A" (file-namestring true) suffix) out))
+            (push tok out))))
+    (let ((pending (shiftf *pending-images* '())))
+      (values (format nil "~{~A~^ ~}~{~%[attached image: ~A]~}"
+                      (nreverse out) (mapcar #'file-namestring pending))
+              (append (reverse images) pending)))))
+
+(defun clipboard-image ()
+  "Save the clipboard's image to a fresh file under *PASTE-DIR* and return
+   its path, or (values nil reason)."
+  (ensure-directories-exist *paste-dir*)
+  (let ((path (namestring (merge-pathnames
+                           (multiple-value-bind (s m h d mo y) (get-decoded-time)
+                             (format nil "~4,'0D~2,'0D~2,'0D-~2,'0D~2,'0D~2,'0D.png" y mo d h m s))
+                           *paste-dir*))))
+    (multiple-value-bind (out err code)
+        (ignore-errors (uiop:run-program (list "pngpaste" path)
+                                         :output :string :error-output :string
+                                         :ignore-error-status t))
+      (declare (ignore out))
+      (cond ((null code) (values nil "pngpaste not found — brew install pngpaste"))
+            ((and (zerop code) (probe-file path)) path)
+            (t (values nil (string-trim '(#\Newline #\Space)
+                                        (if (plusp (length (or err ""))) err "no image on the clipboard"))))))))
+
+(defun cmd-paste ()
+  (multiple-value-bind (path reason) (clipboard-image)
+    (if path
+        (progn (push path *pending-images*)
+               (format t "~&~A ~A ~A~%" (paint "📎" :cyan) (paint path :cyan)
+                       (paint "— attached to your next message" :gray)))
+        (format t "~&~A~%" (paint reason :yellow)))))
+
+(defun show-attachments (paths)
+  (dolist (p paths)
+    (let ((size (ignore-errors (with-open-file (f p :element-type '(unsigned-byte 8)) (file-length f)))))
+      (emit (paint (format nil "  📎 ~A~@[ (~D KB)~]~%" p (and size (round size 1024))) :gray)))))
+
 (defun run-turn (sess prompt)
   "Run one agent turn on PROMPT, streaming to the terminal, threading
-   SESS's history and folding usage. Ctrl-C aborts just this turn."
+   SESS's history and folding usage. Ctrl-C aborts just this turn.
+   @path tokens and /paste'd images become image parts of the message."
+  (multiple-value-bind (text images) (resolve-attachments prompt)
+    (let ((content (handler-case (llm:user-content text images)
+                     (error (e)
+                       (fresh)
+                       (emit (paint (format nil "  could not attach image: ~A~%" e) :yellow))
+                       text))))
+      (when (and images (not (stringp content))) (show-attachments images))
+      (run-turn-content sess content))))
+
+(defun run-turn-content (sess prompt)
+  "RUN-TURN proper, on PROMPT as message content (a string or a parts vector)."
   (let* ((hist (session:session-history sess))
          (messages (if hist (append hist (list (user-msg prompt))) nil))
          (*at-bol* t)
@@ -295,6 +378,7 @@
                  ("/sessions"      "list saved sessions you can resume")
                  ("/resume [id]"   "resume a saved session (latest if no id)")
                  ("/cost"          "session cost + token totals")
+                 ("/paste"         "attach the clipboard image to your next message (Ctrl-V does this inline)")
                  ("/model [id]"    "show or switch model (id like vendor/name → OpenRouter)")
                  ("/effort [lvl]"  "show or set reasoning effort: off, low, medium, high, default")
                  ("/system"        "print the active system prompt")
@@ -388,6 +472,7 @@
        (session:reset-session! sess)
        (format t "~&~A~%" (paint "— conversation cleared (new session) —" :gray)) t)
       ((string-equal verb "/cost") (cmd-cost sess) t)
+      ((string-equal verb "/paste") (cmd-paste) t)
       ((string-equal verb "/sessions") (cmd-sessions) t)
       ((string-equal verb "/resume") (cmd-resume sess arg) t)
       ((string-equal verb "/model") (cmd-model arg) t)

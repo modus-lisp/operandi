@@ -26,6 +26,8 @@
            #:*llm-auth-token* #:*llm-model* #:*llm-backend*
            #:*llm-effort* #:parse-effort #:apply-reasoning
            #:llm-chat #:ht #:extract-json
+           #:image-part #:text-part #:user-content #:content-text #:content-images
+           #:image-file-p
            #:use-openrouter #:use-llama
            #:with-llama #:with-openrouter #:openrouter-credits
            #:*usage-sink* #:usage #:make-usage #:copy-usage
@@ -38,6 +40,68 @@
 (defparameter *llm-url* "http://127.0.0.1:8081/v1/chat/completions")
 (defparameter *llm-default-max-tokens* 256)
 (defparameter *llm-read-timeout* 120)
+
+;;; ---- message content ------------------------------------------------------
+;;; A message's "content" is a string, or — once images are involved — a
+;;; vector of OpenAI-style parts: {"type":"text","text":…} and
+;;; {"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}.
+;;; Everything that reads content goes through CONTENT-TEXT so it never has
+;;; to care which.
+
+(defparameter *image-types*
+  '(("png" . "image/png") ("jpg" . "image/jpeg") ("jpeg" . "image/jpeg")
+    ("gif" . "image/gif") ("webp" . "image/webp"))
+  "Extensions the vision endpoints accept, and their MIME types.")
+
+(defun image-file-p (path)
+  "The MIME type if PATH has an image extension, else NIL."
+  (let ((type (pathname-type (pathname path))))
+    (and type (cdr (assoc type *image-types* :test #'string-equal)))))
+
+(defun text-part (text) (ht "type" "text" "text" text))
+
+(defun image-part (path)
+  "An image_url content part carrying PATH's bytes as a data: URL."
+  (let ((mime (or (image-file-p path)
+                  (error "not an image file (png/jpg/gif/webp): ~A" path)))
+        (bytes (with-open-file (in path :element-type '(unsigned-byte 8))
+                 (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
+                   (read-sequence v in)
+                   v))))
+    (ht "type" "image_url"
+        "image_url" (ht "url" (format nil "data:~A;base64,~A" mime
+                                      (cl-base64:usb8-array-to-base64-string bytes))))))
+
+(defun user-content (text &optional image-paths)
+  "TEXT alone stays a plain string; with IMAGE-PATHS it becomes a parts
+   vector, text first."
+  (if (null image-paths)
+      text
+      (coerce (cons (text-part text) (mapcar #'image-part image-paths)) 'vector)))
+
+(defun content-text (content)
+  "The textual side of CONTENT as a string: a string is itself, a parts
+   vector is its text parts joined with each image reduced to [image],
+   JSON null / NIL is \"\"."
+  (cond ((stringp content) content)
+        ((or (null content) (eq content 'null)) "")
+        ((or (vectorp content) (listp content))
+         (with-output-to-string (o)
+           (map nil (lambda (part)
+                      (cond ((not (hash-table-p part)) (princ part o))
+                            ((equal (gethash "type" part) "text")
+                             (write-string (or (gethash "text" part) "") o))
+                            ((equal (gethash "type" part) "image_url")
+                             (write-string " [image] " o))))
+                content)))
+        (t (princ-to-string content))))
+
+(defun content-images (content)
+  "How many image parts CONTENT carries."
+  (if (or (vectorp content) (and (listp content) content))
+      (count-if (lambda (p) (and (hash-table-p p) (equal (gethash "type" p) "image_url")))
+                content)
+      0))
 
 (defparameter *llm-backend* :llama
   ":LLAMA = local llama.cpp at *llm-url* (default).

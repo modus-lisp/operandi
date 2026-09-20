@@ -120,7 +120,7 @@ inline terminal UI:
   it uses a SearXNG at `SEARXNG_URL` (default `http://127.0.0.1:8080`) if one
   answers, else Brave. `OPERANDI_SEARCH=openrouter|searxng|brave` or `/search`
   forces one,
-- slash commands: `/help /clear /sessions /resume [id] /cost /model [id] /effort [lvl] /paste /search [be] /system /tools /quit`,
+- slash commands: `/help /clear /sessions [all] /resume [id] /cost /model [id] /effort [lvl] /paste /search [be] /system /tools /quit`,
 - each session is saved to `~/.operandi/sessions/<id>.{md,json}` from the
   first real message on and checkpointed after every tool result during a
   turn, so a crash or kill mid-turn loses at most a couple of seconds;

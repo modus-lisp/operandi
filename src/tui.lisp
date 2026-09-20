@@ -405,7 +405,7 @@
   (format t "~&~A~%" (paint "commands:" :bold))
   (dolist (row '(("/help"          "show this help")
                  ("/clear"         "forget the conversation, start fresh")
-                 ("/sessions"      "list saved sessions you can resume")
+                 ("/sessions [all]" "list recent sessions you can resume (all for every one)")
                  ("/resume [id]"   "resume a saved session (latest if no id)")
                  ("/cost"          "session cost + token totals")
                  ("/paste"         "attach the clipboard image to your next message (Ctrl-V does this inline)")
@@ -424,17 +424,26 @@
     (format t "~&~A over ~A turn~:P — ~A~%"
             (paint "session" :bold) (session:session-turns sess) (llm:usage-summary u))))
 
-(defun cmd-sessions ()
-  (let ((rows (session:list-sessions)))
-    (if (null rows)
-        (format t "~&~A~%" (paint "(no saved sessions yet)" :gray))
-        (progn
-          (format t "~&~A~%" (paint "saved sessions (newest first):" :bold))
-          (dolist (r rows)
-            (destructuring-bind (id turns first &optional in-flight) r
-              (format t "  ~A  ~A turn~:P  ~A~@[ ~A~]~%"
-                      (paint id :cyan) turns (oneline first 56)
-                      (and in-flight (paint "(cut off mid-turn)" :yellow)))))))))
+(defparameter *sessions-shown* 10
+  "How many of the most recent sessions /sessions lists without `all`.")
+
+(defun cmd-sessions (&optional arg)
+  "List saved sessions, oldest-to-newest so the freshest is by the prompt.
+   Only the *SESSIONS-SHOWN* most recent unless ARG is \"all\"."
+  (let* ((all-rows (session:list-sessions))          ; newest first
+         (n (length all-rows))
+         (want-all (and arg (member arg '("all" "-a" "a") :test #'string-equal)))
+         (rows (reverse (if want-all all-rows (subseq all-rows 0 (min n *sessions-shown*))))))
+    (cond
+      ((null all-rows) (format t "~&~A~%" (paint "(no saved sessions yet)" :gray)))
+      (t
+       (when (and (not want-all) (> n *sessions-shown*))
+         (format t "~&~A~%" (paint (format nil "… ~D older; /sessions all shows every one" (- n *sessions-shown*)) :gray)))
+       (dolist (r rows)
+         (destructuring-bind (id turns first &optional in-flight) r
+           (format t "  ~A  ~A turn~:P  ~A~@[ ~A~]~%"
+                   (paint id :cyan) turns (oneline first 56)
+                   (and in-flight (paint "(cut off mid-turn)" :yellow)))))))))
 
 (defun cmd-resume (sess arg)
   (let ((id (session:resume-session! sess (or arg :latest))))
@@ -508,7 +517,7 @@
       ((string-equal verb "/cost") (cmd-cost sess) t)
       ((string-equal verb "/paste") (cmd-paste) t)
       ((string-equal verb "/search") (cmd-search arg) t)
-      ((string-equal verb "/sessions") (cmd-sessions) t)
+      ((string-equal verb "/sessions") (cmd-sessions arg) t)
       ((string-equal verb "/resume") (cmd-resume sess arg) t)
       ((string-equal verb "/model") (cmd-model arg) t)
       ((string-equal verb "/effort") (cmd-effort arg) t)

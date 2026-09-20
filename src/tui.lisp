@@ -198,7 +198,10 @@
     (:openrouter (or llm:*llm-model* "openrouter"))
     (t "llama.cpp")))
 
-(defun salvage-interrupted (before live)
+(defparameter *cut-off-note*
+  "[this turn was cut off — the session ended before it finished. The tool calls above did run and their effects stand; anything after them did not happen.]")
+
+(defun salvage-interrupted (before live &key (note "[turn interrupted by the user (Ctrl-C). The tool calls above did run and their effects stand; anything after them did not happen.]"))
   "History to keep after Ctrl-C: LIVE (the engine's in-flight message list)
    if it got past BEFORE, made protocol-valid and marked. The work the agent
    did before the interrupt — reads, edits, decisions — stays in context;
@@ -222,9 +225,19 @@
                 (mapcar (lambda (id)
                           (eng:tool-result-msg id "[not run: the user interrupted the turn]"))
                         missing)
-                (list (llm:ht "role" "assistant"
-                              "content"
-                              "[turn interrupted by the user (Ctrl-C). The tool calls above did run and their effects stand; anything after them did not happen.]"))))))
+                (list (llm:ht "role" "assistant" "content" note))))))
+
+(defun repair-in-flight (sess)
+  "A resumed session whose last write was a mid-turn checkpoint: close the
+   open turn the way Ctrl-C does (stand-in results for dangling tool calls,
+   a note saying where it stopped), count it, and persist it clean."
+  (when (session:session-in-flight-p sess)
+    (let ((hist (session:session-history sess)))
+      (setf (session:session-history sess) (salvage-interrupted nil hist :note *cut-off-note*)
+            (gethash :in-flight sess) nil)
+      (incf (gethash :turns sess))
+      (session:persist-session sess)
+      (format t "~&~A~%" (paint "  (that session was cut off mid-turn; the work it had done is kept)" :yellow)))))
 
 ;;; ---- images -----------------------------------------------------------
 ;;; Two ways in: an @path token in the prompt (drag a file onto the terminal
@@ -334,6 +347,12 @@
          (hooks:*post-tool-hooks* (cons #'tui-post-hook hooks:*post-tool-hooks*))
          (eng:*stream* t)
          (eng:*on-token* #'on-token)
+         ;; durable state DURING the turn: a long tool loop that dies
+         ;; otherwise leaves no session file at all
+         (eng:*on-progress* (lambda (live) (session:checkpoint-session sess live)))
+         ;; ...and the first checkpoint of a turn (the user message) is never
+         ;; throttled away by one from the end of the previous turn
+         (session:*last-checkpoint* 0)
          (eng:*on-compact*
            (lambda (before after path)
              (fresh)
@@ -412,15 +431,18 @@
         (progn
           (format t "~&~A~%" (paint "saved sessions (newest first):" :bold))
           (dolist (r rows)
-            (destructuring-bind (id turns first) r
-              (format t "  ~A  ~A turn~:P  ~A~%"
-                      (paint id :cyan) turns (oneline first 56))))))))
+            (destructuring-bind (id turns first &optional in-flight) r
+              (format t "  ~A  ~A turn~:P  ~A~@[ ~A~]~%"
+                      (paint id :cyan) turns (oneline first 56)
+                      (and in-flight (paint "(cut off mid-turn)" :yellow)))))))))
 
 (defun cmd-resume (sess arg)
   (let ((id (session:resume-session! sess (or arg :latest))))
     (if id
-        (format t "~&~A~%"
-                (paint (format nil "— resumed ~A (~A turn~:P) —" id (session:session-turns sess)) :gray))
+        (progn
+          (format t "~&~A~%"
+                  (paint (format nil "— resumed ~A (~A turn~:P) —" id (session:session-turns sess)) :gray))
+          (repair-in-flight sess))
         (format t "~&~A~%"
                 (paint "no such session to resume — try /sessions" :yellow)))))
 
@@ -1013,6 +1035,7 @@
    piped/non-tty falls back to the simple synchronous loop."
   (let* ((sess (session:make-session))
          (resumed (when resume (session:resume-session! sess resume))))
+    (when resumed (repair-in-flight sess))
     (cond
       (once (run-turn sess once) nil)
       ;; Default: the robust line REPL (plain writes, no cursor positioning) —

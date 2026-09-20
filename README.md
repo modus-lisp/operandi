@@ -121,8 +121,10 @@ inline terminal UI:
   answers, else Brave. `OPERANDI_SEARCH=openrouter|searxng|brave` or `/search`
   forces one,
 - slash commands: `/help /clear /sessions /resume [id] /cost /model [id] /effort [lvl] /paste /search [be] /system /tools /quit`,
-- each session is saved to `~/.operandi/sessions/<id>.{md,json}`, updated after
-  every turn (so a crash never loses it); `/clear` starts a new one. `/sessions`
+- each session is saved to `~/.operandi/sessions/<id>.{md,json}` from the
+  first real message on and checkpointed after every tool result during a
+  turn, so a crash or kill mid-turn loses at most a couple of seconds;
+  `--resume` closes a cut-off turn cleanly. `/clear` starts a new one. `/sessions`
   lists them and `/resume [id]` continues one (the latest if no id) — or resume
   from the shell: `bin/operandi --resume [id] tui`, or non-interactively
   `bin/operandi --resume [id] "a follow-up question"`.

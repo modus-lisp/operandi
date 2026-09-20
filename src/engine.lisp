@@ -39,7 +39,7 @@
            #:*on-token*
            #:*subagent-usage*
            #:*subagents*
-           #:*live-messages* #:*steer-fn* #:message-tool-calls #:tool-result-msg
+           #:*live-messages* #:*on-progress* #:*steer-fn* #:message-tool-calls #:tool-result-msg
            #:*on-compact* #:*compaction-max-tokens* #:apply-backend-defaults
            #:*context-token-budget* #:*context-headroom* #:compact-threshold
            #:*do-chat-max-tokens*
@@ -134,6 +134,18 @@
    appends to always ends in a complete assistant/tool exchange.  Errors from it
    are swallowed: steering is a convenience, and a host bug in it must not take
    down a run that is otherwise fine.")
+
+(defvar *on-progress* nil
+  "Optional (lambda (messages)) called whenever the in-flight message list
+   grows during a run — after every tool result and every compaction — so a
+   host can checkpoint a long turn to disk. A 53-minute turn that dies at
+   minute 52 otherwise leaves nothing: sessions were only persisted when a
+   turn completed.")
+
+(defun note-progress (messages)
+  (setf *live-messages* messages)
+  (when *on-progress* (ignore-errors (funcall *on-progress* messages)))
+  messages)
 
 (defvar *live-messages* nil
   "The running message list of the RUN in progress, updated after every
@@ -1214,6 +1226,10 @@ another tool or give a final answer.")
                        sf:*fetch-raw-cache*
                        *subagent-usage*
                        *subagents*))
+    ;; Checkpoint the prompt itself before the first model call: a session
+    ;; should exist on disk from the first real user message, not from the
+    ;; first tool result.
+    (note-progress messages)
     (loop
       (incf n)
       (when (> n max-iterations)
@@ -1293,8 +1309,7 @@ another tool or give a final answer.")
       ;; Keep the context under the token budget BEFORE every send, so a
       ;; turn that just appended a huge tool result gets compacted before
       ;; it can blow the model's window.
-      (setf messages (maybe-compact messages verbose)
-            *live-messages* messages)
+      (setf messages (note-progress (maybe-compact messages verbose)))
       (let* ((parsed (do-chat-with-retries messages tools-vec :verbose verbose))
              (msg (extract-message parsed))
              (tcs (message-tool-calls msg))
@@ -1384,9 +1399,9 @@ another tool or give a final answer.")
                     (when (and over-budget verbose)
                       (format t "~&[operandi] tool budget exhausted; injecting stop~%"))
                     (setf messages
-                          (append messages
-                                  (list (tool-result-msg tcid result)))
-                          *live-messages* messages))
+                          (note-progress
+                           (append messages
+                                   (list (tool-result-msg tcid result))))))
            ;; Continue loop (compaction happens at the top of the next
            ;; iteration, before the next send).
            )

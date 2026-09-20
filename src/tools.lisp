@@ -413,6 +413,44 @@ Read the file first."
                 (format nil "edited ~A: 1 replacement (~A→~A bytes)"
                         path (length text) (length out))))))))))
 
+(defvar *last-bash-code* nil
+  "Exit status of the most recent %RUN-BASH call.")
+
+(defun %run-bash (cmd)
+  "Run CMD under bash, bounded by coreutils `timeout`, and return its combined
+   output as a string.
+
+   The output goes to a TEMP FILE, never a pipe. With a pipe, RUN-PROGRAM reads
+   until EOF, and EOF needs EVERY holder of the write end to close it — so one
+   backgrounded grandchild (a dev server, a `node x &`) that outlives the command
+   and inherits the descriptor wedges the agent FOREVER. `timeout` is no defence:
+   it kills the child it spawned, not the grandchild holding the pipe, and the
+   read never returns. Observed in the wild: a main thread parked in futex_wait
+   with two orphaned PPID-1 processes still holding the write ends, unkillable by
+   Ctrl-C because the interrupt can't be delivered from inside that read. A file
+   descriptor has no such contract — a stray holder is a harmless leak, and we
+   read whatever was written."
+  (let ((tmp (uiop:tmpize-pathname
+              (merge-pathnames (format nil "operandi-bash-~D" (random 1000000))
+                               (uiop:temporary-directory)))))
+    (unwind-protect
+         (progn
+           (setf *last-bash-code*
+                 (handler-case
+                     (nth-value 2
+                       (uiop:run-program
+                        (list "timeout" "--signal=KILL"
+                              (format nil "~D" *bash-timeout*)
+                              "/bin/bash" "-c" cmd)
+                        ;; a file, not a pipe — see the docstring
+                        :output tmp :error-output :output
+                        :input nil          ; /dev/null, never the agent's stdin
+                        :ignore-error-status t))
+                   (error (e)
+                     (return-from %run-bash (format nil "~&error: ~A~%" e)))))
+           (handler-case (uiop:read-file-string tmp) (error () "")))
+      (ignore-errors (delete-file tmp)))))
+
 (define-tool "Bash"
     (:description "Run a shell command via /bin/bash -c. Long output keeps the
 head AND the tail (where a command's verdict — failures, exit status — lives),
@@ -426,23 +464,9 @@ Prefer Eval for anything touching our Lisp data."
               "required" (vector "command")))
   (let* ((cmd (gethash "command" args))
          (code nil)
-         (out (with-output-to-string (s)
-                (handler-case
-                    ;; Bound the command with coreutils `timeout` so a hang
-                    ;; (server, sleep, blocked read) can't freeze the loop.
-                    ;; --signal=KILL guarantees the process actually dies.
-                    (setf code
-                          (nth-value 2
-                            (uiop:run-program
-                             (list "timeout" "--signal=KILL"
-                                   (format nil "~D" *bash-timeout*)
-                                   "/bin/bash" "-c" cmd)
-                             :output s
-                             :error-output s
-                             :ignore-error-status t)))
-                  (error (e) (format s "~&error: ~A~%" e)))))
+         (out (%run-bash cmd))
          ;; coreutils timeout exits 124 (term) / 137 (128+SIGKILL) on timeout.
-         (timed-out (member code '(124 137)))
+         (timed-out (progn (setf code *last-bash-code*) (member code '(124 137))))
          ;; Keep both ends — the verdict (failures/exit line) is at the TAIL,
          ;; so favour it (head-frac 0.35) instead of a head-only cut.
          (body (txt:bound-result

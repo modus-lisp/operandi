@@ -31,7 +31,8 @@
   (:export #:*subagent-depth*
            #:*subagent-max-depth*
            #:*fan-max*
-           #:*verdict*))
+           #:*verdict*
+           #:*findings-file*))
 
 (in-package #:operandi.subagent)
 
@@ -214,6 +215,137 @@ produced nothing."
                                      (subseq t* 0 (min 400 (length t*))))))
             "iters" (getf r :iters))))
 
+;;; ----------------------- the findings ledger ------------------------
+;;; A verdict that dies with the run is not a durable claim, it is a
+;;; receipt. Findings are appended here instead, one JSON object per line.
+;;;
+;;; Deliberately NOT operandi-notes.md: that file is read into the context
+;;; of every single run, so anything written there is a tax on every future
+;;; run forever. Notes are for the handful of things an agent should always
+;;; know; the ledger is for everything that was ever settled, and is read
+;;; only when asked. JSONL because appending must never rewrite the file —
+;;; concurrent runs share it.
+;;;
+;;; Every record carries provenance (when, which project, which commit),
+;;; because a claim about code is only true as of a revision. A finding
+;;; whose commit no longer matches HEAD is a lead, not a fact, and the
+;;; Findings tool says so rather than letting it read as current.
+
+(defparameter *findings-file*
+  (merge-pathnames ".operandi/findings.jsonl" (user-homedir-pathname))
+  "Append-only ledger of settled claims, one JSON object per line.")
+
+(defun %git-head ()
+  "Short HEAD of the working directory's repo, or NIL outside one."
+  (handler-case
+      (let ((out (uiop:run-program (list "git" "rev-parse" "--short" "HEAD")
+                                   :output :string :error-output nil
+                                   :ignore-error-status t)))
+        (let ((s (string-trim '(#\Space #\Newline #\Return) (or out ""))))
+          (and (plusp (length s)) s)))
+    (error () nil)))
+
+(defun %now-iso ()
+  (multiple-value-bind (sec min hr day mon yr) (get-decoded-time)
+    (format nil "~4,'0D-~2,'0D-~2,'0DT~2,'0D:~2,'0D:~2,'0D" yr mon day hr min sec)))
+
+(defun record-findings (records project commit)
+  "Append RECORDS (the verdict objects) to the ledger with provenance.
+   Best-effort: a ledger write must never take down the run that produced
+   the finding."
+  (handler-case
+      (progn
+        (ensure-directories-exist *findings-file*)
+        (with-open-file (out *findings-file* :direction :output
+                                             :if-exists :append
+                                             :if-does-not-exist :create
+                                             :external-format :utf-8)
+          (let ((ts (%now-iso)))
+            (dolist (r records)
+              (let ((rec (llm:ht "ts" ts "project" project)))
+                (when commit (setf (gethash "commit" rec) commit))
+                (maphash (lambda (k v)
+                           (unless (string= k "n")      ; batch-local index
+                             (setf (gethash k rec) v)))
+                         r)
+                (write-line (jzon:stringify rec) out)))))
+        t)
+    (error () nil)))
+
+(defun read-findings ()
+  "Every recorded finding, newest last. Unparseable lines are skipped —
+   a corrupt line must not hide the rest of the ledger."
+  (handler-case
+      (when (probe-file *findings-file*)
+        (with-open-file (in *findings-file* :external-format :utf-8)
+          (loop for line = (read-line in nil)
+                while line
+                for rec = (handler-case (jzon:parse line) (error () nil))
+                when (hash-table-p rec) collect rec)))
+    (error () nil)))
+
+(defun finding-matches-p (rec needle)
+  "Case-insensitive substring match over the fields worth searching."
+  (or (null needle)
+      (zerop (length needle))
+      (some (lambda (k)
+              (let ((v (gethash k rec)))
+                (and (stringp v) (search needle v :test #'char-equal))))
+            '("hypothesis" "evidence" "verdict" "project"))))
+
+(tools:define-tool "Findings"
+    (:description "Search what has ALREADY been settled, before you go and
+settle it again. Every verdict from a previous Investigate is recorded here
+with its evidence and the commit it was true at.
+
+Check this first when a question sounds like one that may have been asked
+before — re-deriving a claim someone already proved costs a whole run and
+usually reaches a worse answer, because the original had the evidence in
+front of it.
+
+Treat a finding whose commit no longer matches HEAD as a LEAD, not a fact:
+the code moved under it. The tool marks those."
+     :schema (llm:ht
+              "type" "object"
+              "properties"
+              (llm:ht
+               "query" (llm:ht "type" "string"
+                               "description" "Substring to look for in the hypothesis, evidence, verdict or project. Omit to list the most recent findings.")
+               "limit" (llm:ht "type" "integer"
+                               "description" "Most recent matches to return (default 10)."))
+              "required" (vector)))
+  (let* ((needle (let ((q (gethash "query" args))) (and (stringp q) q)))
+         (limit (let ((l (gethash "limit" args))) (if (integerp l) (max 1 (min l 50)) 10)))
+         (head (%git-head))
+         (all (read-findings))
+         (hits (remove-if-not (lambda (r) (finding-matches-p r needle)) all))
+         (recent (last hits limit)))
+    (if (null recent)
+        (if needle
+            (format nil "No finding recorded for ~S. Nothing has settled this yet." needle)
+            "The findings ledger is empty.")
+        (with-output-to-string (s)
+          (format s "~D finding~:P~@[ matching ~S~] (newest last):~%" (length recent) needle)
+          (dolist (r recent)
+            (let* ((c (gethash "commit" r))
+                   (stale (and c head (not (string= c head))))
+                   ;; One preformatted string, not a ~@[ clause holding two
+                   ;; ~A: a false ~@[ consumes exactly one argument, so a
+                   ;; two-argument clause silently shifts every later
+                   ;; argument by one when the condition is nil.
+                   (note (if stale
+                             (format nil "  (recorded at ~A — HEAD is now ~A, so treat this as a LEAD, not a fact)"
+                                     c head)
+                             "")))
+              (format s "~%~A  [~A/~A]~A~%  claim: ~A~%  evidence: ~A~%"
+                      (gethash "ts" r)
+                      (gethash "verdict" r)
+                      (or (gethash "confidence" r) "?")
+                      note
+                      (gethash "hypothesis" r)
+                      (let ((e (or (gethash "evidence" r) "")))
+                        (if (> (length e) 500) (concatenate 'string (subseq e 0 500) " …") e)))))))))
+
 (defun run-investigate (hypotheses context tool-names depth)
   "Settle HYPOTHESES in parallel, batched at *FAN-MAX*. Returns a JSON
    array of verdict records plus a one-line cost footer."
@@ -229,14 +361,16 @@ produced nothing."
                                               (run-one-investigation h context tool-names depth)))
                                       :name (format nil "operandi-investigate-~D" i))))))
                (dolist (th threads) (ignore-errors (bt:join-thread th)))))
-    (let ((batch (roll-up-usage! results))
-          (records (loop for r across results
-                         for i from 1
-                         when r collect (verdict-record r i))))
-      (format nil "~A~%[investigate: ~D hypotheses, ~A]"
+    (let* ((batch (roll-up-usage! results))
+           (records (loop for r across results
+                          for i from 1
+                          when r collect (verdict-record r i)))
+           (logged (record-findings records (namestring (uiop:getcwd)) (%git-head))))
+      (format nil "~A~%[investigate: ~D hypotheses, ~A~A]"
               (jzon:stringify (coerce records 'vector) :pretty t)
               (length records)
-              (llm:usage-summary batch)))))
+              (llm:usage-summary batch)
+              (if logged "; recorded to the findings ledger" "")))))
 
 (tools:define-tool "Investigate"
     (:description "Settle several INDEPENDENT hypotheses in parallel and get

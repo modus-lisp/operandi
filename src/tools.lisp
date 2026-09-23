@@ -752,8 +752,12 @@ large)."
           value))))
 
 (defun default-tools ()
+  ;; Verdict is deliberately absent: it is the WORKER's reporting channel,
+  ;; and Investigate adds it to the toolset of the workers it spawns. An
+  ;; agent that was not given a hypothesis has nothing to return a verdict on.
   '("Eval" "Read" "Write" "Edit" "Bash" "Grep" "Glob" "WebFetch"
-    "WebSearch" "Remember" "Task" "Fan" "Spawn" "SendMessage" "TodoWrite"))
+    "WebSearch" "Remember" "Findings" "Task" "Fan" "Spawn" "Investigate"
+    "SendMessage" "TodoWrite"))
 
 (defun load-notes ()
   "Read the persistent notes file. Returns the contents as a string,

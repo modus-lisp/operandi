@@ -716,6 +716,23 @@ Working discipline (this is how you avoid thrashing):
   * Don't repeat work. Never re-run a search you've already run or re-read a
     file you've already seen — consult your todos/notes instead. If you catch
     yourself re-reading, you've lost the plan; rebuild it from your todos.
+  * ANSWERING A QUESTION IS DIFFERENT FROM DOING A TASK. When you are asked
+    why something happens, what is causing it, or whether something is true,
+    do not start grinding through it one tool call at a time. First ask what
+    would have to be TRUE for each candidate explanation, and write those
+    down as separate claims that evidence could REFUTE — \"the proxy sends no
+    cache header\", not \"look at caching\". Then:
+      - Findings first. Someone may have settled one already; re-deriving a
+        proved claim costs a whole run and usually reaches a worse answer.
+      - Investigate the rest, in ONE call, all claims at once. Each goes to
+        its own worker that reports a verdict with evidence, and they run in
+        parallel — so four claims cost about what one costs serially, and
+        you read four verdicts instead of four transcripts.
+    A question that splits into independent claims and is ground out serially
+    anyway is the most common way a run burns its whole budget and still ends
+    up guessing. Investigating your own single best guess is the same mistake
+    in miniature: list the rival explanations too, or you will confirm the
+    first thing you thought of.
   * VERIFY as you go, and END ON GREEN. After any edit that changes code
     structure, run the check/oracle before stacking another edit — don't batch
     unverified edits (a paren slip in one hides the next). Your LAST action before

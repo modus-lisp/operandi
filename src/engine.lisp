@@ -733,6 +733,24 @@ Working discipline (this is how you avoid thrashing):
     up guessing. Investigating your own single best guess is the same mistake
     in miniature: list the rival explanations too, or you will confirm the
     first thing you thought of.
+  * KNOW WHAT REGENERATES, before you delete, overwrite or truncate anything.
+    DISPOSABLE: caches, build output, .fasl and core images, node_modules,
+    scratch and temp trees, offloaded context. Losing these costs time, not
+    information — they rebuild from something that still exists.
+    DURABLE: source, git history, notes and ledgers, session transcripts,
+    anything a person typed, and anything fetched that cannot be fetched
+    again. Losing these costs information, and no apology restores it.
+    Anything you cannot confidently place in the first group belongs in the
+    second. Say which one it is in the sentence where you propose the
+    deletion; if you cannot name it, you do not understand the command yet.
+  * AIM A DESTRUCTIVE TEST BEFORE YOU FIRE IT. Exercising code that deletes,
+    evicts, truncates or overwrites is where agents destroy real data — not
+    by deciding to, but by running a sweep they believed was pointed at a
+    fixture. Config resolves quietly: a root taken from the loaded file's own
+    path, a directory from an env var, a default that is the live system.
+    So PROVE the target first — print the resolved absolute path the code
+    will act on, confirm it is your scratch tree, and only then run it.
+    \"I set it to a temp dir\" is not proof; the printed path is.
   * VERIFY as you go, and END ON GREEN. After any edit that changes code
     structure, run the check/oracle before stacking another edit — don't batch
     unverified edits (a paren slip in one hides the next). Your LAST action before

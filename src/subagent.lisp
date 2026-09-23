@@ -26,10 +26,12 @@
                     (#:tools #:operandi.tools)
                     (#:hooks #:operandi.hooks)
                     (#:eng   #:operandi.engine)
+                    (#:jzon  #:com.inuoe.jzon)
                     (#:bt    #:bordeaux-threads))
   (:export #:*subagent-depth*
            #:*subagent-max-depth*
-           #:*fan-max*))
+           #:*fan-max*
+           #:*verdict*))
 
 (in-package #:operandi.subagent)
 
@@ -118,6 +120,170 @@
                              (getf r :text)))
           (format s "~&[fan: ~D subagents, ~A total iters, ~A]~%"
                   (length results) total-iters (llm:usage-summary batch)))))))
+
+;;; ----------------------- typed verdicts -----------------------------
+;;; Fan hands the orchestrator N essays and makes it read them. That is
+;;; the wrong shape for the loop this is built for — an expensive model
+;;; proposes hypotheses, a swarm of cheap ones settles them — because the
+;;; expensive model then pays to re-read every worker's reasoning to find
+;;; the one bit that matters: did it hold?
+;;;
+;;; So a worker does not WRITE its conclusion, it CALLS it. The Verdict
+;;; tool's arguments are already JSON and already schema-checked, so the
+;;; claim is structured by construction instead of scraped back out of
+;;; prose. INVESTIGATE returns those records; the reasoning that produced
+;;; them dies with the worker, which is the point.
+
+(defvar *verdict* nil
+  "Per-thread slot where the Verdict tool records this worker's finding,
+   NIL until it calls one. Bound freshly around each investigation —
+   threads do not inherit dynamic bindings, so RUN-ONE-INVESTIGATION
+   binds it inside the worker thread.")
+
+(tools:define-tool "Verdict"
+    (:description "Report your verdict on the hypothesis you were given.
+This is HOW YOU REPORT — calling it is the point of your run, not a
+formality at the end. Call it exactly once, when you have settled the
+hypothesis or established that you cannot.
+
+Put the actual evidence in EVIDENCE: a file:line, the command you ran and
+what it printed, the measurement you took. Quote specifics. An impression
+(\"seems correct\", \"looks fine\") is not evidence and wastes the call."
+     :schema (llm:ht
+              "type" "object"
+              "properties"
+              (llm:ht
+               "verdict" (llm:ht "type" "string"
+                                 "enum" (vector "confirmed" "refuted" "undetermined")
+                                 "description" "confirmed = the evidence supports the hypothesis; refuted = the evidence contradicts it; undetermined = you could not settle it. Undetermined is a real answer — do not guess to avoid it.")
+               "evidence" (llm:ht "type" "string"
+                                  "description" "The concrete evidence: file:line, command output, measurement. Specifics, not impressions.")
+               "confidence" (llm:ht "type" "string"
+                                    "enum" (vector "high" "medium" "low")
+                                    "description" "How much weight the evidence actually carries."))
+              "required" (vector "verdict" "evidence")))
+  (let ((v (gethash "verdict" args))
+        (e (gethash "evidence" args))
+        (c (or (gethash "confidence" args) "medium")))
+    (setf *verdict* (list :verdict v :evidence (or e "") :confidence c))
+    (format nil "Verdict recorded: ~A (~A confidence). You may stop now." v c)))
+
+(defun investigation-prompt (hypothesis context)
+  "The brief handed to one worker: a single hypothesis to settle."
+  (format nil "Settle ONE hypothesis and report the verdict.
+
+HYPOTHESIS: ~A~@[
+
+CONTEXT you have been given (take it as established; do not re-derive it):
+~A~]
+
+Gather only the evidence needed to settle this hypothesis — you are not
+fixing anything, and you are not exploring beyond it. When you have
+settled it, or established that you cannot, call the Verdict tool exactly
+once. Calling Verdict IS your report; a run that ends without it has
+produced nothing."
+          hypothesis (and (stringp context) (plusp (length context)) context)))
+
+(defun run-one-investigation (hypothesis context tool-names depth)
+  "Run one worker against one HYPOTHESIS and return its record. Binds
+   *VERDICT* in THIS thread so the worker's Verdict call lands here."
+  (let ((*verdict* nil))
+    (declare (special *verdict*))
+    (let ((r (run-one-subagent (investigation-prompt hypothesis context)
+                               tool-names depth)))
+      (list :hypothesis hypothesis
+            :verdict *verdict*          ; NIL if the worker never called it
+            :iters (getf r :iters)
+            :usage (getf r :usage)
+            :text (getf r :text)))))
+
+(defun verdict-record (r i)
+  "One investigation result as the object the orchestrator receives."
+  (let ((v (getf r :verdict)))
+    (llm:ht "n" i
+            "hypothesis" (getf r :hypothesis)
+            "verdict" (if v (getf v :verdict) "undetermined")
+            "confidence" (if v (getf v :confidence) "low")
+            "evidence" (if v
+                           (getf v :evidence)
+                           ;; No Verdict call: say so plainly and hand over the
+                           ;; worker's last words rather than silently inventing
+                           ;; a verdict it never reached.
+                           (format nil "[worker never called Verdict] ~A"
+                                   (let ((t* (or (getf r :text) "")))
+                                     (subseq t* 0 (min 400 (length t*))))))
+            "iters" (getf r :iters))))
+
+(defun run-investigate (hypotheses context tool-names depth)
+  "Settle HYPOTHESES in parallel, batched at *FAN-MAX*. Returns a JSON
+   array of verdict records plus a one-line cost footer."
+  (let ((results (make-array (length hypotheses) :initial-element nil)))
+    (loop for start from 0 below (length hypotheses) by *fan-max*
+          for end = (min (length hypotheses) (+ start *fan-max*))
+          do (let ((threads
+                     (loop for i from start below end
+                           collect (let ((idx i) (h (nth i hypotheses)))
+                                     (bt:make-thread
+                                      (lambda ()
+                                        (setf (aref results idx)
+                                              (run-one-investigation h context tool-names depth)))
+                                      :name (format nil "operandi-investigate-~D" i))))))
+               (dolist (th threads) (ignore-errors (bt:join-thread th)))))
+    (let ((batch (roll-up-usage! results))
+          (records (loop for r across results
+                         for i from 1
+                         when r collect (verdict-record r i))))
+      (format nil "~A~%[investigate: ~D hypotheses, ~A]"
+              (jzon:stringify (coerce records 'vector) :pretty t)
+              (length records)
+              (llm:usage-summary batch)))))
+
+(tools:define-tool "Investigate"
+    (:description "Settle several INDEPENDENT hypotheses in parallel and get
+back structured VERDICTS — not essays.
+
+Each hypothesis goes to its own fresh-context worker that gathers evidence
+and reports by calling the Verdict tool. You get back one JSON record per
+hypothesis: verdict (confirmed / refuted / undetermined), confidence, and
+the concrete evidence. The workers' reasoning is discarded — you read
+verdicts, not transcripts.
+
+Use this when you have a question you can split into claims that are
+separately checkable: which of these N explanations is the real cause,
+does this invariant hold in each of these N places, which of these N
+approaches actually works. State each hypothesis so that evidence could
+in principle REFUTE it — 'X is the cause of Y', not 'look into X'.
+
+Pass CONTEXT for background every worker needs, so none of them has to
+rediscover it. Use Fan instead when you want work done rather than
+questions answered."
+     :schema (llm:ht
+              "type" "object"
+              "properties"
+              (llm:ht
+               "hypotheses" (llm:ht "type" "array"
+                                    "items" (llm:ht "type" "string")
+                                    "description" "Falsifiable claims, one per worker. Each must stand alone.")
+               "context" (llm:ht "type" "string"
+                                 "description" "Background every worker should be given as established — what you already know, so none of them re-derives it.")
+               "tools" (llm:ht "type" "string"
+                               "description" "Comma-separated tool names for the workers (default: all)."))
+              "required" (vector "hypotheses")))
+  (cond
+    ((>= *subagent-depth* *subagent-max-depth*)
+     (format nil "Investigate refused: subagent depth ~A >= max ~A"
+             *subagent-depth* *subagent-max-depth*))
+    (t
+     (let* ((raw (gethash "hypotheses" args))
+            (hypotheses (remove-if-not #'stringp
+                                       (coerce (if (vectorp raw) raw (vector)) 'list)))
+            (context (gethash "context" args))
+            ;; the worker cannot report without Verdict, so it is always present
+            (tool-names (adjoin "Verdict" (parse-tool-names (gethash "tools" args))
+                                :test #'string=)))
+       (if (null hypotheses)
+           "Investigate: give at least one hypothesis (an array of strings)."
+           (run-investigate hypotheses context tool-names (1+ *subagent-depth*)))))))
 
 (tools:define-tool "Task"
     (:description "Delegate a focused subtask to a sub-operandi with its

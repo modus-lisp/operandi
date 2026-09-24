@@ -39,7 +39,7 @@
      (:file "cron"     :depends-on ("engine"))                ; operandi.cron
      (:file "session"  :depends-on ("llm"))                   ; operandi.session
      (:file "sessiontree")                                    ; operandi.sessiontree
-     (:file "tui"      :depends-on ("engine" "tools" "llm" "hooks" "session"))  ; operandi.tui
+     (:file "tui"      :depends-on ("engine" "tools" "llm" "hooks" "session" "subagent"))  ; operandi.tui
      (:file "acp"      :depends-on ("engine" "tools" "llm" "hooks" "session"))))))  ; operandi.acp
 
 ;;; Optional: a headless agent that chats over Nostr private DMs (NIP-17). Kept a

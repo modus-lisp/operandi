@@ -412,6 +412,7 @@
                  ("/search [be]"   "show or set the web-search backend: openrouter, searxng, brave, auto")
                  ("/model [id]"    "show or switch model (id like vendor/name → OpenRouter)")
                  ("/effort [lvl]"  "show or set reasoning effort: off, low, medium, high, default")
+                 ("/workers [m]"   "show or set the subagent model (vendor/name, llama, or inherit)")
                  ("/system"        "print the active system prompt")
                  ("/tools"         "list the tools the agent can call")
                  ("/quit  /exit"   "leave (Ctrl-D also works)")))
@@ -461,9 +462,10 @@
 (defun cmd-model (arg)
   (cond
     ((null arg)
-     (format t "~&model: ~A  (backend ~A, effort ~A, context budget ~Dk)~%"
+     (format t "~&model: ~A  (backend ~A, effort ~A, context budget ~Dk)~%workers: ~A~%"
              (paint (model-label) :cyan) llm:*llm-backend* (effort-label)
-             (round eng:*context-token-budget* 1000)))
+             (round eng:*context-token-budget* 1000)
+             (paint (or operandi.subagent:*worker-model* "inherit (same as above)") :cyan)))
     ((find #\/ arg)                       ; vendor/model → OpenRouter
      (llm:use-openrouter :model arg)
      (eng:apply-backend-defaults)
@@ -473,6 +475,15 @@
      (eng:apply-backend-defaults)
      (format t "~&→ local llama.cpp~%"))
     (t (format t "~&unknown model spec ~S — give a 'vendor/name' id or 'llama'.~%" arg))))
+
+(defun cmd-workers (arg)
+  (if (null arg)
+      (format t "~&workers: ~A~%" (paint (or operandi.subagent:*worker-model* "inherit — subagents use the orchestrator's model") :cyan))
+      (multiple-value-bind (m ok) (operandi.subagent:parse-worker-model arg)
+        (if ok
+            (progn (setf operandi.subagent:*worker-model* m)
+                   (format t "~&→ workers: ~A~%" (paint (or m "inherit") :cyan)))
+            (format t "~&~A~%" (paint "workers takes a vendor/name slug, llama, or inherit" :yellow))))))
 
 (defun cmd-effort (arg)
   (if (null arg)
@@ -521,6 +532,7 @@
       ((string-equal verb "/resume") (cmd-resume sess arg) t)
       ((string-equal verb "/model") (cmd-model arg) t)
       ((string-equal verb "/effort") (cmd-effort arg) t)
+      ((string-equal verb "/workers") (cmd-workers arg) t)
       ((string-equal verb "/system") (cmd-system sess) t)
       ((string-equal verb "/tools") (cmd-tools) t)
       (t (format t "~&unknown command ~A — try /help~%" (paint verb :yellow)) t))))

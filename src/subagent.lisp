@@ -32,7 +32,9 @@
            #:*subagent-max-depth*
            #:*fan-max*
            #:*verdict*
-           #:*findings-file*))
+           #:*findings-file*
+           #:*worker-model*
+           #:parse-worker-model))
 
 (in-package #:operandi.subagent)
 
@@ -55,6 +57,49 @@
                          (uiop:split-string tools-str :separator ","))
               :test #'string=)))
 
+;;; ------------------------- the worker tier ----------------------------
+;;; The loop operandi exists for splits cleanly by cost. Deciding WHAT to
+;;; test — turning one question into rival, falsifiable claims — is a
+;;; judgment move, and the A/B in 8edec0b showed a cheap model will not make
+;;; it even holding the tool. Settling a claim is not: cheap workers do it
+;;; well. So the orchestrator and its workers must be able to run on
+;;; DIFFERENT models, or the architecture cannot be expressed at all — a
+;;; strong orchestrator drags an expensive swarm with it, and a cheap one
+;;; cannot decompose.
+;;;
+;;; *WORKER-MODEL* is that second tier. NIL means inherit the orchestrator's
+;;; model (the old behaviour). Otherwise it is a model spec — a
+;;; vendor/name OpenRouter slug, or "llama" — bound with LLM:WITH-OPENROUTER
+;;; / LLM:WITH-LLAMA around each subagent's run. Those rebind with LET, and
+;;; the binding is made inside the worker's own thread, so the orchestrator's
+;;; global model is never touched.
+
+(defun parse-worker-model (s)
+  "\"inherit\"/\"\"/NIL -> NIL; \"llama\" or a vendor/name slug -> itself.
+   Second value NIL if S is not a usable spec."
+  (let ((k (and (stringp s) (string-trim " " s))))
+    (cond ((or (null k) (zerop (length k)) (string-equal k "inherit") (string-equal k "none"))
+           (values nil t))
+          ((string-equal k "llama") (values "llama" t))
+          ((and (find #\/ k) (not (find #\Space k))) (values k t))
+          (t (values nil nil)))))
+
+(defvar *worker-model*
+  (let ((e (uiop:getenv "OPERANDI_WORKER_MODEL")))
+    (and e (nth-value 0 (parse-worker-model e))))
+  "Model the subagent tier runs on (Task, Fan, Spawn, Investigate workers),
+   or NIL to inherit the orchestrator's. Seeded from OPERANDI_WORKER_MODEL;
+   --worker-model and /workers set it; Investigate can override per call.")
+
+(defun call-with-worker-model (model thunk)
+  "Call THUNK with the LLM client bound to MODEL for its dynamic extent, or
+   unchanged when MODEL is NIL. An unrecognised spec inherits rather than
+   failing the run — a worker on the wrong model beats no worker."
+  (cond ((null model) (funcall thunk))
+        ((string-equal model "llama") (llm:with-llama (funcall thunk)))
+        ((find #\/ model) (llm:with-openrouter (:model model) (funcall thunk)))
+        (t (funcall thunk))))
+
 (defun run-one-subagent (desc tool-names depth &optional history)
   "Run ONE subagent to completion in the current thread. With HISTORY, it
    RESUMES that conversation (DESC is ignored) instead of starting fresh —
@@ -75,10 +120,16 @@
       (let ((*subagent-depth* depth)
             (eng:*on-token* nil))
         (declare (special *subagent-depth*))
-        (multiple-value-bind (text messages iters usage)
-            (eng:run desc :tool-names tool-names :verbose nil :history history)
-          (list :desc desc :iters (or iters 0) :messages messages
-                :usage (or usage (llm:make-usage)) :text (or text ""))))
+        (call-with-worker-model
+         *worker-model*
+         (lambda ()
+           (multiple-value-bind (text messages iters usage)
+               (eng:run desc :tool-names tool-names :verbose nil :history history)
+             (list :desc desc :iters (or iters 0) :messages messages
+                   :usage (or usage (llm:make-usage)) :text (or text "")
+                   ;; read INSIDE the binding: the model this worker really used
+                   :model (or llm:*llm-model* (string-downcase
+                                               (symbol-name llm:*llm-backend*))))))))
     (error (e)
       (list :desc desc :iters 0 :messages history :usage (llm:make-usage)
             :text (format nil "SUBAGENT ERROR: ~A" e)))))
@@ -196,6 +247,7 @@ produced nothing."
             :verdict *verdict*          ; NIL if the worker never called it
             :iters (getf r :iters)
             :usage (getf r :usage)
+            :model (getf r :model)
             :text (getf r :text)))))
 
 (defun verdict-record (r i)
@@ -213,7 +265,10 @@ produced nothing."
                            (format nil "[worker never called Verdict] ~A"
                                    (let ((t* (or (getf r :text) "")))
                                      (subseq t* 0 (min 400 (length t*))))))
-            "iters" (getf r :iters))))
+            "iters" (getf r :iters)
+            ;; provenance: a verdict from a flash model and one from a frontier
+            ;; model do not carry the same weight, and the ledger should say which
+            "model" (getf r :model))))
 
 ;;; ----------------------- the findings ledger ------------------------
 ;;; A verdict that dies with the run is not a durable claim, it is a
@@ -346,10 +401,14 @@ the code moved under it. The tool marks those."
                       (let ((e (or (gethash "evidence" r) "")))
                         (if (> (length e) 500) (concatenate 'string (subseq e 0 500) " …") e)))))))))
 
-(defun run-investigate (hypotheses context tool-names depth)
+(defun run-investigate (hypotheses context tool-names depth &optional model)
   "Settle HYPOTHESES in parallel, batched at *FAN-MAX*. Returns a JSON
-   array of verdict records plus a one-line cost footer."
-  (let ((results (make-array (length hypotheses) :initial-element nil)))
+   array of verdict records plus a one-line cost footer. MODEL, when given,
+   overrides *WORKER-MODEL* for this batch's workers."
+  (let ((results (make-array (length hypotheses) :initial-element nil))
+        ;; resolved in the orchestrator's thread, then handed to each worker:
+        ;; a new thread sees the global, not this thread's dynamic bindings
+        (wm (or model *worker-model*)))
     (loop for start from 0 below (length hypotheses) by *fan-max*
           for end = (min (length hypotheses) (+ start *fan-max*))
           do (let ((threads
@@ -357,8 +416,9 @@ the code moved under it. The tool marks those."
                            collect (let ((idx i) (h (nth i hypotheses)))
                                      (bt:make-thread
                                       (lambda ()
-                                        (setf (aref results idx)
-                                              (run-one-investigation h context tool-names depth)))
+                                        (let ((*worker-model* wm))
+                                          (setf (aref results idx)
+                                                (run-one-investigation h context tool-names depth))))
                                       :name (format nil "operandi-investigate-~D" i))))))
                (dolist (th threads) (ignore-errors (bt:join-thread th)))))
     (let* ((batch (roll-up-usage! results))
@@ -366,9 +426,10 @@ the code moved under it. The tool marks those."
                           for i from 1
                           when r collect (verdict-record r i)))
            (logged (record-findings records (namestring (uiop:getcwd)) (%git-head))))
-      (format nil "~A~%[investigate: ~D hypotheses, ~A~A]"
+      (format nil "~A~%[investigate: ~D hypotheses on ~A, ~A~A]"
               (jzon:stringify (coerce records 'vector) :pretty t)
               (length records)
+              (or wm "the orchestrator's model")
               (llm:usage-summary batch)
               (if logged "; recorded to the findings ledger" "")))))
 
@@ -401,7 +462,9 @@ questions answered."
                "context" (llm:ht "type" "string"
                                  "description" "Background every worker should be given as established — what you already know, so none of them re-derives it.")
                "tools" (llm:ht "type" "string"
-                               "description" "Comma-separated tool names for the workers (default: all)."))
+                               "description" "Comma-separated tool names for the workers (default: all).")
+               "model" (llm:ht "type" "string"
+                               "description" "Model for THIS batch's workers — an OpenRouter vendor/name slug, or \"llama\". Omit to use the configured worker model. Escalate only the hypotheses that a cheap worker left undetermined."))
               "required" (vector "hypotheses")))
   (cond
     ((>= *subagent-depth* *subagent-max-depth*)
@@ -415,9 +478,14 @@ questions answered."
             ;; the worker cannot report without Verdict, so it is always present
             (tool-names (adjoin "Verdict" (parse-tool-names (gethash "tools" args))
                                 :test #'string=)))
-       (if (null hypotheses)
-           "Investigate: give at least one hypothesis (an array of strings)."
-           (run-investigate hypotheses context tool-names (1+ *subagent-depth*)))))))
+       (multiple-value-bind (model ok) (parse-worker-model (gethash "model" args))
+         (cond
+           ((null hypotheses)
+            "Investigate: give at least one hypothesis (an array of strings).")
+           ((not ok)
+            (format nil "Investigate: ~S is not a model spec — give a vendor/name slug or \"llama\"."
+                    (gethash "model" args)))
+           (t (run-investigate hypotheses context tool-names (1+ *subagent-depth*) model))))))))
 
 (tools:define-tool "Task"
     (:description "Delegate a focused subtask to a sub-operandi with its

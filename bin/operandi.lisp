@@ -125,6 +125,14 @@
                       (cond (is-model (llm:use-openrouter :model next) (setf acc (rest tail)))
                             (t        (llm:use-openrouter)             (setf acc tail)))
                       (eng:apply-backend-defaults)))
+                   ((and acc (string= (first acc) "--worker-model"))
+                    (multiple-value-bind (m ok)
+                        (funcall (find-symbol "PARSE-WORKER-MODEL" "OPERANDI.SUBAGENT") (second acc))
+                      (unless ok
+                        (format *error-output* "operandi: --worker-model takes a vendor/name slug, llama, or inherit, not ~S~%" (second acc))
+                        (sb-ext:exit :code 2))
+                      (setf (symbol-value (find-symbol "*WORKER-MODEL*" "OPERANDI.SUBAGENT")) m
+                            acc (cddr acc))))
                    ((and acc (string= (first acc) "--effort"))
                     (multiple-value-bind (e ok) (llm:parse-effort (second acc))
                       (unless ok
@@ -158,6 +166,7 @@
      (format t "  operandi.lisp -- --resume [ID] tui  (resume a saved session; latest if no ID)~%")
      (format t "  operandi.lisp -- --openrouter [MODEL] \"task\"~%")
      (format t "  operandi.lisp -- --effort off|low|medium|high \"task\"   (reasoning; also OPERANDI_EFFORT)~%")
+     (format t "  operandi.lisp -- --openrouter STRONG --worker-model CHEAP tui   (orchestrator and subagents on different models)~%")
      (format t "  operandi.lisp -- --tools Read,Write,Edit,Bash,Grep \"task\"   (allow-list)~%")
      (format t "  operandi.lisp -- --no-tools Fan,Task,Spawn \"task\"           (defaults minus these)~%")
      (format t "~%env: OPERANDI_MAX_TOKENS (per-turn output cap, default 16384),~%")

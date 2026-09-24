@@ -143,6 +143,46 @@
     (when eng:*subagent-usage* (llm:usage-incf eng:*subagent-usage* batch))
     batch))
 
+(defun join-or-stop (threads)
+  "Wait for every worker in THREADS. If THIS thread is unwound before they
+   all finish — Ctrl-C in the TUI, an abort-turn throw, any non-local exit —
+   stop the ones still running.
+
+   Without this, interrupting a Fan or Investigate stopped only the parent:
+   the join below is the only link to the workers, and an interrupt is not
+   an ERROR, so it went straight through the IGNORE-ERRORS and left N threads
+   running. They kept making paid LLM calls for a turn that no longer existed,
+   and since the parent never reached record-findings, everything they found
+   was thrown away. The user saw \"interrupted\" and was still being billed.
+
+   DESTROY-THREAD is SBCL's terminate-thread: it interrupts the worker with
+   abort-thread, so the worker UNWINDS and runs its own cleanup — a worker
+   that was itself running Investigate stops its children the same way.
+   A request already sent to the provider may still be billed; nothing
+   after it will be."
+  (let ((finished nil))
+    (unwind-protect
+         (progn (dolist (th threads)
+                  ;; Catch ONLY a worker that died (join-thread-error). The old
+                  ;; IGNORE-ERRORS here caught every ERROR — including one
+                  ;; interrupted INTO this thread — and swallowed it, so the
+                  ;; parent carried on waiting and nothing below ever ran.
+                  (handler-case (bt:join-thread th)
+                    (sb-thread:join-thread-error () nil)))
+                (setf finished t))
+      (unless finished
+        ;; Issue every stop before waiting on any: a second Ctrl-C landing
+        ;; mid-loop must not leave half the workers untouched.
+        (sb-sys:without-interrupts
+          (dolist (th threads)
+            (when (bt:thread-alive-p th)
+              (ignore-errors (bt:destroy-thread th)))))
+        ;; terminate-thread is asynchronous. Give the workers a moment to
+        ;; actually unwind, so none gets one more call in after we return.
+        (loop repeat 40
+              while (some #'bt:thread-alive-p threads)
+              do (sleep 0.05))))))
+
 (defun run-fan (tasks tool-names depth)
   "Run TASKS concurrently (batched at *FAN-MAX*), preserving order.
    Returns the formatted, labeled results + a cost/iteration footer, and
@@ -158,7 +198,7 @@
                                         (setf (aref results idx)
                                               (run-one-subagent d tool-names depth)))
                                       :name (format nil "operandi-fan-~D" i))))))
-               (dolist (th threads) (ignore-errors (bt:join-thread th)))))
+               (join-or-stop threads)))
     (let ((batch (roll-up-usage! results)))
       (with-output-to-string (s)
         (let ((total-iters 0))
@@ -420,7 +460,7 @@ the code moved under it. The tool marks those."
                                           (setf (aref results idx)
                                                 (run-one-investigation h context tool-names depth))))
                                       :name (format nil "operandi-investigate-~D" i))))))
-               (dolist (th threads) (ignore-errors (bt:join-thread th)))))
+               (join-or-stop threads)))
     (let* ((batch (roll-up-usage! results))
            (records (loop for r across results
                           for i from 1

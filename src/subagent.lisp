@@ -34,7 +34,15 @@
            #:*verdict*
            #:*findings-file*
            #:*worker-model*
-           #:parse-worker-model))
+           #:parse-worker-model
+           #:*ask-max-hypotheses*
+           #:*ask-worker-tools*
+           #:install-thread-error-guard
+           #:run-investigate
+           #:elicit-hypotheses
+           #:project-findings
+           #:findings-brief
+           #:synthesis-prompt))
 
 (in-package #:operandi.subagent)
 
@@ -56,6 +64,33 @@
       (remove "" (mapcar (lambda (s) (string-trim " " s))
                          (uiop:split-string tools-str :separator ","))
               :test #'string=)))
+
+;;; ------------------ a stray thread must not end the process ---------------
+(defun install-thread-error-guard ()
+  "Make an unhandled error in any thread OTHER than the main one abort that
+   thread instead of the process.
+
+   operandi runs with --disable-debugger, under which an unhandled error in
+   ANY thread exits the whole image. operandi's own workers catch their
+   errors, but code they run can start threads of its own, and one of those
+   erroring took down a live /ask — orchestrator, every worker, and the
+   verdicts already reported. The main thread keeps the old behaviour: an
+   error there is a real failure and should still stop the run. Only
+   installed when the debugger is disabled; interactively, a stray thread's
+   error should still reach the debugger where you can see it."
+  (let ((prior sb-ext:*invoke-debugger-hook*))
+    (when (and prior (not (get 'install-thread-error-guard 'installed)))
+      (setf (get 'install-thread-error-guard 'installed) t)
+      (setf sb-ext:*invoke-debugger-hook*
+            (lambda (condition hook)
+              (if (eq sb-thread:*current-thread* (sb-thread:main-thread))
+                  (funcall prior condition hook)
+                  (progn
+                    (ignore-errors
+                     (format *error-output* "~&[operandi] thread ~S died, process kept: ~A~%"
+                             (sb-thread:thread-name sb-thread:*current-thread*) condition))
+                    (sb-thread:abort-thread)))))
+      t)))
 
 ;;; ------------------------- the worker tier ----------------------------
 ;;; The loop operandi exists for splits cleanly by cost. Deciding WHAT to
@@ -441,14 +476,48 @@ the code moved under it. The tool marks those."
                       (let ((e (or (gethash "evidence" r) "")))
                         (if (> (length e) 500) (concatenate 'string (subseq e 0 500) " …") e)))))))))
 
+(defun %make-scratch-dir ()
+  "A fresh directory for one swarm's probes, under ~/.operandi/scratch/."
+  (multiple-value-bind (sec min hr day mon yr) (get-decoded-time)
+    (let ((dir (merge-pathnames
+                (format nil ".operandi/scratch/investigate-~4,'0D~2,'0D~2,'0D-~2,'0D~2,'0D~2,'0D-~D/"
+                        yr mon day hr min sec (random 10000))
+                (user-homedir-pathname))))
+      (ensure-directories-exist dir)
+      (namestring dir))))
+
+(defun %untracked-files ()
+  "Untracked paths in the working directory's git repo, or NIL outside one."
+  (handler-case
+      (let ((out (uiop:run-program (list "git" "status" "--porcelain" "--untracked-files=all")
+                                   :output :string :error-output nil
+                                   :ignore-error-status t)))
+        (loop for line in (uiop:split-string (or out "") :separator '(#\Newline))
+              when (uiop:string-prefix-p "?? " line)
+                collect (subseq line 3)))
+    (error () nil)))
+
+(defun scratch-rules (scratch)
+  "What every worker is told about where its own files go."
+  (format nil "YOUR SCRATCH DIRECTORY is ~A. Every file you create — probe
+scripts, logs, output, pid files — goes there, never in the project tree:
+you are investigating someone else's project, not editing it. To run Lisp,
+write it to a file there and run it in a SEPARATE process through Bash
+(sbcl --non-interactive --load FILE) — never in this image. Nothing you
+start may outlive you: kill every background process before you report."
+          scratch))
+
 (defun run-investigate (hypotheses context tool-names depth &optional model)
   "Settle HYPOTHESES in parallel, batched at *FAN-MAX*. Returns a JSON
    array of verdict records plus a one-line cost footer. MODEL, when given,
    overrides *WORKER-MODEL* for this batch's workers."
-  (let ((results (make-array (length hypotheses) :initial-element nil))
-        ;; resolved in the orchestrator's thread, then handed to each worker:
-        ;; a new thread sees the global, not this thread's dynamic bindings
-        (wm (or model *worker-model*)))
+  (let* ((results (make-array (length hypotheses) :initial-element nil))
+         ;; resolved in the orchestrator's thread, then handed to each worker:
+         ;; a new thread sees the global, not this thread's dynamic bindings
+         (wm (or model *worker-model*))
+         (scratch (%make-scratch-dir))
+         (context (format nil "~@[~A~%~%~]~A" context (scratch-rules scratch)))
+         (before (%untracked-files)))
     (loop for start from 0 below (length hypotheses) by *fan-max*
           for end = (min (length hypotheses) (+ start *fan-max*))
           do (let ((threads
@@ -465,13 +534,137 @@ the code moved under it. The tool marks those."
            (records (loop for r across results
                           for i from 1
                           when r collect (verdict-record r i)))
-           (logged (record-findings records (namestring (uiop:getcwd)) (%git-head))))
-      (format nil "~A~%[investigate: ~D hypotheses on ~A, ~A~A]"
-              (jzon:stringify (coerce records 'vector) :pretty t)
-              (length records)
-              (or wm "the orchestrator's model")
-              (llm:usage-summary batch)
-              (if logged "; recorded to the findings ledger" "")))))
+           (logged (record-findings records (namestring (uiop:getcwd)) (%git-head)))
+           ;; files that appeared in the project during the swarm despite the
+           ;; scratch rule. Reported, never deleted: they are in someone's repo.
+           (debris (set-difference (%untracked-files) before :test #'string=)))
+      (values
+       (format nil "~A~%[investigate: ~D hypotheses on ~A, ~A~A; scratch ~A]~@[~%WARNING: workers left ~D new file~:P in the project tree: ~{~A~^, ~}~]"
+               (jzon:stringify (coerce records 'vector) :pretty t)
+               (length records)
+               (or wm "the orchestrator's model")
+               (llm:usage-summary batch)
+               (if logged "; recorded to the findings ledger" "")
+               scratch
+               (and debris (length debris)) debris)
+       ;; the structured records too, for a harness that reasons over them
+       records
+       batch
+       debris))))
+
+
+;;; ------------------------ the question phase -------------------------
+;;; Every experiment in 8edec0b..c42c3ba pointed the same way. Asked directly,
+;;; a model — the cheap one included — writes good rival hypotheses: on the
+;;; Ctrl-C question both ds4f and kimi covered all four real explanations, as
+;;; genuine rivals. What neither ever did was DECIDE to delegate: holding the
+;;; Investigate tool, told to use it, on a question that plainly split, both
+;;; ground through it serially — kimi for $2.28 where a swarm had settled a
+;;; comparable question for 6 cents.
+;;;
+;;; So the harness makes that decision instead of waiting for the model to.
+;;; A question goes: ledger -> hypotheses -> swarm -> synthesis, and the model
+;;; is only ever asked to do the parts it demonstrably does well.
+
+(defparameter *ask-max-hypotheses* 6
+  "Most rival hypotheses one /ask will settle. More costs more and rarely
+   discriminates better — past a handful they start restating each other.")
+
+(defparameter *ask-worker-tools*
+  '("Read" "Grep" "Glob" "Bash" "WebFetch" "WebSearch" "Findings" "Verdict")
+  "What an /ask worker may use. Investigators, not fixers: no Edit or Write,
+   and nothing that delegates — a worker that could Investigate or Fan could
+   spawn its own swarm, eight per level to the depth limit, on a question
+   that asked for one verdict. Findings so a worker can see what is settled,
+   Verdict because it is how a worker reports.
+
+   And no Eval. Workers are threads in the ORCHESTRATOR's image, so an
+   in-image Eval can start threads there, or redefine operandi's own
+   functions under every other worker. The first live /ask died that way:
+   a worker LOADed a probe that spawned a thread, the thread hit an error,
+   and --disable-debugger exited the whole process — taking five verdicts
+   that were already in with it. A worker that needs to run Lisp writes it
+   to its scratch dir and runs it in a SEPARATE sbcl through Bash, where it
+   can crash all it likes.")
+
+(defun parse-hypothesis-list (text)
+  "The JSON array of strings in TEXT — tolerating a ```json fence or prose
+   around it, which models add despite being told not to. NIL if none."
+  (when (stringp text)
+    (let ((start (position #\[ text))
+          (end (position #\] text :from-end t)))
+      (when (and start end (< start end))
+        (let ((parsed (ignore-errors (jzon:parse (subseq text start (1+ end))))))
+          (when (vectorp parsed)
+            (remove-if (lambda (h) (zerop (length (string-trim '(#\Space #\Tab #\Newline) h))))
+                       (remove-if-not #'stringp (coerce parsed 'list)))))))))
+
+(defun project-findings (project &optional (limit 12))
+  "The most recent LIMIT ledger records for PROJECT, oldest first."
+  (last (remove-if-not (lambda (r) (equal (gethash "project" r) project))
+                       (read-findings))
+        limit))
+
+(defun findings-brief (records)
+  "RECORDS as compact lines for a prompt: [verdict/confidence] claim."
+  (with-output-to-string (s)
+    (dolist (r records)
+      (format s "- [~A/~A] ~A~%"
+              (gethash "verdict" r) (or (gethash "confidence" r) "?")
+              (gethash "hypothesis" r)))))
+
+(defun elicit-hypotheses (question &key prior)
+  "Ask the current model for rival, falsifiable hypotheses about QUESTION.
+   PRIOR is a findings brief, so already-settled claims are not re-asked.
+   Returns (values hypotheses raw-reply); hypotheses is NIL on failure."
+  (let* ((prompt (format nil "A question has come in about the project in ~A:
+
+QUESTION: ~A
+~@[
+Already settled in this project (do NOT propose these again; build past them):
+~A~]
+Before anyone investigates, write down the RIVAL hypotheses worth testing.
+Each one must be a single, specific claim that evidence in the code or
+system could REFUTE — \"the join is wrapped in ignore-errors, so an interrupt
+unwinds past it\", not \"look at the threading\". Cover the genuinely different
+explanations, including the ones that would make the obvious answer wrong;
+where a question has two sides, state both sides as separate claims.
+Between 3 and ~D hypotheses.
+
+Reply with ONLY a JSON array of strings, one hypothesis each."
+                         (namestring (uiop:getcwd)) question
+                         (and prior (plusp (length prior)) prior)
+                         *ask-max-hypotheses*))
+         (reply (handler-case (llm:llm-chat prompt :max-tokens 3000 :effort :low)
+                  (error () nil)))
+         (hs (parse-hypothesis-list reply)))
+    (values (and hs (subseq hs 0 (min (length hs) *ask-max-hypotheses*)))
+            reply)))
+
+(defun synthesis-prompt (question prior records)
+  "The turn that turns verdicts into an answer. It reads the swarm's
+   claims, not its transcripts, and may follow up only where the swarm
+   could not settle something."
+  (format nil "You put this question to a swarm of investigators. Each took one
+hypothesis, read the code, and reported a verdict with evidence. Write the
+answer.
+
+QUESTION: ~A
+~@[
+Already settled in this project before this question was asked:
+~A~]
+VERDICTS (one worker per hypothesis):
+~A
+
+Give a clear bottom line: what is actually true, grounded in the verdicts'
+own evidence — cite their file:line, do not re-derive it. Say plainly where
+verdicts conflict, and what stayed undetermined. Use tools ONLY to follow up
+on a hypothesis that was undetermined or in conflict, and only as far as
+settling it needs; do not re-investigate anything confirmed or refuted with
+high confidence — that work is done."
+          question
+          (and prior (plusp (length prior)) prior)
+          (jzon:stringify (coerce records 'vector) :pretty t)))
 
 (tools:define-tool "Investigate"
     (:description "Settle several INDEPENDENT hypotheses in parallel and get

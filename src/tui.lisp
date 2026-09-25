@@ -321,10 +321,89 @@
     (let ((size (ignore-errors (with-open-file (f p :element-type '(unsigned-byte 8)) (file-length f)))))
       (emit (paint (format nil "  📎 ~A~@[ (~D KB)~]~%" p (and size (round size 1024))) :gray)))))
 
+(defun ask-prompt-p (prompt)
+  (and (stringp prompt)
+       (let ((p (string-left-trim " " prompt)))
+         (or (string-equal p "/ask") (uiop:string-prefix-p "/ask " p)))))
+
+(defun ask-question (prompt)
+  (string-trim " " (subseq (string-left-trim " " prompt) 4)))
+
+(defun verdict-glyph (v)
+  (cond ((equal v "confirmed") (paint "✔ confirmed   " :br-green))
+        ((equal v "refuted")   (paint "✗ refuted     " :br-red))
+        (t                     (paint "? undetermined" :yellow))))
+
+(defun run-ask (sess question)
+  "/ask: the harness, not the model, decides to delegate. Ledger ->
+   hypotheses -> swarm -> synthesis; the model is only asked for the parts
+   it does well when asked (writing rivals, reading verdicts). The swarm
+   runs inside an interrupt handler: /ask arrives as a turn, and Ctrl-C
+   here must stop the workers (JOIN-OR-STOP) and return to the prompt, not
+   take the process down."
+  (when (zerop (length question))
+    (fresh)
+    (emit (paint (format nil "  /ask needs a question — e.g. /ask why does the first map load stall?~%") :yellow))
+    (return-from run-ask nil))
+  (let ((synthesis
+          (handler-case
+              (let* ((project (namestring (uiop:getcwd)))
+                     (prior-records (operandi.subagent:project-findings project))
+                     (prior (and prior-records (operandi.subagent:findings-brief prior-records))))
+                (fresh)
+                (emit (paint (format nil "⟐ ask: ~A~%" question) :bold :cyan))
+                (emit (paint (format nil "  ledger: ~D prior finding~:P for this project~%"
+                                     (length prior-records)) :gray))
+                (emit (paint (format nil "  writing hypotheses on ~A…~%" (model-label)) :gray))
+                (force-output)
+                (let ((hyps (operandi.subagent:elicit-hypotheses question :prior prior)))
+                  (cond
+                    ((null hyps)
+                     ;; never do worse than no /ask at all
+                     (emit (paint "  no usable hypotheses from the model — answering directly instead~%" :yellow))
+                     question)
+                    (t
+                     (loop for h in hyps for i from 1
+                           do (emit (paint (format nil "    ~D. ~A~%" i (oneline h 110)) :gray)))
+                     (emit (paint (format nil "  settling ~D in parallel on ~A…~%"
+                                          (length hyps)
+                                          (or operandi.subagent:*worker-model* (model-label)))
+                                  :gray))
+                     (force-output)
+                     (multiple-value-bind (text records batch debris)
+                         (operandi.subagent:run-investigate
+                          hyps
+                          (format nil "Project: ~A~%The question being answered: ~A" project question)
+                          operandi.subagent:*ask-worker-tools*
+                          1)
+                       (declare (ignore text))
+                       (dolist (r records)
+                         (emit (format nil "    ~A ~A ~A~%"
+                                       (verdict-glyph (gethash "verdict" r))
+                                       (paint (format nil "~6A" (or (gethash "confidence" r) "")) :gray)
+                                       (oneline (gethash "hypothesis" r) 90))))
+                       (emit (paint (format nil "  swarm: ~A — recorded to the ledger~%"
+                                            (llm:usage-summary batch)) :gray))
+                       (when debris
+                         (emit (paint (format nil "  ⚠ workers left ~D file~:P in the project (not removed): ~{~A~^, ~}~%"
+                                              (length debris) debris)
+                                      :yellow)))
+                       (force-output)
+                       (operandi.subagent:synthesis-prompt question prior records))))))
+            (#+sbcl sb-sys:interactive-interrupt #-sbcl error ()
+              (fresh)
+              (emit (paint "  ⎋ ask interrupted — workers stopped.~%" :yellow))
+              nil))))
+    (when synthesis
+      (run-turn-content sess synthesis))))
+
 (defun run-turn (sess prompt)
   "Run one agent turn on PROMPT, streaming to the terminal, threading
    SESS's history and folding usage. Ctrl-C aborts just this turn.
-   @path tokens and /paste'd images become image parts of the message."
+   @path tokens and /paste'd images become image parts of the message.
+   A turn beginning /ask goes through the question phase (RUN-ASK)."
+  (when (ask-prompt-p prompt)
+    (return-from run-turn (run-ask sess (ask-question prompt))))
   (multiple-value-bind (text images) (resolve-attachments prompt)
     (let ((content (handler-case (llm:user-content text images)
                      (error (e)
@@ -413,6 +492,7 @@
                  ("/model [id]"    "show or switch model (id like vendor/name → OpenRouter)")
                  ("/effort [lvl]"  "show or set reasoning effort: off, low, medium, high, default")
                  ("/workers [m]"   "show or set the subagent model (vendor/name, llama, or inherit)")
+                 ("/ask <question>" "rival hypotheses -> a swarm settles them -> an answer from the verdicts")
                  ("/system"        "print the active system prompt")
                  ("/tools"         "list the tools the agent can call")
                  ("/quit  /exit"   "leave (Ctrl-D also works)")))
@@ -535,6 +615,9 @@
       ((string-equal verb "/workers") (cmd-workers arg) t)
       ((string-equal verb "/system") (cmd-system sess) t)
       ((string-equal verb "/tools") (cmd-tools) t)
+      ;; /ask is a TURN, not a command: returning NIL here lets both REPLs
+      ;; route it through run-turn, which has the interrupt handling a swarm needs
+      ((string-equal verb "/ask") nil)
       (t (format t "~&unknown command ~A — try /help~%" (paint verb :yellow)) t))))
 
 ;;; ------------------------------- input ------------------------------

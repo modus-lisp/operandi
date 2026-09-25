@@ -40,6 +40,10 @@
 ;; package at read-time.
 (funcall (find-symbol "OPEN-STORE" "OPERANDI.STORE"))
 
+;; Under --disable-debugger an unhandled error in ANY thread exits the image;
+;; make a stray thread's error kill only that thread (see the function).
+(funcall (find-symbol "INSTALL-THREAD-ERROR-GUARD" "OPERANDI.SUBAGENT"))
+
 (defpackage #:operandi-cli
   (:use #:cl)
   (:local-nicknames (#:eng #:operandi.engine)
@@ -175,6 +179,10 @@
      (format t "Sessions are saved under ~~/.operandi/sessions/; --resume continues one.~%")
      (format t "Default backend is a local llama.cpp on http://127.0.0.1:8081.~%"))
     ((member cmd '("tui" "shell" "repl") :test #'string-equal) (run-shell))
+    ;; operandi ask "why does X happen?" — the question phase, non-interactively
+    ((string-equal cmd "ask")
+     (funcall (find-symbol "REPL" "OPERANDI.TUI")
+              :once (format nil "/ask ~{~A~^ ~}" (rest args)) :greet nil))
     (t (run-once (format nil "~{~A~^ ~}" args) tool-names))))
 
 ;; Exit cleanly once the command is done. Without this, an invocation that

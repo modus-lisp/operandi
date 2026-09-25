@@ -38,6 +38,7 @@
            #:*ask-max-hypotheses*
            #:*ask-worker-tools*
            #:install-thread-error-guard
+           #:*swarm-deadline*
            #:run-investigate
            #:elicit-hypotheses
            #:project-findings
@@ -174,11 +175,34 @@
    run's accumulator (ENG:*SUBAGENT-USAGE*), which the parent thread — the
    one running this tool — still has bound. Returns the batch total."
   (let ((batch (llm:make-usage)))
-    (loop for r across results when r do (llm:usage-incf batch (getf r :usage)))
+    ;; a worker stopped at the deadline left at most a partial record, with
+    ;; no usage — what it spent is not recoverable here
+    (loop for r across results
+          when (and r (getf r :usage)) do (llm:usage-incf batch (getf r :usage)))
     (when eng:*subagent-usage* (llm:usage-incf eng:*subagent-usage* batch))
     batch))
 
-(defun join-or-stop (threads)
+(defparameter *swarm-deadline*
+  (let ((e (uiop:getenv "OPERANDI_SWARM_DEADLINE")))
+    (or (and e (ignore-errors (parse-integer e))) 900))
+  "Seconds an Investigate swarm may run before its stragglers are stopped and
+   the harness carries on with the verdicts it has. A swarm that cannot finish
+   must end LATE and PARTIAL, never hang: one live /ask sat for 33 hours after
+   the laptop slept mid-run, holding the one verdict it had got.")
+
+(defun %stop-workers (threads)
+  "Stop every thread in THREADS still running, then give them a moment to
+   actually unwind. Every stop is issued before any waiting, inside
+   without-interrupts, so a second Ctrl-C cannot leave half of them running."
+  (sb-sys:without-interrupts
+    (dolist (th threads)
+      (when (bt:thread-alive-p th)
+        (ignore-errors (bt:destroy-thread th)))))
+  (loop repeat 40
+        while (some #'bt:thread-alive-p threads)
+        do (sleep 0.05)))
+
+(defun join-or-stop (threads &optional deadline)
   "Wait for every worker in THREADS. If THIS thread is unwound before they
    all finish — Ctrl-C in the TUI, an abort-turn throw, any non-local exit —
    stop the ones still running.
@@ -194,29 +218,34 @@
    abort-thread, so the worker UNWINDS and runs its own cleanup — a worker
    that was itself running Investigate stops its children the same way.
    A request already sent to the provider may still be billed; nothing
-   after it will be."
-  (let ((finished nil))
+   after it will be.
+
+   With DEADLINE (a universal time), workers still running then are stopped
+   the same way and this returns NIL; it returns T when all of them finished."
+  (let ((finished nil) (timed-out nil))
     (unwind-protect
-         (progn (dolist (th threads)
-                  ;; Catch ONLY a worker that died (join-thread-error). The old
-                  ;; IGNORE-ERRORS here caught every ERROR — including one
-                  ;; interrupted INTO this thread — and swallowed it, so the
-                  ;; parent carried on waiting and nothing below ever ran.
-                  (handler-case (bt:join-thread th)
-                    (sb-thread:join-thread-error () nil)))
-                (setf finished t))
+         (progn
+           ;; Poll rather than block in join-thread. DEADLINE is a UNIVERSAL
+           ;; time — wall clock, not a monotonic one — so time the machine
+           ;; spent asleep counts against it, and a swarm stalled across a
+           ;; closed lid is stopped on waking instead of waited on forever.
+           (loop
+             (when (notany #'bt:thread-alive-p threads) (return))
+             (when (and deadline (> (get-universal-time) deadline))
+               (setf timed-out t)
+               (return))
+             (sleep 0.25))
+           (dolist (th threads)
+             (unless (bt:thread-alive-p th)
+               ;; ONLY a worker that died (join-thread-error). The old
+               ;; IGNORE-ERRORS here caught every ERROR — including one
+               ;; interrupted INTO this thread — and swallowed it.
+               (handler-case (bt:join-thread th)
+                 (sb-thread:join-thread-error () nil))))
+           (setf finished (not timed-out)))
       (unless finished
-        ;; Issue every stop before waiting on any: a second Ctrl-C landing
-        ;; mid-loop must not leave half the workers untouched.
-        (sb-sys:without-interrupts
-          (dolist (th threads)
-            (when (bt:thread-alive-p th)
-              (ignore-errors (bt:destroy-thread th)))))
-        ;; terminate-thread is asynchronous. Give the workers a moment to
-        ;; actually unwind, so none gets one more call in after we return.
-        (loop repeat 40
-              while (some #'bt:thread-alive-p threads)
-              do (sleep 0.05))))))
+        (%stop-workers threads)))
+    (not timed-out)))
 
 (defun run-fan (tasks tool-names depth)
   "Run TASKS concurrently (batched at *FAN-MAX*), preserving order.
@@ -261,6 +290,11 @@
 ;;; prose. INVESTIGATE returns those records; the reasoning that produced
 ;;; them dies with the worker, which is the point.
 
+(defvar *investigation* nil
+  "While a worker settles one hypothesis: a plist of :hypothesis :project
+   :commit :model and :report — a function that hands a record to the parent.
+   Bound in the worker's thread by RUN-ONE-INVESTIGATION; NIL elsewhere.")
+
 (defvar *verdict* nil
   "Per-thread slot where the Verdict tool records this worker's finding,
    NIL until it calls one. Bound freshly around each investigation —
@@ -293,6 +327,20 @@ what it printed, the measurement you took. Quote specifics. An impression
         (e (gethash "evidence" args))
         (c (or (gethash "confidence" args) "medium")))
     (setf *verdict* (list :verdict v :evidence (or e "") :confidence c))
+    ;; Make the claim durable NOW, not when the batch completes. Two live
+    ;; /asks lost verdicts that had already been reported — five when the
+    ;; process died, one when a sleeping laptop stalled the swarm — because
+    ;; the ledger was only written after every worker came back.
+    (when *investigation*
+      (let* ((inv *investigation*)
+             (model (or llm:*llm-model* (getf inv :model)))
+             (partial (list :hypothesis (getf inv :hypothesis) :verdict *verdict*
+                            :iters nil :model model
+                            :text "(reported; the worker may have been stopped after this)")))
+        (record-findings (list (verdict-record partial 0))
+                         (getf inv :project) (getf inv :commit))
+        ;; ...and visible to the parent even if this worker never returns
+        (ignore-errors (funcall (getf inv :report) partial))))
     (format nil "Verdict recorded: ~A (~A confidence). You may stop now." v c)))
 
 (defun investigation-prompt (hypothesis context)
@@ -311,11 +359,17 @@ once. Calling Verdict IS your report; a run that ends without it has
 produced nothing."
           hypothesis (and (stringp context) (plusp (length context)) context)))
 
-(defun run-one-investigation (hypothesis context tool-names depth)
+(defun run-one-investigation (hypothesis context tool-names depth
+                              &key project commit report)
   "Run one worker against one HYPOTHESIS and return its record. Binds
-   *VERDICT* in THIS thread so the worker's Verdict call lands here."
-  (let ((*verdict* nil))
-    (declare (special *verdict*))
+   *VERDICT* and *INVESTIGATION* in THIS thread, so the worker's Verdict
+   call lands here — and is recorded to the ledger and REPORTed to the
+   parent the moment it is made."
+  (let ((*verdict* nil)
+        (*investigation* (list :hypothesis hypothesis :project project
+                               :commit commit :model *worker-model*
+                               :report (or report (lambda (r) (declare (ignore r)))))))
+    (declare (special *verdict* *investigation*))
     (let ((r (run-one-subagent (investigation-prompt hypothesis context)
                                tool-names depth)))
       (list :hypothesis hypothesis
@@ -379,6 +433,12 @@ produced nothing."
   (multiple-value-bind (sec min hr day mon yr) (get-decoded-time)
     (format nil "~4,'0D-~2,'0D-~2,'0DT~2,'0D:~2,'0D:~2,'0D" yr mon day hr min sec)))
 
+(defvar *ledger-lock* (bt:make-lock "findings-ledger")
+  "Serializes appends. Verdicts are now recorded by each worker the moment it
+   reports, so several threads append at once, and a record can be many KB
+   of evidence — more than one write(2), so two could interleave into
+   unparseable lines.")
+
 (defun record-findings (records project commit)
   "Append RECORDS (the verdict objects) to the ledger with provenance.
    Best-effort: a ledger write must never take down the run that produced
@@ -386,6 +446,7 @@ produced nothing."
   (handler-case
       (progn
         (ensure-directories-exist *findings-file*)
+        (bt:with-lock-held (*ledger-lock*)
         (with-open-file (out *findings-file* :direction :output
                                              :if-exists :append
                                              :if-does-not-exist :create
@@ -398,7 +459,7 @@ produced nothing."
                            (unless (string= k "n")      ; batch-local index
                              (setf (gethash k rec) v)))
                          r)
-                (write-line (jzon:stringify rec) out)))))
+                (write-line (jzon:stringify rec) out))))))
         t)
     (error () nil)))
 
@@ -517,9 +578,15 @@ start may outlive you: kill every background process before you report."
          (wm (or model *worker-model*))
          (scratch (%make-scratch-dir))
          (context (format nil "~@[~A~%~%~]~A" context (scratch-rules scratch)))
-         (before (%untracked-files)))
+         (before (%untracked-files))
+         (project (namestring (uiop:getcwd)))
+         (commit (%git-head))
+         ;; one deadline for the whole swarm, across every batch
+         (deadline (+ (get-universal-time) *swarm-deadline*)))
     (loop for start from 0 below (length hypotheses) by *fan-max*
           for end = (min (length hypotheses) (+ start *fan-max*))
+          ;; past the deadline, later batches are not started at all
+          while (<= (get-universal-time) deadline)
           do (let ((threads
                      (loop for i from start below end
                            collect (let ((idx i) (h (nth i hypotheses)))
@@ -527,30 +594,50 @@ start may outlive you: kill every background process before you report."
                                       (lambda ()
                                         (let ((*worker-model* wm))
                                           (setf (aref results idx)
-                                                (run-one-investigation h context tool-names depth))))
+                                                (run-one-investigation
+                                                 h context tool-names depth
+                                                 :project project :commit commit
+                                                 ;; a reported verdict lands in its
+                                                 ;; slot at once; a normal return
+                                                 ;; overwrites it with the full record
+                                                 :report (lambda (r) (setf (aref results idx) r))))))
                                       :name (format nil "operandi-investigate-~D" i))))))
-               (join-or-stop threads)))
+               (join-or-stop threads deadline)))
     (let* ((batch (roll-up-usage! results))
+           ;; every hypothesis gets a record — one whose worker was stopped, or
+           ;; never started, says so rather than silently vanishing
            (records (loop for r across results
+                          for h in hypotheses
                           for i from 1
-                          when r collect (verdict-record r i)))
-           (logged (record-findings records (namestring (uiop:getcwd)) (%git-head)))
+                          collect (verdict-record
+                                   (or r (list :hypothesis h :verdict nil :iters nil :model wm
+                                               :text (if (> (get-universal-time) deadline)
+                                                         "[stopped at the swarm deadline before reaching a verdict]"
+                                                         "[worker ended without a result]")))
+                                   i)))
+           ;; already in the ledger: each verdict was recorded when reported
+           (logged (count-if (lambda (r) (not (search "[worker never called Verdict]"
+                                                      (gethash "evidence" r))))
+                             records))
+           (timed-out (> (get-universal-time) deadline))
            ;; files that appeared in the project during the swarm despite the
            ;; scratch rule. Reported, never deleted: they are in someone's repo.
            (debris (set-difference (%untracked-files) before :test #'string=)))
       (values
-       (format nil "~A~%[investigate: ~D hypotheses on ~A, ~A~A; scratch ~A]~@[~%WARNING: workers left ~D new file~:P in the project tree: ~{~A~^, ~}~]"
+       (format nil "~A~%[investigate: ~D hypotheses on ~A, ~A; ~D verdict~:P recorded to the ledger as reported; scratch ~A]~@[~%DEADLINE: the swarm hit its ~Ds deadline; unfinished workers were stopped and their hypotheses are marked undetermined.~]~@[~%WARNING: workers left ~D new file~:P in the project tree: ~{~A~^, ~}~]"
                (jzon:stringify (coerce records 'vector) :pretty t)
                (length records)
                (or wm "the orchestrator's model")
                (llm:usage-summary batch)
-               (if logged "; recorded to the findings ledger" "")
+               logged
                scratch
+               (and timed-out *swarm-deadline*)
                (and debris (length debris)) debris)
        ;; the structured records too, for a harness that reasons over them
        records
        batch
-       debris))))
+       debris
+       timed-out))))
 
 
 ;;; ------------------------ the question phase -------------------------

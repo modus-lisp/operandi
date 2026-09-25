@@ -370,7 +370,7 @@
                                           (or operandi.subagent:*worker-model* (model-label)))
                                   :gray))
                      (force-output)
-                     (multiple-value-bind (text records batch debris)
+                     (multiple-value-bind (text records batch debris timed-out)
                          (operandi.subagent:run-investigate
                           hyps
                           (format nil "Project: ~A~%The question being answered: ~A" project question)
@@ -384,6 +384,10 @@
                                        (oneline (gethash "hypothesis" r) 90))))
                        (emit (paint (format nil "  swarm: ~A — recorded to the ledger~%"
                                             (llm:usage-summary batch)) :gray))
+                       (when timed-out
+                         (emit (paint (format nil "  ⏱ the swarm hit its ~Ds deadline — unfinished workers stopped, answering with what came back~%"
+                                              operandi.subagent:*swarm-deadline*)
+                                      :yellow)))
                        (when debris
                          (emit (paint (format nil "  ⚠ workers left ~D file~:P in the project (not removed): ~{~A~^, ~}~%"
                                               (length debris) debris)

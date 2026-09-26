@@ -20,11 +20,11 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
-  (ql:quickload '(:dexador :com.inuoe.jzon) :silent t))
+  (ql:quickload '(:com.inuoe.jzon) :silent t))
 
 (defpackage #:operandi.engine
   (:use #:cl)
-  (:local-nicknames (#:dex   #:dexador)
+  (:local-nicknames (#:http  #:operandi.http)
                     (#:jzon  #:com.inuoe.jzon)
                     (#:llm   #:operandi.llm)
                     (#:tools #:operandi.tools)
@@ -897,13 +897,13 @@ another tool or give a final answer.")
 (defun do-chat-blocking (messages tools-vec &key (max-tokens *do-chat-max-tokens*)
                                                  (temperature 0.0))
   "One blocking chat completion. Returns the parsed top-level hash table."
-  (let ((resp (dex:post llm:*llm-url*
-                        :content (with-output-to-string (s)
-                                   (jzon:stringify (build-chat-body messages tools-vec
-                                                                    max-tokens temperature nil)
-                                                   :stream s))
-                        :headers (chat-headers) :keep-alive nil
-                        :connect-timeout 5 :read-timeout llm:*llm-read-timeout*)))
+  (let ((resp (http:post llm:*llm-url*
+                         :content (with-output-to-string (s)
+                                    (jzon:stringify (build-chat-body messages tools-vec
+                                                                     max-tokens temperature nil)
+                                                    :stream s))
+                         :headers (chat-headers)
+                         :read-timeout llm:*llm-read-timeout*)))
     (jzon:parse resp)))
 
 (defun parse-sse-line (line)
@@ -998,14 +998,14 @@ another tool or give a final answer.")
    *ON-TOKEN* as they arrive, and returns the assembled response in the SAME
    shape as the blocking path. Closes the stream on any exit — including a
    Ctrl-C mid-generation."
-  (let ((stream (dex:post llm:*llm-url*
-                          :content (with-output-to-string (s)
-                                     (jzon:stringify (build-chat-body messages tools-vec
-                                                                      max-tokens temperature t)
-                                                     :stream s))
-                          :headers (chat-headers) :keep-alive nil
-                          :connect-timeout 5 :read-timeout llm:*llm-read-timeout*
-                          :want-stream t))
+  (let ((stream (http:post llm:*llm-url*
+                           :content (with-output-to-string (s)
+                                      (jzon:stringify (build-chat-body messages tools-vec
+                                                                       max-tokens temperature t)
+                                                      :stream s))
+                           :headers (chat-headers)
+                           :read-timeout llm:*llm-read-timeout*
+                           :want-stream t))
         (state (make-sse-state)))
     (unwind-protect
          (loop for line = (read-line stream nil :eof)
@@ -1060,12 +1060,12 @@ another tool or give a final answer.")
                 (and code (princ-to-string code)))))))
 
 (defun http-error->parsed (e)
-  "Turn a dex:http-request-failed into an error-body parsed ({error:{message,code}}),
+  "Turn an http:http-request-failed into an error-body parsed ({error:{message,code}}),
    preferring the provider's own JSON error message from the response body. So a
    404/402/401 surfaces its real reason via provider-error-text rather than a bare
    '[empty response from model]'. Non-retryable 4xx are marked so the loop stops."
-  (let* ((code (ignore-errors (dex:response-status e)))
-         (raw (ignore-errors (dex:response-body e)))
+  (let* ((code (ignore-errors (http:response-status e)))
+         (raw (ignore-errors (http:response-body e)))
          (body (cond ((stringp raw) raw)
                      ((typep raw '(vector (unsigned-byte 8)))
                       (ignore-errors (sb-ext:octets-to-string raw :external-format :utf-8)))
@@ -1095,7 +1095,7 @@ another tool or give a final answer.")
              (parsed (handler-case
                          (let ((*stream* nil))
                            (do-chat-blocking msgs #() :max-tokens 1))
-                       (dex:http-request-failed (e) (http-error->parsed e)))))
+                       (http:http-request-failed (e) (http-error->parsed e)))))
         (cond
           ((response-has-error-body-p parsed)
            (values nil (or (provider-error-text parsed) "provider returned an error")))
@@ -1113,7 +1113,7 @@ another tool or give a final answer.")
         (sleep *chat-retry-sleep*))
     (loop
       (let* ((parsed (handler-case (do-chat messages tools-vec)
-                       (dex:http-request-failed (e)
+                       (http:http-request-failed (e)
                          ;; A real HTTP 4xx/5xx (e.g. OpenRouter 404 "No allowed
                          ;; providers", 402 grant, 401 bad key). dex discards the
                          ;; body into the condition — recover it as an error-body
@@ -1121,7 +1121,7 @@ another tool or give a final answer.")
                          ;; instead of a mysterious "[empty response from model]".
                          (when verbose
                            (format t "~&[operandi] http ~A (try ~A)~%"
-                                   (ignore-errors (dex:response-status e)) (1+ attempt)))
+                                   (ignore-errors (http:response-status e)) (1+ attempt)))
                          (http-error->parsed e))
                        (error (e)
                          (when verbose

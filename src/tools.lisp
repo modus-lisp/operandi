@@ -22,7 +22,7 @@
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
   (require :sb-posix)
-  (ql:quickload '(:com.inuoe.jzon :uiop :dexador :cl-ppcre :quri) :silent t))
+  (ql:quickload '(:com.inuoe.jzon :uiop :cl-ppcre :quri) :silent t))
 
 (defpackage #:operandi.tools
   (:use #:cl)

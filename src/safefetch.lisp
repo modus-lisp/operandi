@@ -21,11 +21,11 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
-  (ql:quickload '(:dexador :com.inuoe.jzon :cl-ppcre :quri :uiop) :silent t))
+  (ql:quickload '(:com.inuoe.jzon :cl-ppcre :quri :uiop) :silent t))
 
 (defpackage #:operandi.safefetch
   (:use #:cl)
-  (:local-nicknames (#:dex   #:dexador)
+  (:local-nicknames (#:http  #:operandi.http)
                     (#:jzon  #:com.inuoe.jzon)
                     (#:ppcre #:cl-ppcre)
                     (#:llm   #:operandi.llm)
@@ -60,28 +60,19 @@
       (string-trim '(#\Space #\Tab #\Newline #\Return) s))))
 
 (defparameter *webfetch-max-bytes* 2000000
-  "Cap on bytes pulled from a URL. dex:get :force-string reads the WHOLE
-   body into memory first, so an endless / huge / chunked response OOMs
-   the image (fatal, like Read on /dev/zero — :read-timeout doesn't stop
-   a steady stream). We stream and stop at this bound instead.")
+  "Cap on bytes pulled from a URL.  Reading a whole body into memory first
+   lets an endless / huge / chunked response OOM the image (fatal, like Read
+   on /dev/zero -- a read timeout doesn't stop a steady stream), so the client
+   stops reading at this bound instead.")
 
 (defun bounded-http-get (url)
   "GET URL as a stream, returning at most *webfetch-max-bytes* octets
    decoded to a string, so a huge or endless body can't exhaust memory."
-  (let ((stream (dex:get url :want-stream t :keep-alive nil
-                             :read-timeout 15 :connect-timeout 5
-                             :headers '(("User-Agent" . "operandi/1.0")
-                                        ("Accept" . "text/html, */*; q=0.5")))))
-    (unwind-protect
-         (if (subtypep (stream-element-type stream) 'character)
-             (let ((buf (make-string *webfetch-max-bytes*)))
-               (subseq buf 0 (read-sequence buf stream)))
-             (let* ((buf (make-array *webfetch-max-bytes* :element-type '(unsigned-byte 8)))
-                    (n (read-sequence buf stream)))
-               (handler-case
-                   (sb-ext:octets-to-string buf :end n :external-format :utf-8)
-                 (error () (map 'string #'code-char (subseq buf 0 n))))))
-      (ignore-errors (close stream)))))
+  ;; The cap is enforced by the client, which stops reading at *WEBFETCH-MAX-BYTES* octets, so
+  ;; there is no stream to manage here and nothing past the cap is ever pulled off the wire.
+  (values (http:get url :read-timeout 15 :max-bytes *webfetch-max-bytes*
+                        :headers '(("User-Agent" . "operandi/1.0")
+                                   ("Accept" . "text/html, */*; q=0.5")))))
 
 ;;; ----------------------- inbound sanitizer -------------------------
 

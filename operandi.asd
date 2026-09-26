@@ -18,7 +18,10 @@
   :license "MIT"
   :version "0.1.0"
   :depends-on ("com.inuoe.jzon"
-               "dexador"
+               "seal/http"      ; pure-CL HTTP/TLS (on natrium) -- replaced dexador, which was
+                                ; the only way FFI entered this stack (cl+ssl, iolib, static-vectors)
+               "babel"
+               "quri"
                "cl-base64"
                "cl-ppcre"
                "sqlite"
@@ -28,13 +31,14 @@
   ((:module "src"
     :components
     ((:file "text")                                           ; operandi.text
-     (:file "llm")                                            ; operandi.llm
+     (:file "http")                                           ; operandi.http
+     (:file "llm"      :depends-on ("http"))                  ; operandi.llm
      (:file "store")                                          ; operandi.store
-     (:file "search"   :depends-on ("llm"))                   ; operandi.search
-     (:file "safefetch" :depends-on ("llm" "text"))           ; operandi.safefetch
+     (:file "search"   :depends-on ("http" "llm"))            ; operandi.search
+     (:file "safefetch" :depends-on ("http" "llm" "text"))    ; operandi.safefetch
      (:file "hooks"    :depends-on ("store"))                 ; operandi.hooks
      (:file "tools"    :depends-on ("llm" "search" "hooks" "safefetch" "text"))  ; operandi.tools
-     (:file "engine"   :depends-on ("llm" "tools" "hooks" "safefetch"))   ; operandi.engine
+     (:file "engine"   :depends-on ("http" "llm" "tools" "hooks" "safefetch"))   ; operandi.engine
      (:file "subagent" :depends-on ("llm" "tools" "engine"))  ; operandi.subagent
      (:file "cron"     :depends-on ("engine"))                ; operandi.cron
      (:file "session"  :depends-on ("llm"))                   ; operandi.session

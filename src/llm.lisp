@@ -17,11 +17,11 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
-  (ql:quickload '(:dexador :com.inuoe.jzon) :silent t))
+  (ql:quickload '(:com.inuoe.jzon) :silent t))
 
 (defpackage #:operandi.llm
   (:use #:cl)
-  (:local-nicknames (#:jzon #:com.inuoe.jzon))
+  (:local-nicknames (#:jzon #:com.inuoe.jzon) (#:http #:operandi.http))
   (:export #:*llm-url* #:*llm-default-max-tokens* #:*llm-read-timeout*
            #:*llm-auth-token* #:*llm-model* #:*llm-backend*
            #:*llm-effort* #:parse-effort #:apply-reasoning
@@ -260,10 +260,10 @@
   (let ((attempt 0))
     (loop
       (handler-case
-          (return (dex:post url :content body :headers headers :keep-alive nil
-                                :connect-timeout 5 :read-timeout *llm-read-timeout*))
-        (dex:http-request-failed (e)
-          (let ((code (ignore-errors (dex:response-status e))))
+          (return (http:post url :content body :headers headers
+                                 :read-timeout *llm-read-timeout*))
+        (http:http-request-failed (e)
+          (let ((code (ignore-errors (http:response-status e))))
             (if (and (or (eql code 429) (and (integerp code) (>= code 500)))
                      (< attempt *llm-max-retries*))
                 (progn (sleep (min 30 (* 3 (expt 2 attempt)))) (incf attempt))
@@ -348,9 +348,9 @@
   (let ((token (read-token-file token-file)))
     (when (and token (plusp (length token)))
       (handler-case
-          (let* ((resp (dex:get "https://openrouter.ai/api/v1/credits"
-                                :headers `(("Authorization" . ,(concatenate 'string "Bearer " token)))
-                                :keep-alive nil :connect-timeout 5 :read-timeout 15))
+          (let* ((resp (http:get "https://openrouter.ai/api/v1/credits"
+                                 :headers `(("Authorization" . ,(concatenate 'string "Bearer " token)))
+                                 :read-timeout 15))
                  (d (gethash "data" (jzon:parse resp)))
                  (total (gethash "total_credits" d))
                  (usage (gethash "total_usage" d)))

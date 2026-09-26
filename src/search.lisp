@@ -21,11 +21,11 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
-  (ql:quickload '(:dexador :com.inuoe.jzon :cl-ppcre) :silent t))
+  (ql:quickload '(:com.inuoe.jzon :cl-ppcre) :silent t))
 
 (defpackage #:operandi.search
   (:use #:cl)
-  (:local-nicknames (#:dex   #:dexador)
+  (:local-nicknames (#:http  #:operandi.http)
                     (#:jzon  #:com.inuoe.jzon)
                     (#:ppcre #:cl-ppcre)
                     (#:llm   #:operandi.llm))
@@ -85,8 +85,7 @@
   (when (eq *searxng-probe* :unknown)
     (setf *searxng-probe*
           (handler-case
-              (progn (dex:get (format nil "~A/config" *searxng-url*)
-                              :connect-timeout 1 :read-timeout 2 :keep-alive nil)
+              (progn (http:get (format nil "~A/config" *searxng-url*) :read-timeout 2)
                      t)
             (error () nil))))
   *searxng-probe*)
@@ -132,12 +131,9 @@
       (return-from api-get nil))
     (handler-case
         (jzon:parse
-         (dex:get (concatenate 'string *api-base* path)
-                  :force-string t
-                  :keep-alive nil
-                  :read-timeout 10
-                  :connect-timeout 5
-                  :headers `(("X-Subscription-Token" . ,token)
+         (http:get (concatenate 'string *api-base* path)
+                   :read-timeout 10
+                   :headers `(("X-Subscription-Token" . ,token)
                              ("Accept" . "application/json"))))
       (error (e)
         (format *error-output* "~&brave api err: ~A~%" e)
@@ -197,12 +193,11 @@
                                                   "content" (format nil "Web search: ~A~A" q hint)))))
          (res (handler-case
                   (jzon:parse
-                   (dex:post llm:*llm-url*
-                             :headers `(("Authorization" . ,(format nil "Bearer ~A" llm:*llm-auth-token*))
-                                        ("Content-Type" . "application/json"))
-                             :content (jzon:stringify body)
-                             :force-string t :keep-alive nil
-                             :read-timeout 30 :connect-timeout 5))
+                   (http:post llm:*llm-url*
+                              :headers `(("Authorization" . ,(format nil "Bearer ~A" llm:*llm-auth-token*))
+                                         ("Content-Type" . "application/json"))
+                              :content (jzon:stringify body)
+                              :read-timeout 30))
                 (error (e)
                   (format *error-output* "~&openrouter search err: ~A~%" e)
                   nil)))
@@ -231,8 +226,7 @@
          (url (format nil "~A/search?q=~A&format=json&language=en~@[&time_range=~A~]"
                       *searxng-url* (url-encode q) range))
          (res (handler-case
-                  (jzon:parse (dex:get url :force-string t :keep-alive nil
-                                           :read-timeout 15 :connect-timeout 3))
+                  (jzon:parse (http:get url :read-timeout 15))
                 (error (e)
                   (format *error-output* "~&searxng err: ~A~%" e)
                   nil)))

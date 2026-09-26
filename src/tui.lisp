@@ -59,6 +59,21 @@
           (ignore-errors (interactive-stream-p stream))))))
 
 (defun stdout-tty-p () (fd-tty-p 1 *standard-output*))
+(deftype user-interrupt ()
+  "Ctrl-C, as a condition type.  Only SBCL delivers it as a condition; elsewhere this is the
+   EMPTY type, so nothing matches.  The previous fallback was ERROR, which on any other
+   implementation caught every genuine failure as though the user had pressed Ctrl-C -- the turn
+   was then salvaged and \"[turn interrupted by the user (Ctrl-C)]\" written into the history, a
+   false statement the model would go on believing.  An empty type lets a real error propagate
+   exactly as it does on SBCL."
+  #+sbcl 'sb-sys:interactive-interrupt
+  #-sbcl nil)
+
+(defun raw-mode-available-p ()
+  "Can the concurrent UI put the terminal into cbreak mode?  It needs termios in-process (see
+   RAW-ON for why not `stty'), which here means SBCL's SB-POSIX."
+  #+sbcl t #-sbcl nil)
+
 (defun stdin-tty-p  () (fd-tty-p 0 *standard-input*))
 
 (defun color-on-p ()
@@ -394,7 +409,7 @@
                                       :yellow)))
                        (force-output)
                        (operandi.subagent:synthesis-prompt question prior records))))))
-            (#+sbcl sb-sys:interactive-interrupt #-sbcl error ()
+            (user-interrupt ()
               (fresh)
               (emit (paint "  ⎋ ask interrupted — workers stopped.~%" :yellow))
               nil))))
@@ -449,7 +464,7 @@
          (live nil))
     (handler-case
         (multiple-value-bind (text hist* iters usage)
-            (handler-bind ((#+sbcl sb-sys:interactive-interrupt #-sbcl error
+            (handler-bind ((user-interrupt
                              (lambda (c) (declare (ignore c)) (setf live eng:*live-messages*))))
               (eng:run prompt :history messages :verbose nil))
           (setf (session:session-history sess) hist*)
@@ -469,7 +484,7 @@
           (emit (paint (format nil "  ~A iter · ~A~%" iters (llm:usage-summary usage))
                        :gray))
           (force-output))
-      (#+sbcl sb-sys:interactive-interrupt #-sbcl error ()
+      (user-interrupt ()
         ;; Keep what the agent got done before the interrupt (see
         ;; SALVAGE-INTERRUPTED); usage for the partial turn isn't recoverable.
         (let ((kept (salvage-interrupted messages live)))
@@ -710,7 +725,9 @@
    `stty`, whose tcsetattr from a subprocess can hit SIGTTOU and hang. Leaves
    output processing (OPOST/ONLCR) and ICRNL intact, so agent output still uses
    plain \\n and Enter arrives as newline."
-  (setf *raw-saved* (sb-posix:tcgetattr 0))
+  #-sbcl (error "raw terminal mode needs in-process termios, which this implementation lacks")
+  #+sbcl (setf *raw-saved* (sb-posix:tcgetattr 0))
+  #+sbcl
   (let ((tio (sb-posix:tcgetattr 0)))
     (setf (sb-posix:termios-lflag tio)
           (logandc2 (sb-posix:termios-lflag tio)
@@ -730,7 +747,7 @@
 (defun raw-off ()
   (when *raw-saved*
     (raw-write (format nil "~A[?2004l" (string #\Escape)))
-    (ignore-errors (sb-posix:tcsetattr 0 sb-posix:tcsanow *raw-saved*))
+    #+sbcl (ignore-errors (sb-posix:tcsetattr 0 sb-posix:tcsanow *raw-saved*))
     (setf *raw-saved* nil)))
 
 (defun term-size ()
@@ -1122,7 +1139,7 @@
   (when greet (banner sess))
   (loop
     (let ((line (handler-case (read-input (prompt-string sess))
-                  (#+sbcl sb-sys:interactive-interrupt #-sbcl error ()
+                  (user-interrupt ()
                     (terpri) ""))))
       (cond
         ((null line) (terpri) (return))
@@ -1151,7 +1168,8 @@
       ;; scroll region + absolute ESC7/ESC8 positioning) gives type-while-working
       ;; but corrupts output under some terminal/multiplexer combos (e.g. tmux
       ;; scroll-region + DECSC interactions), so it's OPT-IN via OPERANDI_FANCY_TUI=1.
-      ((and (stdin-tty-p) (stdout-tty-p) (uiop:getenv "OPERANDI_FANCY_TUI"))
+      ((and (stdin-tty-p) (stdout-tty-p) (uiop:getenv "OPERANDI_FANCY_TUI")
+            (raw-mode-available-p))
        (handler-case (repl-concurrent sess :greet greet :resume resume :resumed resumed)
          (error ()
            (ignore-errors (raw-off))

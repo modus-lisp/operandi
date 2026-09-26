@@ -21,8 +21,10 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
-  (require :sb-posix)
-  (ql:quickload '(:com.inuoe.jzon :uiop :cl-ppcre :quri) :silent t))
+  #+sbcl (require :sb-posix)   ; modus provides SB-POSIX as a boot-time surface
+  ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
+  ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
+  #+quicklisp (ql:quickload '(:com.inuoe.jzon :uiop :cl-ppcre :quri :bordeaux-threads) :silent t))
 
 (defpackage #:operandi.tools
   (:use #:cl)
@@ -195,7 +197,7 @@
    freezes the whole agent loop. Enforced via coreutils `timeout`.")
 
 (defparameter *eval-timeout* 60
-  "Seconds a single Eval form may run before SB-EXT:WITH-TIMEOUT aborts
+  "Seconds a single Eval form may run before BT:WITH-TIMEOUT aborts
    it. An infinite loop in an Eval'd form would otherwise hang the loop
    forever with no way for the model to recover.")
 
@@ -717,10 +719,10 @@ large)."
         (result-line nil))
     (handler-case
         ;; WITH-TIMEOUT aborts an infinite loop in the Eval'd form. Its
-        ;; SB-EXT:TIMEOUT is a SERIOUS-CONDITION, not an ERROR, so it needs
+        ;; BT:TIMEOUT is a SERIOUS-CONDITION, not an ERROR, so it needs
         ;; its own handler clause below (as does STORAGE-CONDITION from a
         ;; deeply-recursive form — the ERROR clause alone would miss both).
-        (sb-ext:with-timeout *eval-timeout*
+        (bt:with-timeout (*eval-timeout*)
           (let ((*package* (find-package :cl-user))
                 (*standard-output* out)
                 (*error-output* out)
@@ -734,7 +736,7 @@ large)."
             (setf result-line
                   (let ((*print-length* 1000) (*print-level* 20) (*print-circle* t))
                     (format nil "=> ~S" last-result)))))
-      (sb-ext:timeout ()
+      (bt:timeout ()
         (setf result-line (format nil "EVAL ERROR: aborted — form ran longer than ~Ds" *eval-timeout*)))
       (storage-condition (e)
         (setf result-line (format nil "EVAL ERROR: exhausted stack/heap (~A)" (type-of e))))

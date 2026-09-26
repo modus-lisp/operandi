@@ -20,7 +20,9 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
-  (ql:quickload '(:com.inuoe.jzon) :silent t))
+  ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
+  ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
+  #+quicklisp (ql:quickload '(:com.inuoe.jzon :babel) :silent t))
 
 (defpackage #:operandi.engine
   (:use #:cl)
@@ -1068,7 +1070,7 @@ another tool or give a final answer.")
          (raw (ignore-errors (http:response-body e)))
          (body (cond ((stringp raw) raw)
                      ((typep raw '(vector (unsigned-byte 8)))
-                      (ignore-errors (sb-ext:octets-to-string raw :external-format :utf-8)))
+                      (ignore-errors (babel:octets-to-string raw :encoding :utf-8 :errorp nil)))
                      ;; streaming request (:want-stream t) → body is a stream; slurp it.
                      ((and raw (streamp raw))
                       (ignore-errors

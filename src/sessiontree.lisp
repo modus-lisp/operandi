@@ -22,7 +22,9 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
-  (funcall (read-from-string "ql:quickload") '(:com.inuoe.jzon :uiop) :silent t))
+  ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
+  ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
+  #+quicklisp (funcall (read-from-string "ql:quickload") '(:com.inuoe.jzon :uiop) :silent t))
 
 (defpackage #:operandi.sessiontree
   (:use #:cl)

@@ -21,7 +21,9 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
-  (ql:quickload '(:com.inuoe.jzon :cl-ppcre :quri :uiop) :silent t))
+  ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
+  ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
+  #+quicklisp (ql:quickload '(:com.inuoe.jzon :cl-ppcre :quri :uiop) :silent t))
 
 (defpackage #:operandi.safefetch
   (:use #:cl)

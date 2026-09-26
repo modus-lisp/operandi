@@ -21,7 +21,9 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
-  (ql:quickload '(:com.inuoe.jzon :cl-ppcre) :silent t))
+  ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
+  ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
+  #+quicklisp (ql:quickload '(:com.inuoe.jzon :cl-ppcre :babel) :silent t))
 
 (defpackage #:operandi.search
   (:use #:cl)
@@ -144,7 +146,7 @@
    (e.g. 'ñ', 'é', '北') are emitted as their UTF-8 byte sequence with
    each byte percent-encoded — Brave (and most servers) reject single-byte
    percent-encodings of codepoints > 127."
-  (let ((bytes (sb-ext:string-to-octets s :external-format :utf-8)))
+  (let ((bytes (babel:string-to-octets s :encoding :utf-8)))
     (with-output-to-string (out)
       (loop for b across bytes do
             (let ((c (code-char b)))

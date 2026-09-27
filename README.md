@@ -63,10 +63,10 @@ sbcl --non-interactive --load bin/operandi.lisp -- --openrouter minimax/minimax-
 ### Fast start (`bin/operandi`)
 
 Loading from source every run is slow — not SBCL (≈50ms) but the per-run
-Quicklisp dependency load (dexador pulls in cl+ssl/cffi/usocket), plus, if your
+Quicklisp dependency load, plus, if your
 `~/.config/common-lisp` points an ASDF `:tree` at a big directory, a full
 filesystem scan on every launch. `bin/operandi` sidesteps both: it dumps a
-**core image** with operandi (+ linedit) baked in and launches from it with the
+**core image** with operandi baked in and launches from it with the
 init files skipped — **≈60ms to a ready agent** instead of ~16s.
 
 ```
@@ -129,9 +129,10 @@ inline terminal UI:
   from the shell: `bin/operandi --resume [id] tui`, or non-interactively
   `bin/operandi --resume [id] "a follow-up question"`.
 
-It's line-based on purpose — no alt-screen, no raw mode — so it works over ssh
-and in a pipe. Colour and line-editing (linedit, if installed) auto-enable only
-on an interactive tty; piped/non-interactive output is plain text.
+It's line-based on purpose — no alt-screen — so it works over ssh and in a pipe.
+Colour and line editing ([quill](https://github.com/modus-lisp/quill): Emacs keys,
+Ctrl-J for a newline, history with Ctrl-R, Ctrl-V to attach a clipboard image)
+switch on only on an interactive tty; piped/non-interactive input and output are plain.
 
 ```
 sbcl --non-interactive --load bin/operandi.lisp -- --openrouter deepseek/deepseek-v4-flash tui

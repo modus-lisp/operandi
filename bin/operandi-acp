@@ -18,7 +18,7 @@ if needs_build; then
   "$SBCL" --non-interactive \
     --eval '(require :asdf)' \
     --eval "(let ((q (merge-pathnames \"quicklisp/setup.lisp\" (user-homedir-pathname)))) (when (probe-file q) (load q)))" \
-    --eval '(funcall (read-from-string "ql:quickload") (list :operandi :linedit) :silent t)' \
+    --eval '(funcall (read-from-string "ql:quickload") :operandi :silent t)' \
     --eval "(save-lisp-and-die \"$CORE\")" >/dev/null
 fi
 exec "$SBCL" --core "$CORE" --noinform --no-userinit --no-sysinit --non-interactive \

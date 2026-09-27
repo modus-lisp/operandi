@@ -25,7 +25,8 @@
                "cl-base64"
                "cl-ppcre"
                "sqlite"
-               "bordeaux-threads")
+               "bordeaux-threads"
+               "quill")         ; pure-CL line editor for the REPL prompt -- replaced linedit
   :serial nil
   :components
   ((:module "src"

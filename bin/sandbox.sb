@@ -59,7 +59,7 @@
 (allow file-read* file-write* (subpath "/Users/vinnyfiano/.operandi"))
 (allow file-read* file-write* (subpath "/dev/null"))
 
-;; The terminal: stdin/stdout are inherited fds, but linedit's tcsetattr()
+;; The terminal: stdin/stdout are inherited fds, but the line editor's tcsetattr()
 ;; (raw mode) is an ioctl that's checked per call, and it also opens /dev/tty
 (allow file-read* file-write* file-ioctl
   (literal "/dev/tty")

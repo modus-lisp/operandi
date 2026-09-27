@@ -641,49 +641,45 @@
 
 ;;; ------------------------------- input ------------------------------
 
-(defvar *linedit* nil "The LINEDIT reader if the library loaded, else NIL.")
+(defvar *history* nil "The prompt's QUILL:HISTORY, loaded from ~/.operandi/history on first use.")
 
-(defun try-load-linedit ()
-  "Load linedit for line editing/history — but only on an interactive tty.
-   Under a pipe or --non-interactive we want the plain read-line path.
-   Skip the quickload when linedit is already in the image (bin/operandi
-   bakes it into the core): quickload would still make ASDF stat the
-   sources under ~/quicklisp, which the sandbox hides, and the resulting
-   compile error — swallowed here — left us with no line editing at all."
-  (when (and (not *linedit*) (stdin-tty-p))
-    (ignore-errors
-     (unless (find-package "LINEDIT")
-       (funcall (read-from-string "ql:quickload") "linedit" :silent t))
-     ;; multi-line editing (src/linedit-ext.lisp) — in the core already when
-     ;; launched via bin/operandi; loaded here otherwise
-     (unless (find-package "OPERANDI.LINEDIT-EXT")
-       (let ((ext (asdf:system-relative-pathname :operandi "src/linedit-ext.lisp")))
-         (when (probe-file ext) (load ext))))
-     (setf *linedit* (find-symbol "LINEDIT" "LINEDIT")))))
+(defun paste-image-key (session)
+  "Ctrl-V: save the clipboard image and insert its @path into the buffer, so
+   it rides along with the message like a dragged-in file would. With no
+   image on the clipboard, beep -- Cmd-V is the terminal's own text paste."
+  (let ((path (clipboard-image)))
+    (if path
+        (quill:insert (quill:session-buffer session) (format nil "@~A " path))
+        (progn (write-char (code-char 7)) (force-output)))))
+
+(defvar *keymap*
+  (let ((km (quill:make-keymap quill:*default-keymap*)))
+    (quill:bind km :c-v 'paste-image-key)
+    km))
 
 (defun %plain-read (prompt)
   (write-string prompt) (force-output)
   (read-line *standard-input* nil nil))
 
 (defun read-input (prompt)
-  "Read one line of input with editing/history if linedit is present, else a
-   plain prompt. Returns the line, or NIL on EOF (Ctrl-D) — which the REPL
-   treats as quit. Ctrl-D must take exactly ONE press: linedit signals EOF as
-   an END-OF-FILE condition (or returns NIL), and either way we propagate that
-   as NIL rather than silently retrying with read-line (which would swallow the
-   first Ctrl-D and demand a second). A genuine, non-EOF linedit failure falls
-   back to read-line once."
-  (if *linedit*
-      (handler-case
-          (funcall *linedit* :prompt prompt :history #P"~/.operandi/history")
-        (end-of-file () nil)          ; Ctrl-D -> quit, don't re-read
-        (error () (%plain-read prompt)))
-      (%plain-read prompt)))
+  "Read one line of input -- with editing, multi-line (Ctrl-J), history and
+   Ctrl-R on a terminal, a plain read-line otherwise (quill decides). Returns
+   the line, or NIL on EOF (Ctrl-D on an empty line, one press), which the REPL
+   treats as quit. Ctrl-C returns \"\": a fresh prompt. A genuine editor
+   failure falls back to read-line once."
+  (unless *history*
+    (setf *history* (quill:make-history
+                     :file (merge-pathnames ".operandi/history" (user-homedir-pathname)))))
+  (handler-case
+      (multiple-value-bind (line status)
+          (quill:read-line-edited :prompt prompt :history *history*
+                                  :keymap *keymap*)
+        (case status (:ok line) (:interrupt "") (t nil)))
+    (error () (%plain-read prompt))))
 
 (defun prompt-string (sess)
-  ;; PLAIN — no ANSI. This is the linedit/simple-REPL prompt, and linedit both
-  ;; mis-counts prompt width and leaks stray codes (e.g. a literal "2m") when the
-  ;; prompt contains SGR escapes. The concurrent UI uses input-prompt instead.
+  ;; PLAIN — no ANSI, so it reads the same in a pipe. (quill measures SGR in a
+  ;; prompt correctly; linedit didn't.) The concurrent UI uses input-prompt instead.
   (let ((cost (gethash :cost sess)))
     (format nil "~A~A › "
             (model-label)
@@ -1129,7 +1125,6 @@
   "The synchronous line-at-a-time REPL: read a task, run it to completion, read
    the next. Used for pipes / non-tty (and as the fallback if raw mode fails).
    No mid-turn typing — the turn blocks the loop."
-  (try-load-linedit)
   (when (and greet resume)
     (format t "~&~A~%"
             (paint (if resumed

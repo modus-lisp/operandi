@@ -34,6 +34,7 @@
     ((:file "text")                                           ; operandi.text
      (:file "http")                                           ; operandi.http
      (:file "llm"      :depends-on ("http"))                  ; operandi.llm
+     (:file "actor")                                          ; operandi.actor
      (:file "store")                                          ; operandi.store
      (:file "search"   :depends-on ("http" "llm"))            ; operandi.search
      (:file "safefetch" :depends-on ("http" "llm" "text"))    ; operandi.safefetch
@@ -45,7 +46,7 @@
      (:file "session"  :depends-on ("llm"))                   ; operandi.session
      (:file "sessiontree")                                    ; operandi.sessiontree
      (:file "tui"      :depends-on ("engine" "tools" "llm" "hooks" "session" "subagent"))  ; operandi.tui
-     (:file "acp"      :depends-on ("engine" "tools" "llm" "hooks" "session"))))))  ; operandi.acp
+     (:file "acp"      :depends-on ("actor" "store" "engine" "tools" "llm" "hooks" "session"))))))  ; operandi.acp
 
 ;;; Optional: a headless agent that chats over Nostr private DMs (NIP-17). Kept a
 ;;; SEPARATE system so the core stays dependency-light — this one pulls cl-nostr

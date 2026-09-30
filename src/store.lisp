@@ -27,7 +27,7 @@
            #:with-tx #:with-db-lock
            #:exec #:exec-non-query #:select-rows #:select-single
            #:current-schema-version
-           #:init-schema))
+           #:init-schema #:*exec-via*))
 
 (in-package #:operandi.store)
 
@@ -80,9 +80,17 @@
          (s:execute-non-query *db* "ROLLBACK")
          (error e)))))
 
+(defvar *exec-via* nil
+  "When non-NIL, a function (SQL PARAMS) that EXEC-NON-QUERY hands its write
+   to instead of touching *DB*.  An actor that does not own the connection
+   binds it to send the write to the one that does (see operandi.actor): on
+   modus an actor may not mutate another's objects, and a connection is one.")
+
 (defun exec-non-query (sql &rest params)
   "Execute SQL with PARAMS, return nothing meaningful."
-  (with-db-lock (apply #'s:execute-non-query *db* sql params)))
+  (if *exec-via*
+      (progn (funcall *exec-via* sql params) nil)
+      (with-db-lock (apply #'s:execute-non-query *db* sql params))))
 
 (defun exec (sql &rest params)
   "Alias for exec-non-query."

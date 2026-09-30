@@ -35,7 +35,7 @@
       acp::*pending* (make-hash-table)
       acp::*outq* nil                        ; no writer thread in the oracle
       acp::*rpc-seq* 0 acp::*msg-seq* 0 acp::*tool-seq* 0
-      acp::*tool-ids* (make-hash-table))
+      acp::*tool-id* nil)
 
 (defun drain ()
   "Parse + clear everything ENQUEUED for the wire since the last drain. (The

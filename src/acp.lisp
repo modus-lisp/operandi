@@ -177,13 +177,15 @@
 
 (defun %arg (args key) (and (hash-table-p args) (gethash key args)))
 (defun tool-title (name args)
-  (let ((a (or (%arg args "file_path") (%arg args "command") (%arg args "pattern")
+  (let ((a (or (%arg args "path") (%arg args "file_path") (%arg args "command") (%arg args "pattern")
                (%arg args "url") (%arg args "query") (%arg args "form"))))
     (if (stringp a)
         (format nil "~A: ~A" name (if (> (length a) 60) (concatenate 'string (subseq a 0 60) "…") a))
         name)))
 (defun tool-locations (name args)
-  (let ((p (%arg args "file_path")))
+  ;; operandi's own tools name it "path"; "file_path" is kept for tools that
+  ;; follow the other convention.
+  (let ((p (or (%arg args "path") (%arg args "file_path"))))
     (if (and p (stringp p)) (vector (obj "path" p)) :skip)))
 
 (defun clip (s n)
@@ -274,10 +276,17 @@
                      "options" (vector (obj "optionId" "allow" "name" "Allow" "kind" "allow_once")
                                        (obj "optionId" "always" "name" "Always allow" "kind" "allow_always")
                                        (obj "optionId" "reject" "name" "Reject" "kind" "reject_once")))))
-         (outcome (and (hash-table-p resp) (gethash "outcome" resp))))
+         ;; The spec nests the decision: {"outcome": {"outcome": "selected",
+         ;; "optionId": ...}}.  The flat {"outcome": "selected", "optionId": ...}
+         ;; is what this server (and its conformance client) spoke first; a
+         ;; spec client's reply read as flat was never "selected", so every
+         ;; permission it granted came back REFUSED.  Take either.
+         (o (and (hash-table-p resp) (gethash "outcome" resp)))
+         (sel (if (hash-table-p o) o resp))
+         (outcome (if (hash-table-p o) (gethash "outcome" o) o)))
     (cond
       ((equal outcome "selected")
-       (let ((opt (gethash "optionId" resp)))
+       (let ((opt (gethash "optionId" sel)))
          (cond ((equal opt "always") :allow-always)
                ((equal opt "reject") :reject)
                (t :allow-once))))

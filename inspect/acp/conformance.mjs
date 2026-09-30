@@ -60,7 +60,7 @@ rl.on("line", (line) => {
     // an inbound REQUEST from the agent (permission / fs / terminal)
     if (m.method === "session/request_permission") {
       check("RequestPermissionRequest", m.params, "agent→client request_permission");
-      send({ jsonrpc: "2.0", id: m.id, result: { outcome: "selected", optionId: m.params.options[0].optionId } });
+      send({ jsonrpc: "2.0", id: m.id, result: { outcome: { outcome: "selected", optionId: m.params.options[0].optionId } } });
     } else {
       send({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: "client does not support " + m.method } });
     }

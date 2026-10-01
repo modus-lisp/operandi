@@ -76,52 +76,68 @@
     (handler-case (apply fn args)
       (serious-condition (e)
         (setf reason (list :error (%describe-condition e)))))
-    (when link (send parent (list :exit (self) reason)))
+    (cond (link (send parent (list :exit (self) reason)))
+          ;; Nobody is linked: say so rather than vanish (an actor that dies
+          ;; silently looks like one that ignores its mail).
+          ((consp reason)
+           (ignore-errors
+            (format *error-output* "~&operandi.actor: ~(~A~) ended: ~A~%" fn (second reason))
+            (finish-output *error-output*))))
     reason))
 
 ;;; ------------------------------------------------------------------
 ;;; modus: the hosted actor runtime
 ;;; ------------------------------------------------------------------
 
+;;; Each definition is its own top-level form (not one PROGN): the JIT
+;;; translates a top-level form as a unit, and one untranslatable function
+;;; kept every function in the unit interpreted.
 #+modus
-(progn
-  (defvar *started* nil "Set by the main thread when it starts the runtime.")
+(defvar *started* nil "Set by the main thread when it starts the runtime.")
 
-  (defun %ensure-runtime ()
-    (unless *started*
-      (cl-user::actors-start *actor-threads* *actor-slots* *actor-region-bytes*)
-      (setf *started* t)))
+#+modus
+(defun %ensure-runtime ()
+  (unless *started*
+    (cl-user::actors-start *actor-threads* *actor-slots* *actor-region-bytes*)
+    (setf *started* t)))
 
-  (defun %actor-entry ()
-    "What every modus actor runs: its first message says what to do."
-    (let ((init (cl-user::actors-receive)))
-      (destructuring-bind (tag fn args parent link) init
-        (declare (ignore tag))
-        (%run fn args parent link))))
+#+modus
+(defun %actor-entry ()
+  "What every modus actor runs: its first message says what to do."
+  (let ((init (cl-user::actors-receive)))
+    (destructuring-bind (tag fn args parent link) init
+      (declare (ignore tag))
+      (%run fn args parent link))))
 
-  (defun self ()
-    ;; Before the runtime starts there is only the main thread, actor 1 (and
-    ;; ACTORS-SELF has nothing to read yet).
-    (if *started*
-        (let ((id (cl-user::actors-self))) (if (and (integerp id) (plusp id)) id 1))
-        1))
+#+modus
+(defun self ()
+  ;; Before the runtime starts there is only the main thread, actor 1 (and
+  ;; ACTORS-SELF has nothing to read yet).
+  (if *started*
+      (let ((id (cl-user::actors-self))) (if (and (integerp id) (plusp id)) id 1))
+      1))
 
-  (defun spawn (fn &rest args)
-    (let ((link nil))
-      (when (eq fn :link) (setf link (pop args) fn (pop args)))
-      (check-type fn symbol)
-      (%ensure-runtime)
-      (let ((id (cl-user::actors-spawn '%actor-entry)))
-        (cl-user::actors-send id (list :%init fn args (self) link))
-        id)))
+#+modus
+(defun spawn (fn &rest args)
+  (let ((link nil))
+    (when (eq fn :link) (setf link (pop args) fn (pop args)))
+    (check-type fn symbol)
+    (%ensure-runtime)
+    (let ((id (cl-user::actors-spawn '%actor-entry)))
+      (cl-user::actors-send id (list :%init fn args (self) link))
+      id)))
 
-  (defun send (id msg) (cl-user::actors-send id msg) msg)
+#+modus
+(defun send (id msg) (cl-user::actors-send id msg) msg)
 
-  (defun %ms (secs) (and secs (max 0 (round (* secs 1000)))))
+#+modus
+(defun %ms (secs) (and secs (max 0 (round (* secs 1000)))))
 
-  (defun receive (&optional secs) (cl-user::actors-receive (%ms secs)))
+#+modus
+(defun receive (&optional secs) (cl-user::actors-receive (%ms secs)))
 
-  (defun receive-if (pred &optional secs) (cl-user::actors-receive-if pred (%ms secs))))
+#+modus
+(defun receive-if (pred &optional secs) (cl-user::actors-receive-if pred (%ms secs)))
 
 ;;; ------------------------------------------------------------------
 ;;; threads: a mailbox per thread

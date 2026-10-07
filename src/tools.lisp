@@ -9,7 +9,7 @@
 ;;;    :schema { JSON schema describing arguments }
 ;;;    :impl   <function (args-hash) -> string-result>)
 ;;;
-;;; The :SCHEMA is a CL hash table that jzon serializes; it follows the
+;;; The :SCHEMA is a CL hash table that json-simple serializes; it follows the
 ;;; OpenAI tool-call JSON-schema shape llama.cpp expects:
 ;;;   {"type":"object", "properties":{...}, "required":[...]}
 ;;;
@@ -24,11 +24,11 @@
   #+sbcl (require :sb-posix)   ; modus provides SB-POSIX as a boot-time surface
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:com.inuoe.jzon :uiop :cl-ppcre :quri :bordeaux-threads) :silent t))
+  #+quicklisp (ql:quickload '(:json-simple :uiop :cl-ppcre :quri :bordeaux-threads) :silent t))
 
 (defpackage #:operandi.tools
   (:use #:cl)
-  (:local-nicknames (#:jzon  #:com.inuoe.jzon)
+  (:local-nicknames (#:json  #:json-simple)
                     (#:llm   #:operandi.llm)
                     (#:hooks #:operandi.hooks)
                     (#:sf    #:operandi.safefetch)

@@ -23,12 +23,12 @@
   (require :asdf)
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:com.inuoe.jzon :cl-ppcre :babel) :silent t))
+  #+quicklisp (ql:quickload '(:json-simple :cl-ppcre :babel) :silent t))
 
 (defpackage #:operandi.search
   (:use #:cl)
   (:local-nicknames (#:http  #:operandi.http)
-                    (#:jzon  #:com.inuoe.jzon)
+                    (#:json  #:json-simple)
                     (#:ppcre #:cl-ppcre)
                     (#:llm   #:operandi.llm))
   (:export #:*backend* #:*searxng-url* #:*token-file* #:*api-base*
@@ -132,7 +132,7 @@
       (format *error-output* "~&brave: no token at ~A~%" *token-file*)
       (return-from api-get nil))
     (handler-case
-        (jzon:parse
+        (json:parse
          (http:get (concatenate 'string *api-base* path)
                    :read-timeout 10
                    :headers `(("X-Subscription-Token" . ,token)
@@ -194,11 +194,11 @@
                        "messages" (vector (llm:ht "role" "user"
                                                   "content" (format nil "Web search: ~A~A" q hint)))))
          (res (handler-case
-                  (jzon:parse
+                  (json:parse
                    (http:post llm:*llm-url*
                               :headers `(("Authorization" . ,(format nil "Bearer ~A" llm:*llm-auth-token*))
                                          ("Content-Type" . "application/json"))
-                              :content (jzon:stringify body)
+                              :content (json:stringify body)
                               :read-timeout 30))
                 (error (e)
                   (format *error-output* "~&openrouter search err: ~A~%" e)
@@ -228,7 +228,7 @@
          (url (format nil "~A/search?q=~A&format=json&language=en~@[&time_range=~A~]"
                       *searxng-url* (url-encode q) range))
          (res (handler-case
-                  (jzon:parse (http:get url :read-timeout 15))
+                  (json:parse (http:get url :read-timeout 15))
                 (error (e)
                   (format *error-output* "~&searxng err: ~A~%" e)
                   nil)))

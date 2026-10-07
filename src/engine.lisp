@@ -22,12 +22,12 @@
   (require :asdf)
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:com.inuoe.jzon :babel) :silent t))
+  #+quicklisp (ql:quickload '(:json-simple :babel) :silent t))
 
 (defpackage #:operandi.engine
   (:use #:cl)
   (:local-nicknames (#:http  #:operandi.http)
-                    (#:jzon  #:com.inuoe.jzon)
+                    (#:json  #:json-simple)
                     (#:llm   #:operandi.llm)
                     (#:tools #:operandi.tools)
                     (#:hooks #:operandi.hooks)
@@ -587,7 +587,7 @@ completed). Do not shorten for brevity — nothing may be lost.")
           (map nil (lambda (tc)
                      (let* ((fn (and (hash-table-p tc) (gethash "function" tc)))
                             (raw (and (hash-table-p fn) (gethash "arguments" fn)))
-                            (args (and (stringp raw) (ignore-errors (jzon:parse raw)))))
+                            (args (and (stringp raw) (ignore-errors (json:parse raw)))))
                        (when (hash-table-p args)
                          (let ((p (or (gethash "path" args) (gethash "file_path" args))))
                            (when (and (stringp p) (plusp (length p)))
@@ -901,12 +901,12 @@ another tool or give a final answer.")
   "One blocking chat completion. Returns the parsed top-level hash table."
   (let ((resp (http:post llm:*llm-url*
                          :content (with-output-to-string (s)
-                                    (jzon:stringify (build-chat-body messages tools-vec
+                                    (json:stringify (build-chat-body messages tools-vec
                                                                      max-tokens temperature nil)
                                                     :stream s))
                          :headers (chat-headers)
                          :read-timeout llm:*llm-read-timeout*)))
-    (jzon:parse resp)))
+    (json:parse resp)))
 
 (defun parse-sse-line (line)
   "A single SSE line -> the parsed JSON hash for a 'data:' event, :done for
@@ -916,7 +916,7 @@ another tool or give a final answer.")
     (let ((payload (string-trim '(#\Return #\Space) (subseq line 5))))
       (cond ((zerop (length payload)) nil)
             ((string= payload "[DONE]") :done)
-            (t (handler-case (jzon:parse payload) (error () nil)))))))
+            (t (handler-case (json:parse payload) (error () nil)))))))
 
 ;; Streaming assembly, factored out of the socket read so it's unit-
 ;; testable: fold each parsed SSE event into a state, then finalize into
@@ -1002,7 +1002,7 @@ another tool or give a final answer.")
    Ctrl-C mid-generation."
   (let ((stream (http:post llm:*llm-url*
                            :content (with-output-to-string (s)
-                                      (jzon:stringify (build-chat-body messages tools-vec
+                                      (json:stringify (build-chat-body messages tools-vec
                                                                        max-tokens temperature t)
                                                       :stream s))
                            :headers (chat-headers)
@@ -1078,7 +1078,7 @@ another tool or give a final answer.")
                           (loop for line = (read-line raw nil nil) while line
                                 do (write-line line o)))))
                      (t nil)))
-         (parsed (and body (ignore-errors (jzon:parse body))))
+         (parsed (and body (ignore-errors (json:parse body))))
          (inner (and (hash-table-p parsed) (gethash "error" parsed)))
          (msg (cond ((and (hash-table-p inner) (stringp (gethash "message" inner)))
                      (gethash "message" inner))
@@ -1152,7 +1152,7 @@ another tool or give a final answer.")
 
 (defun msg-text (msg)
   "The assistant message's textual content as a NON-EMPTY string, or NIL.
-   The chat API returns JSON null for a toolless empty turn, which jzon
+   The chat API returns JSON null for a toolless empty turn, which json-simple
    parses to the symbol NULL (not a string, not NIL) — normalize that,
    plus blank/whitespace-only strings, to a single NIL 'no text'
    sentinel so callers never leak \"NULL\" or \"\" as a final answer."
@@ -1177,7 +1177,7 @@ another tool or give a final answer.")
    that never happened."
   (let* ((fn (gethash "function" tc))
          (raw (and fn (gethash "arguments" fn))))
-    (handler-case (values (and raw (jzon:parse raw)) nil)
+    (handler-case (values (and raw (json:parse raw)) nil)
       (error (e)
         (values (make-hash-table :test 'equal)
                 (format nil "~A chars, ~A" (length (or raw "")) e))))))
@@ -1382,11 +1382,11 @@ another tool or give a final answer.")
         (when (null msg)
           (when verbose
             (format t "~&[operandi] empty assistant message; raw parsed: ~A~%"
-                    (subseq (handler-case (jzon:stringify parsed)
+                    (subseq (handler-case (json:stringify parsed)
                               (error () (princ-to-string parsed)))
                             0 (min 800
                                    (length
-                                    (handler-case (jzon:stringify parsed)
+                                    (handler-case (json:stringify parsed)
                                       (error () (princ-to-string parsed))))))))
           (return (values (or (provider-error-text parsed) "[empty response from model]")
                           messages n

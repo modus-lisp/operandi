@@ -24,11 +24,11 @@
   (require :asdf)
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (funcall (read-from-string "ql:quickload") '(:com.inuoe.jzon :uiop) :silent t))
+  #+quicklisp (funcall (read-from-string "ql:quickload") '(:json-simple :uiop) :silent t))
 
 (defpackage #:operandi.sessiontree
   (:use #:cl)
-  (:local-nicknames (#:jzon #:com.inuoe.jzon))
+  (:local-nicknames (#:json #:json-simple))
   (:export #:*trees-dir* #:make-tree #:tree-id #:tree-path
            #:append-entry #:add-message #:set-model #:set-tools #:add-custom #:compact!
            #:entry #:leaf #:entries-count #:entries-in-order #:goto! #:branch-path
@@ -166,7 +166,7 @@
   (with-open-file (s (tree-path (tree-id tr)) :direction :output
                      :if-exists :append :if-does-not-exist :create
                      :external-format :utf-8)
-    (write-line (jzon:stringify obj) s)))
+    (write-line (json:stringify obj) s)))
 (defun %write-line (tr e) (%append-line tr e))
 (defun %write-leaf (tr id)
   (let ((h (make-hash-table :test 'equal)))
@@ -182,10 +182,10 @@
                      :if-exists :supersede :if-does-not-exist :create
                      :external-format :utf-8)
     (dolist (id (entries-in-order tr))
-      (write-line (jzon:stringify (entry tr id)) s))
+      (write-line (json:stringify (entry tr id)) s))
     (let ((h (make-hash-table :test 'equal)))
       (setf (gethash "type" h) "leaf" (gethash "target" h) (gethash :leaf tr))
-      (write-line (jzon:stringify h) s)))
+      (write-line (json:stringify h) s)))
   tr)
 
 (defun load-tree (id-or-path)
@@ -197,7 +197,7 @@
     (when (probe-file path)
       (with-open-file (s path :external-format :utf-8)
         (loop for line = (read-line s nil nil) while line
-              for rec = (ignore-errors (jzon:parse line))
+              for rec = (ignore-errors (json:parse line))
               when (hash-table-p rec) do
                 (cond
                   ((string= (gethash "type" rec "") "leaf")

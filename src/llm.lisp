@@ -12,18 +12,18 @@
 ;;;     too small the reasoning eats the whole budget and CONTENT is
 ;;;     empty. With THINK NIL we set chat_template_kwargs.enable_thinking
 ;;;     so the model skips reasoning entirely.
-;;;   - jzon serializes CL T -> JSON true and CL NIL -> JSON false
+;;;   - json-simple serializes CL T -> JSON true and CL NIL -> JSON false
 ;;;     (NOT null). Keep that in mind when building bodies.
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:com.inuoe.jzon) :silent t))
+  #+quicklisp (ql:quickload '(:json-simple) :silent t))
 
 (defpackage #:operandi.llm
   (:use #:cl)
-  (:local-nicknames (#:jzon #:com.inuoe.jzon) (#:http #:operandi.http))
+  (:local-nicknames (#:json #:json-simple) (#:http #:operandi.http))
   (:export #:*llm-url* #:*llm-default-max-tokens* #:*llm-read-timeout*
            #:*llm-auth-token* #:*llm-model* #:*llm-backend*
            #:*llm-effort* #:parse-effort #:apply-reasoning
@@ -159,7 +159,7 @@
    NIL on local llama.cpp.")
 
 (defun ht (&rest pairs)
-  "Build a string-keyed hash-table for jzon serialization."
+  "Build a string-keyed hash-table for json-simple serialization."
   (let ((h (make-hash-table :test 'equal)))
     (loop for (k v) on pairs by #'cddr
           do (setf (gethash k h) v))
@@ -231,7 +231,7 @@
 (defun extract-json (text)
   "Locate the first balanced JSON object in TEXT and parse it. Tolerates
    leading/trailing prose and ```json ... ``` markdown fences. Returns
-   the parsed jzon hash-table, or NIL if no valid object is found."
+   the parsed json-simple hash-table, or NIL if no valid object is found."
   (when (stringp text)
     (let ((start (position #\{ text)))
       (when start
@@ -246,7 +246,7 @@
                          ((char= c #\}) (decf depth)
                           (when (zerop depth)
                             (return (handler-case
-                                        (jzon:parse
+                                        (json:parse
                                          (subseq text start (1+ i)))
                                       (error () nil))))))))))))
 
@@ -312,7 +312,7 @@
     (loop for (k v) on extra by #'cddr
           do (setf (gethash (string-downcase (string k)) body-ht) v))
     (let* ((body (with-output-to-string (s)
-                   (jzon:stringify body-ht :stream s)))
+                   (json:stringify body-ht :stream s)))
            (headers (cond
                       (*llm-auth-token*
                        `(("Content-Type" . "application/json")
@@ -321,7 +321,7 @@
                                                           *llm-auth-token*))))
                       (t '(("Content-Type" . "application/json")))))
            (resp (%llm-post *llm-url* body headers))
-           (parsed (jzon:parse resp))
+           (parsed (json:parse resp))
            (choices (gethash "choices" parsed))
            (msg (and (vectorp choices) (plusp (length choices))
                      (gethash "message" (aref choices 0)))))
@@ -353,7 +353,7 @@
           (let* ((resp (http:get "https://openrouter.ai/api/v1/credits"
                                  :headers `(("Authorization" . ,(concatenate 'string "Bearer " token)))
                                  :read-timeout 15))
-                 (d (gethash "data" (jzon:parse resp)))
+                 (d (gethash "data" (json:parse resp)))
                  (total (gethash "total_credits" d))
                  (usage (gethash "total_usage" d)))
             (values (- total usage) total usage))

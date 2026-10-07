@@ -23,11 +23,11 @@
   (require :asdf)
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:com.inuoe.jzon) :silent t))
+  #+quicklisp (ql:quickload '(:json-simple) :silent t))
 
 (defpackage #:operandi.hooks
   (:use #:cl)
-  (:local-nicknames (#:jzon  #:com.inuoe.jzon)
+  (:local-nicknames (#:json  #:json-simple)
                     (#:store #:operandi.store))
   (:export #:*pre-tool-hooks*
            #:*post-tool-hooks*
@@ -70,7 +70,7 @@
   (let ((s (handler-case
                (etypecase val
                  (string val)
-                 (hash-table (jzon:stringify val))
+                 (hash-table (json:stringify val))
                  (null "")
                  (t (princ-to-string val)))
              (error () (princ-to-string val)))))

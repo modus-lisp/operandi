@@ -16,12 +16,12 @@
   (require :asdf)
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:com.inuoe.jzon :uiop) :silent t))
+  #+quicklisp (ql:quickload '(:json-simple :uiop) :silent t))
 
 (defpackage #:operandi.session
   (:use #:cl)
   (:local-nicknames (#:llm  #:operandi.llm)
-                    (#:jzon #:com.inuoe.jzon))
+                    (#:json #:json-simple))
   (:export #:*sessions-dir* #:make-session #:reset-session! #:session-id
            #:session-history #:session-turns #:session-usage #:session-add-usage
            #:persist-session #:render-session #:session->json #:session-json-path
@@ -116,7 +116,7 @@
   "Serialize the session — id, model, totals, and the RAW message history.
    IN-FLIGHT marks a mid-turn checkpoint: the history may end on an
    assistant tool_calls message whose results never came."
-  (jzon:stringify
+  (json:stringify
    (llm:ht "id"      (gethash :id s)
            "model"   (model-label)
            "backend" (string-downcase (symbol-name llm:*llm-backend*))
@@ -174,7 +174,7 @@
   (let ((files (ignore-errors (directory (merge-pathnames "*.json" *sessions-dir*)))))
     (loop for f in (sort (copy-list files) #'> :key #'file-write-date)
           collect (handler-case
-                      (let* ((d (jzon:parse (uiop:read-file-string f)))
+                      (let* ((d (json:parse (uiop:read-file-string f)))
                              (hist (coerce (or (gethash "history" d) #()) 'vector))
                              (first-user (loop for m across hist
                                                when (and (hash-table-p m)
@@ -194,7 +194,7 @@
     (when id
       (handler-case
           (let* ((path (session-json-path id))
-                 (d (and (probe-file path) (jzon:parse (uiop:read-file-string path)))))
+                 (d (and (probe-file path) (json:parse (uiop:read-file-string path)))))
             (when (hash-table-p d)
               (let ((u (gethash "usage" d)) (h (gethash "history" d)))
                 (flet ((u@ (k) (or (and (hash-table-p u) (gethash k u)) 0)))

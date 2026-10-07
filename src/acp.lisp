@@ -31,7 +31,7 @@
   (require :asdf)
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:com.inuoe.jzon :uiop) :silent t))
+  #+quicklisp (ql:quickload '(:json-simple :uiop) :silent t))
 
 (defpackage #:operandi.acp
   (:use #:cl)
@@ -42,13 +42,13 @@
                     (#:session #:operandi.session)
                     (#:store   #:operandi.store)
                     (#:actor   #:operandi.actor)
-                    (#:jzon    #:com.inuoe.jzon))
+                    (#:json    #:json-simple))
   (:export #:serve #:*protocol-version*))
 
 (in-package #:operandi.acp)
 
 (defparameter *protocol-version* 1)
-(defparameter +null+ (find-symbol "NULL" "COM.INUOE.JZON") "The jzon value that serializes to JSON null.")
+(defparameter +null+ 'cl:null "The json-simple value that serializes to JSON null.")
 
 ;;; ------------------------------ transport ---------------------------
 
@@ -67,7 +67,7 @@
   "Router: outbound request id -> the actor waiting for the client's reply.")
 
 (defun obj (&rest pairs)
-  "String-keyed hash-table for jzon, OMITTING any key whose value is :SKIP."
+  "String-keyed hash-table for json-simple, OMITTING any key whose value is :SKIP."
   (let ((h (make-hash-table :test 'equal)))
     (loop for (k v) on pairs by #'cddr
           unless (eq v :skip) do (setf (gethash k h) v))
@@ -89,7 +89,7 @@
       (router-handle msg)))
 
 (defun send-line (message)
-  (to-router (list :out (jzon:stringify message))))
+  (to-router (list :out (json:stringify message))))
 
 (defun send-notification (method params)
   (send-line (obj "jsonrpc" "2.0" "method" method "params" params)))
@@ -512,7 +512,7 @@
     (:out     (emit (second msg)))
     (:in      (let ((s (string-trim '(#\Space #\Tab #\Return #\Newline) (second msg))))
                 (when (plusp (length s))
-                  (let ((m (ignore-errors (jzon:parse s))))
+                  (let ((m (ignore-errors (json:parse s))))
                     (if (hash-table-p m)
                         (handler-case (handle-message m)
                           (error (e) (format *log* "acp: handler error: ~A~%" e)))

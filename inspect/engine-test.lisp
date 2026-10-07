@@ -2,7 +2,7 @@
 ;;;
 ;;; Oracle for the agent loop's handling of empty / null-content turns.
 ;;; The chat API sometimes ends a turn with content=null and no tool
-;;; call (a stall); jzon parses that null to the symbol NULL, which used
+;;; call (a stall); json-simple parses that null to the symbol NULL, which used
 ;;; to leak out as the literal answer "NULL". The loop should instead
 ;;; nudge the model back to work and, failing that, salvage the last real
 ;;; content — never return "NULL"/"".
@@ -41,7 +41,7 @@
 
 (defun assistant-resp (&key content tool-calls)
   "A parsed chat-completion response, shaped like the real API. CONTENT
-   NIL becomes JSON null (the symbol NULL, as jzon would produce)."
+   NIL becomes JSON null (the symbol NULL, as json-simple would produce)."
   (let ((m (llm:ht "role" "assistant" "content" (or content 'null))))
     (when tool-calls (setf (gethash "tool_calls" m) tool-calls))
     (llm:ht "choices" (vector (llm:ht "message" m)))))

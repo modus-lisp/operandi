@@ -23,12 +23,12 @@
   (require :asdf)
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:com.inuoe.jzon :cl-ppcre :quri :uiop) :silent t))
+  #+quicklisp (ql:quickload '(:json-simple :cl-ppcre :quri :uiop) :silent t))
 
 (defpackage #:operandi.safefetch
   (:use #:cl)
   (:local-nicknames (#:http  #:operandi.http)
-                    (#:jzon  #:com.inuoe.jzon)
+                    (#:json  #:json-simple)
                     (#:ppcre #:cl-ppcre)
                     (#:llm   #:operandi.llm)
                     (#:txt   #:operandi.text))
@@ -124,7 +124,7 @@ remove. No prose. If nothing qualifies, output []")
          (lb (position #\[ out)) (rb (position #\] out :from-end t)))
     (when (and lb rb (< lb rb))
       (handler-case
-          (let ((a (jzon:parse (subseq out lb (1+ rb)))))
+          (let ((a (json:parse (subseq out lb (1+ rb)))))
             (when (vectorp a) (remove-if-not #'stringp (coerce a 'list))))
         (error () nil)))))
 

@@ -30,7 +30,7 @@
                     (#:llm   #:operandi.llm)
                     (#:hooks #:operandi.hooks)
                     (#:tools #:operandi.tools)
-                    (#:jzon  #:com.inuoe.jzon)
+                    (#:json  #:json-simple)
                     (#:bt    #:bordeaux-threads)
                     (#:session #:operandi.session))
   (:export #:repl #:*color* #:clipboard-image))

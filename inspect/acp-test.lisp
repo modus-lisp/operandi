@@ -17,7 +17,7 @@
 (defpackage #:acp-test (:use #:cl)
   (:local-nicknames (#:acp #:operandi.acp) (#:llm #:operandi.llm)
                     (#:eng #:operandi.engine) (#:session #:operandi.session)
-                    (#:jzon #:com.inuoe.jzon)))
+                    (#:json #:json-simple)))
 (in-package #:acp-test)
 
 (defvar *fails* 0)
@@ -41,7 +41,7 @@
   "Parse + clear everything ENQUEUED for the wire since the last drain. (The
    oracle runs the handlers synchronously without the writer thread, so it reads
    the output queue directly.)"
-  (prog1 (mapcar (lambda (s) (jzon:parse s)) acp::*outq*)
+  (prog1 (mapcar (lambda (s) (json:parse s)) acp::*outq*)
     (setf acp::*outq* nil)))
 (defun m@ (m &rest path)
   (dolist (k path m)

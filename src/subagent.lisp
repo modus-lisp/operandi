@@ -28,7 +28,7 @@
                     (#:tools #:operandi.tools)
                     (#:hooks #:operandi.hooks)
                     (#:eng   #:operandi.engine)
-                    (#:jzon  #:com.inuoe.jzon)
+                    (#:json  #:json-simple)
                     (#:bt    #:bordeaux-threads))
   (:export #:*subagent-depth*
            #:*subagent-max-depth*
@@ -461,7 +461,7 @@ produced nothing."
                            (unless (string= k "n")      ; batch-local index
                              (setf (gethash k rec) v)))
                          r)
-                (write-line (jzon:stringify rec) out))))))
+                (write-line (json:stringify rec) out))))))
         t)
     (error () nil)))
 
@@ -473,7 +473,7 @@ produced nothing."
         (with-open-file (in *findings-file* :external-format :utf-8)
           (loop for line = (read-line in nil)
                 while line
-                for rec = (handler-case (jzon:parse line) (error () nil))
+                for rec = (handler-case (json:parse line) (error () nil))
                 when (hash-table-p rec) collect rec)))
     (error () nil)))
 
@@ -627,7 +627,7 @@ start may outlive you: kill every background process before you report."
            (debris (set-difference (%untracked-files) before :test #'string=)))
       (values
        (format nil "~A~%[investigate: ~D hypotheses on ~A, ~A; ~D verdict~:P recorded to the ledger as reported; scratch ~A]~@[~%DEADLINE: the swarm hit its ~Ds deadline; unfinished workers were stopped and their hypotheses are marked undetermined.~]~@[~%WARNING: workers left ~D new file~:P in the project tree: ~{~A~^, ~}~]"
-               (jzon:stringify (coerce records 'vector) :pretty t)
+               (json:stringify (coerce records 'vector) :pretty t)
                (length records)
                (or wm "the orchestrator's model")
                (llm:usage-summary batch)
@@ -683,7 +683,7 @@ start may outlive you: kill every background process before you report."
     (let ((start (position #\[ text))
           (end (position #\] text :from-end t)))
       (when (and start end (< start end))
-        (let ((parsed (ignore-errors (jzon:parse (subseq text start (1+ end))))))
+        (let ((parsed (ignore-errors (json:parse (subseq text start (1+ end))))))
           (when (vectorp parsed)
             (remove-if (lambda (h) (zerop (length (string-trim '(#\Space #\Tab #\Newline) h))))
                        (remove-if-not #'stringp (coerce parsed 'list)))))))))
@@ -753,7 +753,7 @@ settling it needs; do not re-investigate anything confirmed or refuted with
 high confidence — that work is done."
           question
           (and prior (plusp (length prior)) prior)
-          (jzon:stringify (coerce records 'vector) :pretty t)))
+          (json:stringify (coerce records 'vector) :pretty t)))
 
 (tools:define-tool "Investigate"
     (:description "Settle several INDEPENDENT hypotheses in parallel and get

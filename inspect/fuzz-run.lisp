@@ -23,7 +23,7 @@
   (:use #:cl)
   (:local-nicknames (#:tools #:operandi.tools)
                     (#:llm   #:operandi.llm)
-                    (#:jzon  #:com.inuoe.jzon)))
+                    (#:json  #:json-simple)))
 (in-package #:operandi.fuzz)
 
 (defparameter *per-input-timeout* 5)
@@ -106,7 +106,7 @@
                   until (eq line :eof)
                   when (plusp (length (string-trim '(#\Space #\Tab #\Return) line)))
                   do (handler-case
-                         (let* ((o (jzon:parse line))
+                         (let* ((o (json:parse line))
                                 (tool (and (hash-table-p o) (gethash "tool" o)))
                                 (args (and (hash-table-p o) (gethash "args" o))))
                            (when (and (stringp tool) (hash-table-p args))
@@ -162,7 +162,7 @@
         result)))
 
 (defun short (tool args)
-  (let ((s (handler-case (jzon:stringify args) (error () "?"))))
+  (let ((s (handler-case (json:stringify args) (error () "?"))))
     (format nil "~A ~A" tool (subseq s 0 (min 90 (length s))))))
 
 (defun run (&optional corpus-dir)

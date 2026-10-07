@@ -17,7 +17,7 @@
   :author "ynniv"
   :license "MIT"
   :version "0.1.0"
-  :depends-on ("com.inuoe.jzon"
+  :depends-on ("json-simple"
                "seal/http"      ; pure-CL HTTP/TLS (on natrium) -- replaced dexador, which was
                                 ; the only way FFI entered this stack (cl+ssl, iolib, static-vectors)
                "babel"

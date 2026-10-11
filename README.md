@@ -87,6 +87,51 @@ The core (`operandi.core`, gitignored) is built on first run and rebuilt
 automatically whenever a source file changes. Same arguments as the `.lisp`
 entry point above.
 
+## macOS sandbox
+
+The agent runs its tools (Bash, Eval, file writes) with whatever rights your
+user has, so on macOS you can run it inside `sandbox-exec` instead.
+`bin/operandi-sandbox-macos` is the launcher; `bin/sandbox.sb` is the profile.
+
+Put it on your PATH:
+
+```
+ln -s ~/workspace/modus-lisp/operandi/bin/operandi-sandbox-macos ~/.local/bin/operandi
+```
+
+Then run `operandi` as usual, from the project you want it to work on:
+
+```
+cd ~/projects/myapp && operandi tui
+```
+
+What the sandbox allows:
+
+- **Writes** only to the directory you launched from (the project), this
+  repo, `~/.operandi` (sessions, token, database), `~/quicklisp`, the fasl
+  cache `~/.cache/common-lisp`, `/tmp`, and the per-user temp/cache dirs.
+- **Reads** of the OS, `/usr`, `/opt`, your git config, and the rest of the
+  home directory's metadata. Other files in `~` are not readable.
+- **Network**: any public host, plus `localhost:8081` (llama.cpp) and
+  `localhost:8080` (SearXNG). Other localhost ports are blocked, and the
+  agent may bind a local dev server on localhost.
+- **No AppleScript** to other apps. The clipboard is readable for Ctrl-V.
+
+Things to know:
+
+- The launcher refuses to expose `$HOME` or `/`. If you launch from there, it
+  falls back to running inside the repo.
+- The profile is a template. The launcher fills in the home, repo, temp and
+  cache paths on every run, so nothing is hardcoded to one user.
+- The core is rebuilt **before** the sandbox starts, since the sandbox can't
+  see `~/quicklisp` or write the fasl cache.
+- A profile change takes effect only on the next launch. A session already
+  running keeps the profile it started with.
+- Nested `sandbox-exec` is denied, so you can't test the profile from inside
+  an already-sandboxed session. Test it from a normal shell.
+- Paths are matched after symlink resolution (`/etc` is `/private/etc`), so
+  rules written against the symlink names won't match.
+
 ## TUI
 
 `tui` (aliases: `shell`, `repl`) launches the interactive REPL — an enhanced,

@@ -115,11 +115,22 @@
    intact. A GLOBAL (not a dynamic binding) because the agent turn runs on a
    worker thread — a let-binding wouldn't reach it.")
 
+(defvar *nl-run* 0 "Trailing newlines in the output so far, capped at 2.")
+
 (defun emit (str)
-  "Send STR to the active output sink, updating *AT-BOL* from its last char."
+  "Send STR to the active output sink, updating *AT-BOL* and *NL-RUN* from it."
   (when (and str (plusp (length str)))
     (funcall *ui-out* str)
-    (setf *at-bol* (char= (char str (1- (length str))) #\Newline))))
+    (setf *at-bol* (char= (char str (1- (length str))) #\Newline))
+    (let ((last-text (position #\Newline str :test-not #'char= :from-end t)))
+      (setf *nl-run* (min 2 (if last-text
+                                (- (length str) 1 last-text)
+                                (+ *nl-run* (length str))))))))
+
+(defun ensure-blank-line ()
+  "Leave a blank line before the next block, unless one is already there."
+  (fresh)
+  (when (< *nl-run* 2) (emit (string #\Newline))))
 
 (defun fresh ()
   "Ensure the cursor is at column 0 (emit a newline only if it isn't)."
@@ -341,7 +352,7 @@
   ;; Text streamed before a tool call is narration, not the answer: start
   ;; *STREAMED* over so it only ever holds the text since the last tool call.
   (when *streamed* (get-output-stream-string *streamed*))
-  (fresh)
+  (ensure-blank-line)
   (emit (format nil "~A ~A~A~A~%"
                 (paint "⏺" :cyan)
                 (paint name :bold)
@@ -679,7 +690,7 @@
               (emit (md-render-text final))
               (emit (string #\Newline))))
           (fresh)
-          (emit (paint (format nil "  ~A iter · ~A~%" iters (llm:usage-summary usage))
+          (emit (paint (format nil "  ~A iter · ~A~%~%" iters (llm:usage-summary usage))
                        :gray))
           (force-output))
       (user-interrupt ()
@@ -1348,7 +1359,12 @@
            (cond
              ((eq cmd :quit) (return))
              (cmd)
-             (t (terpri) (run-turn sess line))))))))
+             (t
+              ;; Enter already ended the typed line (cursor at column 0), so
+              ;; record that and let ENSURE-BLANK-LINE add exactly one blank line.
+              (setf *at-bol* t *nl-run* 1)
+              (ensure-blank-line)
+              (run-turn sess line))))))))
   (when greet (farewell sess)))
 
 (defun repl (&key (greet t) resume once)

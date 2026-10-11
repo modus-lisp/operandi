@@ -27,9 +27,9 @@
   (let ((model (uiop:getenv "OPERANDI_ACP_MODEL"))
         (tok (merge-pathnames ".operandi/openrouter.token" (user-homedir-pathname))))
     (cond
-      (model (funcall (find-symbol "USE-OPENROUTER" "OPERANDI.LLM") :model model))
+      (model (funcall (find-symbol "SET-BACKEND-OPENROUTER!" "OPERANDI.LLM") :model model))
       ((probe-file tok)
-       (funcall (find-symbol "USE-OPENROUTER" "OPERANDI.LLM")
+       (funcall (find-symbol "SET-BACKEND-OPENROUTER!" "OPERANDI.LLM")
                 :model "deepseek/deepseek-v4-flash")))))
 
 ;; Serve until the client closes stdin. JSON-RPC goes to the captured stdout.

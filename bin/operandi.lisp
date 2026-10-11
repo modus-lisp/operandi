@@ -137,8 +137,8 @@
               (config-default-model))))
   (when m
     (if (string-equal m "llama")
-        (llm:use-llama)
-        (llm:use-openrouter :model m))
+        (llm:set-backend-llama!)
+        (llm:set-backend-openrouter! :model m))
     (eng:apply-backend-defaults)))
 
 (let* ((raw (remove "--" (uiop:command-line-arguments) :test #'string=))
@@ -154,11 +154,11 @@
                            ;; OpenRouter model IDs look like 'vendor/model' — a
                            ;; single slashed token. A spaced arg is the task.
                            (is-model (and next (find #\/ next) (not (find #\Space next)))))
-                      (cond (is-model (llm:use-openrouter :model next) (setf acc (rest tail)))
+                      (cond (is-model (llm:set-backend-openrouter! :model next) (setf acc (rest tail)))
                             ;; bare --openrouter: the configured OpenRouter model, else
                             ;; the library default.
                             (t (let ((cfg (config-default-model)))
-                                 (llm:use-openrouter
+                                 (llm:set-backend-openrouter!
                                   :model (if (and cfg (find #\/ cfg)) cfg
                                              "minimax/minimax-m2.7")))
                                (setf acc tail)))

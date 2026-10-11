@@ -187,7 +187,7 @@ with exactly 'NAME: COUNT'."
               :prompt (llm:usage-prompt-tokens usage) :secs secs)))))
 
 (defun run-evals (&key model (tasks *tasks*))
-  (when model (llm:use-openrouter :model model))
+  (when model (llm:set-backend-openrouter! :model model))
   (store:open-store)
   (let* ((root (uiop:getcwd))
          (base (merge-pathnames "operandi-evals/" (uiop:temporary-directory)))

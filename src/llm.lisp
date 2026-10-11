@@ -30,7 +30,7 @@
            #:llm-chat #:ht #:extract-json
            #:image-part #:text-part #:user-content #:content-text #:content-images
            #:image-file-p
-           #:use-openrouter #:use-llama
+           #:set-backend-openrouter! #:set-backend-llama!
            #:with-llama #:with-openrouter #:openrouter-credits
            #:*usage-sink* #:usage #:make-usage #:copy-usage
            #:usage-calls #:usage-prompt-tokens #:usage-completion-tokens
@@ -359,7 +359,7 @@
             (values (- total usage) total usage))
         (error () nil)))))
 
-(defun use-openrouter (&key (model "minimax/minimax-m2.7")
+(defun set-backend-openrouter! (&key (model "minimax/minimax-m2.7")
                             (token-file (merge-pathnames
                                          ".operandi/openrouter.token"
                                          (user-homedir-pathname))))
@@ -370,7 +370,7 @@
     (cond
       ((or (null token) (zerop (length token)))
        (format *error-output*
-               "~&use-openrouter: token file ~A missing or empty~%"
+               "~&set-backend-openrouter!: token file ~A missing or empty~%"
                token-file)
        nil)
       (t
@@ -379,17 +379,15 @@
              *llm-auth-token* token
              *llm-model*      model
              *llm-read-timeout* 240)
-       (format t "~&[llm] backend=openrouter model=~A~%" model)
        t))))
 
-(defun use-llama (&key (url "http://127.0.0.1:8081/v1/chat/completions"))
+(defun set-backend-llama! (&key (url "http://127.0.0.1:8081/v1/chat/completions"))
   "Switch the LLM client back to the local llama.cpp server."
   (setf *llm-backend*    :llama
         *llm-url*        url
         *llm-auth-token* nil
         *llm-model*      nil
         *llm-read-timeout* 120)
-  (format t "~&[llm] backend=llama url=~A~%" url)
   t)
 
 (defmacro with-llama (&body body)

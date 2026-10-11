@@ -259,7 +259,7 @@ plainly; never fabricate a value to fill a hole."
   (when *running* (return-from start :already-running))
   (unless nip05 (error "operandi.nostr: set *owner-nip05* (or pass :nip05) — the operator's NIP-05 address"))
   (ensure-agent-key)
-  (when model (llm:use-openrouter :model model))
+  (when model (llm:set-backend-openrouter! :model model))
   (setf *owner-pubkey* (nip05:resolve-pubkey nip05))
   (unless *owner-pubkey* (error "could not resolve NIP-05 ~A to a pubkey" nip05))
   (let* ((owner-relays (ignore-errors (nth-value 1 (nip05:resolve nip05))))

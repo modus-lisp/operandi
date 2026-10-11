@@ -94,7 +94,7 @@
 (handler-case
     (progn
       (when (probe-file (merge-pathnames ".operandi/openrouter.token" (user-homedir-pathname)))
-        (llm:use-openrouter :model "deepseek/deepseek-v4-flash"))
+        (llm:set-backend-openrouter! :model "deepseek/deepseek-v4-flash"))
       (let* ((sess (session::make-session))
              (out (capture (lambda ()
                              (tui::run-turn sess "Use the Bash tool to run exactly: echo operandi-lives . Then tell me the single word it printed.")))))

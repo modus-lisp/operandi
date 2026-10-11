@@ -2,7 +2,7 @@
 ;;;
 ;;; The agent loop. Sends a chat completion request to whatever
 ;;; backend operandi.llm is currently configured for — local llama.cpp
-;;; (port 8081) by default, or OpenRouter via use-openrouter — checks
+;;; (port 8081) by default, or OpenRouter via set-backend-openrouter! — checks
 ;;; if the response contains tool_calls, executes them, appends
 ;;; results to the conversation, and loops until the model returns a
 ;;; final text answer or we hit MAX-ITERATIONS.

@@ -43,7 +43,7 @@ By default the backend is a local llama.cpp on `http://127.0.0.1:8081`.
 Switch to OpenRouter (token at `~/.operandi/openrouter.token`):
 
 ```lisp
-(operandi.llm:use-openrouter :model "minimax/minimax-m2.7")
+(operandi.llm:set-backend-openrouter! :model "minimax/minimax-m2.7")
 (operandi.engine:run "...")
 ```
 

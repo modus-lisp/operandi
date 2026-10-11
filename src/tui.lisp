@@ -765,11 +765,11 @@
              (round eng:*context-token-budget* 1000)
              (paint (or operandi.subagent:*worker-model* "inherit (same as above)") :cyan)))
     ((find #\/ arg)                       ; vendor/model → OpenRouter
-     (llm:use-openrouter :model arg)
+     (llm:set-backend-openrouter! :model arg)
      (eng:apply-backend-defaults)
      (format t "~&→ OpenRouter ~A~%" (paint arg :cyan)))
     ((string-equal arg "llama")
-     (llm:use-llama)
+     (llm:set-backend-llama!)
      (eng:apply-backend-defaults)
      (format t "~&→ local llama.cpp~%"))
     (t (format t "~&unknown model spec ~S — give a 'vendor/name' id or 'llama'.~%" arg))))
@@ -1220,10 +1220,15 @@
       ((< (char-code c) 32) :ignore)
       (t c))))
 
+(defun banner-model ()
+  "Model and backend for the banner, e.g. \"· deepseek/... · openrouter\"."
+  (format nil "· ~A~@[ · ~A~]" (model-label)
+          (and (eq llm:*llm-backend* :openrouter) "openrouter")))
+
 (defun ui-banner (sess)
   (emit (format nil "~A ~A~%~A~%~A~%"
                 (paint "operandi" :bold :cyan)
-                (paint (format nil "· ~A" (model-label)) :gray)
+                (paint (banner-model) :gray)
                 (paint "Type while it works — your line queues as the next message. ^C aborts a turn, ^D quits."
                        :gray)
                 (paint (format nil "· session log: ~A~A.md" session:*sessions-dir* (gethash :id sess))
@@ -1291,7 +1296,7 @@
 (defun banner (sess)
   (format t "~&~A ~A~%~A~%~A~%~%"
           (paint "operandi" :bold :cyan)
-          (paint (format nil "· ~A" (model-label)) :gray)
+          (paint (banner-model) :gray)
           (paint "Type a task, or /help for commands. Ctrl-C aborts a turn, Ctrl-D quits."
                  :gray)
           (paint (format nil "· session log: ~A~A.md" session:*sessions-dir* (gethash :id sess))

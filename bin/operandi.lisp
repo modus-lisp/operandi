@@ -48,6 +48,7 @@
   (:use #:cl)
   (:local-nicknames (#:eng #:operandi.engine)
                     (#:llm #:operandi.llm)
+                    (#:json #:json-simple)
                     (#:tools #:operandi.tools)))
 (in-package #:operandi-cli)
 
@@ -114,8 +115,35 @@
   (and (stringp s) (= (length s) 15) (char= (char s 8) #\-)
        (every #'digit-char-p (remove #\- s))))
 
+(defun config-path ()
+  (merge-pathnames ".operandi/config.json" (user-homedir-pathname)))
+
+(defun config-default-model ()
+  "The `model` key of ~/.operandi/config.json, or NIL if absent/unreadable.
+   \"llama\" means the local llama.cpp backend."
+  (let ((p (config-path)))
+    (when (probe-file p)
+      (handler-case
+          (let ((m (gethash "model" (json:parse (uiop:read-file-string p)))))
+            (and (stringp m) (plusp (length m)) m))
+        (error (e)
+          (format *error-output* "operandi: ignoring ~A: ~A~%" p e)
+          nil)))))
+
+;; Apply the configured default model unless the command line names a backend
+;; explicitly (--openrouter, with or without a model; a bare --openrouter also
+;; reads the config, below). Doing both would announce the backend twice.
+(let ((m (and (not (member "--openrouter" (uiop:command-line-arguments) :test #'string=))
+              (config-default-model))))
+  (when m
+    (if (string-equal m "llama")
+        (llm:use-llama)
+        (llm:use-openrouter :model m))
+    (eng:apply-backend-defaults)))
+
 (let* ((raw (remove "--" (uiop:command-line-arguments) :test #'string=))
        (resume nil)
+       (tui-p nil)
        (tool-names (tools:default-tools))     ; available-tools allow-list (default = all)
        ;; Strip leading flags (--openrouter [model], --resume [id], --tools/--no-tools) in any order.
        (args (let ((acc raw))
@@ -127,7 +155,13 @@
                            ;; single slashed token. A spaced arg is the task.
                            (is-model (and next (find #\/ next) (not (find #\Space next)))))
                       (cond (is-model (llm:use-openrouter :model next) (setf acc (rest tail)))
-                            (t        (llm:use-openrouter)             (setf acc tail)))
+                            ;; bare --openrouter: the configured OpenRouter model, else
+                            ;; the library default.
+                            (t (let ((cfg (config-default-model)))
+                                 (llm:use-openrouter
+                                  :model (if (and cfg (find #\/ cfg)) cfg
+                                             "minimax/minimax-m2.7")))
+                               (setf acc tail)))
                       (eng:apply-backend-defaults)))
                    ((and acc (string= (first acc) "--worker-model"))
                     (multiple-value-bind (m ok)
@@ -152,21 +186,32 @@
                     (setf tool-names (%tools-allow (second acc)) acc (cddr acc)))
                    ((and acc (string= (first acc) "--no-tools"))
                     (setf tool-names (%tools-deny (second acc)) acc (cddr acc)))
+                   ((and acc (string= (first acc) "--tui"))
+                    (setf tui-p t acc (rest acc)))
+                   ;; Any other leading --flag is a typo or unknown option: fail loud
+                   ;; instead of sending it to the agent as task text.
+                   ((and acc (> (length (first acc)) 2) (string= "--" (first acc) :end2 2)
+                         (not (string= (first acc) "--help")))
+                    (format *error-output* "operandi: unknown option ~A (try --help)~%" (first acc))
+                    (sb-ext:exit :code 2))
                    (t (return))))
                acc))
-       (cmd (first args)))
+       ;; --tui and no argument at all are the same thing: the interactive TUI.
+       (cmd (if tui-p "tui" (first args))))
   ;; Preflight the model on any path that will actually run a turn (not bare help).
-  (when (or resume cmd) (preflight-or-die))
+  (unless (equal cmd "--help") (preflight-or-die))
   (cond
     ;; --resume alone or with an explicit tui command → resumed interactive TUI
     ((and resume (or (null cmd) (member cmd '("tui" "shell" "repl") :test #'string-equal)))
      (run-shell resume))
     ;; --resume + a task → continue that session with one more (non-interactive) turn
     (resume (run-resumed-task resume (format nil "~{~A~^ ~}" args)))
-    ((null cmd)
+    ;; Bare `operandi` (no task, no command) → the interactive TUI.
+    ((null cmd) (run-shell))
+    ((string= cmd "--help")
      (format t "~&usage:~%")
      (format t "  operandi.lisp -- \"task description\"~%")
-     (format t "  operandi.lisp -- tui              (interactive REPL: streaming, tools, /commands)~%")
+     (format t "  operandi.lisp              (no args, or --tui: interactive REPL: streaming, tools, /commands)~%")
      (format t "  operandi.lisp -- --resume [ID] tui  (resume a saved session; latest if no ID)~%")
      (format t "  operandi.lisp -- --openrouter [MODEL] \"task\"~%")
      (format t "  operandi.lisp -- --effort off|low|medium|high \"task\"   (reasoning; also OPERANDI_EFFORT)~%")

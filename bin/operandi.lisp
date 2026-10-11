@@ -218,6 +218,7 @@
      (format t "  operandi.lisp -- --openrouter STRONG --worker-model CHEAP tui   (orchestrator and subagents on different models)~%")
      (format t "  operandi.lisp -- --tools Read,Write,Edit,Bash,Grep \"task\"   (allow-list)~%")
      (format t "  operandi.lisp -- --no-tools Fan,Task,Spawn \"task\"           (defaults minus these)~%")
+     (format t "  bin/operandi-acp                 (ACP server over stdio for editors: Zed, Buzz; see README)~%")
      (format t "~%env: OPERANDI_MAX_TOKENS (per-turn output cap, default 16384),~%")
      (format t "     OPERANDI_CONTEXT_BUDGET (compaction threshold), OPERANDI_MAX_ITERS.~%")
      (format t "~%--openrouter reads token from ~~/.operandi/openrouter.token.~%")

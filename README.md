@@ -204,6 +204,25 @@ an OpenRouter token is present, else local llama.cpp. The mapping — operandi's
 streaming/hooks/plan/usage/session seams onto the ACP wire — lives in
 `src/acp.lisp`; `(operandi.acp:serve)` runs it over any stdin/stdout.
 
+Methods: `initialize`, `authenticate`, `session/new`, `session/load`,
+`session/prompt`, and the `session/cancel` notification. Unknown methods get
+JSON-RPC `-32601`; an unknown session id gets `-32602`. `session/new` accepts a
+non-standard `systemPrompt`, which hosts such as Buzz use to configure the agent.
+
+Tests (no model needed unless noted):
+
+```
+sbcl --core operandi.core --noinform --no-userinit --no-sysinit --non-interactive \
+  --load inspect/acp-test.lisp        # handler oracle: spec shapes, streamed updates, permission gate
+sbcl --core operandi.core --noinform --no-userinit --no-sysinit --non-interactive \
+  --load inspect/acp-wire-test.lisp   # wire level: JSON-RPC in/out over string streams, error codes
+cd inspect/acp && npm install && npm test   # schema conformance (needs a model backend)
+```
+
+`inspect/acp-test.lisp` and `inspect/acp-wire-test.lisp` run in `inspect/fitness.sh`.
+The schema-conformance suite and the goose interop script are not part of fitness.
+See `inspect/acp/README.md` for the three validation layers.
+
 ## MCP server
 
 `mcp/server.js` spawns the CLI per task and exposes `operandi_run` /

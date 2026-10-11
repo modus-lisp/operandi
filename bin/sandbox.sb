@@ -1,4 +1,11 @@
-;; agent.sb — absolute paths only; ~ does not expand inside profiles
+;; agent.sb — TEMPLATE. Not usable as-is: ~/.local/bin/operandi substitutes the
+;; tokens below with absolute paths (bare text, no quotes) before passing the
+;; result to sandbox-exec -p. Each token always appears INSIDE a quoted string.
+;;   __HOME__   $HOME                                  e.g. /Users/alice
+;;   __REPO__   the modus-lisp checkout                e.g. /Users/alice/workspace/modus-lisp
+;;   __TMP__    getconf DARWIN_USER_TEMP_DIR  (pwd -P) e.g. /private/var/folders/xx/.../T
+;;   __CACHE__  getconf DARWIN_USER_CACHE_DIR (pwd -P) e.g. /private/var/folders/xx/.../C
+;; Absolute paths only; ~ does not expand inside profiles.
 (version 1)
 (deny default)
 
@@ -8,8 +15,8 @@
 (allow signal (target self))               ; runtime raising signals to itself
 (allow sysctl-read)                        ; every runtime wants hw.ncpu etc.
 
-(allow file-read-data file-read-metadata (path "/" "/Users" "/Users/vinnyfiano"))
-(allow file-read-data file-read-metadata (subpath "/usr" "/opt" "/Users/vinnyfiano/.cache/common-lisp"))
+(allow file-read-data file-read-metadata (path "/" "/Users" "__HOME__"))
+(allow file-read-data file-read-metadata (subpath "/usr" "/opt" "__HOME__/.cache/common-lisp"))
 
 ;; realpath()/getcwd() stat every component on the way up, so each subpath
 ;; grant below needs metadata-only access on all of its ancestors — one missing
@@ -39,16 +46,15 @@
 ;; The per-user temp/cache dirs (confstr DARWIN_USER_TEMP_DIR — resolved via
 ;; the dirhelper service); without them git/xcrun/python warn on every call.
 (allow mach-lookup (global-name "com.apple.bsd.dirhelper"))
-(allow-ancestor-metadata "/private/var/folders/9m/1ylshs2s2y14754pxfxhxf4h0000gp/T")
-(allow-ancestor-metadata "/private/var/folders/9m/1ylshs2s2y14754pxfxhxf4h0000gp/C")
-(allow file-read* file-write* (subpath "/private/var/folders/9m/1ylshs2s2y14754pxfxhxf4h0000gp/T"
-                                       "/private/var/folders/9m/1ylshs2s2y14754pxfxhxf4h0000gp/C"))
-(allow file-read* (literal "/Users/vinnyfiano/.gitconfig" "/Users/vinnyfiano/.gitignore_global")
-                  (subpath "/Users/vinnyfiano/.config/git"))
+(allow-ancestor-metadata "__TMP__")
+(allow-ancestor-metadata "__CACHE__")
+(allow file-read* file-write* (subpath "__TMP__" "__CACHE__"))
+(allow file-read* (literal "__HOME__/.gitconfig" "__HOME__/.gitignore_global")
+                  (subpath "__HOME__/.config/git"))
 
 ;; The agent's own world — writable, since it self-modifies
-(allow-ancestor-metadata "/Users/vinnyfiano/workspace/modus-lisp")
-(allow file-read* file-write* (subpath "/Users/vinnyfiano/workspace/modus-lisp"))
+(allow-ancestor-metadata "__REPO__")
+(allow file-read* file-write* (subpath "__REPO__"))
 
 ;; The caller's project — the launcher passes it as -D CWD=<resolved cwd>.
 ;; Writable like modus-lisp, so the agent can work on whatever you ran it from.
@@ -56,7 +62,7 @@
 (allow file-read* file-write* (subpath (param "CWD")))
 
 ;; Narrow exceptions as needed, e.g.:
-(allow file-read* file-write* (subpath "/Users/vinnyfiano/.operandi"))
+(allow file-read* file-write* (subpath "__HOME__/.operandi"))
 (allow file-read* file-write* (subpath "/dev/null"))
 
 ;; The terminal: stdin/stdout are inherited fds, but the line editor's tcsetattr()
@@ -112,13 +118,12 @@
 
 ;; Quicklisp install + its dists/cache (read-only is enough once installed;
 ;; the first run needs writes to download and unpack)
-(allow file-read* (subpath "/Users/vinnyfiano/quicklisp"))
+(allow file-read* (subpath "__HOME__/quicklisp"))
 ;; ASDF writes compiled fasls here; reads are already allowed, writes are not
-(allow file-read* file-write* (subpath "/Users/vinnyfiano/.cache/common-lisp"))
+(allow file-read* file-write* (subpath "__HOME__/.cache/common-lisp"))
 ;; SBCL opens ~/.sbclrc at startup; deny gives EPERM and kills the image
-(allow file-read* (literal "/Users/vinnyfiano/.sbclrc"))
+(allow file-read* (literal "__HOME__/.sbclrc"))
 ;; probe-file walks every ancestor of the fasl cache; ~/.cache had no metadata grant
-(allow file-read-metadata (literal "/Users/vinnyfiano/.cache"))
+(allow file-read-metadata (literal "__HOME__/.cache"))
 ;; quickload downloads and unpacks new systems here
-(allow file-read* file-write* (subpath "/Users/vinnyfiano/quicklisp/tmp"))
-
+(allow file-read* file-write* (subpath "__HOME__/quicklisp/tmp"))

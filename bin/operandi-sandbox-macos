@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Run operandi inside its macOS sandbox, with the directory you launched it from
+# opened up (read/write) as the project. bin/sandbox.sb is a TEMPLATE: this
+# script renders it for the current user and machine on every run, so nothing
+# about the home dir or per-user temp/cache paths is hardcoded.
+#
+# Meant to be symlinked onto PATH:
+#   ln -s ~/workspace/modus-lisp/operandi/bin/operandi-sandbox-macos ~/.local/bin/operandi
+#
+# Usage: operandi [operandi args...]
+set -euo pipefail
+
+# Follow symlinks to find the real script, so ROOT is the repo even when this
+# is invoked through ~/.local/bin/operandi.
+SELF="$0"
+while [ -L "$SELF" ]; do
+  TARGET="$(readlink "$SELF")"
+  case "$TARGET" in
+    /*) SELF="$TARGET" ;;
+    *)  SELF="$(dirname "$SELF")/$TARGET" ;;
+  esac
+done
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd -P)"
+OPERANDI="$ROOT/bin/operandi"
+TEMPLATE="$ROOT/bin/sandbox.sb"
+
+# Resolve a path to its physical form: sandbox rules match resolved paths.
+resolve() { (cd "$1" && pwd -P); }
+
+HOME_DIR="$(resolve "$HOME")"
+REPO="$(resolve "$ROOT")"
+TMP_DIR="$(resolve "$(getconf DARWIN_USER_TEMP_DIR)")"
+CACHE_DIR="$(resolve "$(getconf DARWIN_USER_CACHE_DIR)")"
+
+# Substitution goes into a quoted SBPL string, so refuse paths that would
+# break out of it (a quote or backslash in a directory name).
+for p in "$HOME_DIR" "$REPO" "$TMP_DIR" "$CACHE_DIR"; do
+  case "$p" in
+    *\"*|*\\*) echo "operandi: refusing path with quote/backslash: $p" >&2; exit 1 ;;
+  esac
+done
+
+CWD="$(pwd -P)"
+
+# Refuse to open up $HOME (or anything above it) — that would defeat the
+# sandbox. Fall back to running inside operandi's own tree instead.
+if [ "$CWD" = / ] || [[ "$HOME_DIR/" == "$CWD"/* ]]; then
+  echo "operandi: not exposing $CWD to the sandbox; running from $REPO instead" >&2
+  CWD="$REPO"
+  cd "$CWD"
+fi
+
+# Render the profile. Plain bash string replacement, no sed escaping issues.
+PROFILE="$(<"$TEMPLATE")"
+PROFILE="${PROFILE//__HOME__/$HOME_DIR}"
+PROFILE="${PROFILE//__REPO__/$REPO}"
+PROFILE="${PROFILE//__TMP__/$TMP_DIR}"
+PROFILE="${PROFILE//__CACHE__/$CACHE_DIR}"
+
+# Rebuild the core if sources changed — outside the sandbox, which can't see
+# ~/quicklisp or write the fasl cache.
+OPERANDI_BUILD_ONLY=1 "$OPERANDI"
+
+exec /usr/bin/sandbox-exec -D CWD="$CWD" -p "$PROFILE" "$OPERANDI" "$@"

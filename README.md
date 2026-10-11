@@ -9,27 +9,92 @@ searches code and the web — and, the sharp edge, **evaluates arbitrary
 Common Lisp in the running SBCL image**, so it can call straight into
 whatever domain packages the host application has loaded.
 
-## Layout
+## Quick start
+
+`bin/operandi` is the entry point. It dumps a **core image** with operandi
+baked in and launches from it with the init files skipped, so a run costs
+~20 ms of launcher overhead instead of ~16 s of Quicklisp loading (the model
+preflight adds a network round-trip on top). The core (`operandi.core`,
+gitignored) is built on first run and rebuilt automatically whenever a source
+file changes.
 
 ```
-operandi.asd          ASDF system :operandi
-src/
-  llm.lisp            operandi.llm      — backend-agnostic chat client (llama / OpenRouter)
-  store.lisp          operandi.store    — SQLite audit log (agent_tool_calls)
-  search.lisp         operandi.search   — Brave Search (backs WebSearch)
-  hooks.lisp          operandi.hooks    — pre/post-tool hooks (default: log to SQLite)
-  tools.lisp          operandi.tools    — tool registry: Read/Write/Edit/Bash/Grep/Glob/
-                                          WebFetch/WebSearch/Remember/TodoWrite/Eval
-  engine.lisp         operandi.engine   — the agent loop (retries, auto-compaction, cost)
-  subagent.lisp       operandi.subagent — the Task tool (delegated sub-agents, depth-capped)
-  cron.lisp           operandi.cron     — in-image scheduled-task runner (empty by default)
-  session.lisp        operandi.session  — conversation session state + persistence (shared)
-  tui.lisp            operandi.tui      — interactive REPL: streaming, tool rendering, /commands
-  acp.lisp            operandi.acp      — Agent Client Protocol server (drives operandi from editors)
-bin/operandi.lisp     standalone CLI          (fast launcher: bin/operandi)
-bin/operandi-acp.lisp ACP server entry point  (fast launcher: bin/operandi-acp)
-mcp/                  Node MCP server exposing operandi as dispatchable tools + a swarm harness
+bin/operandi tui                                  # interactive REPL
+bin/operandi "summarize what's in this directory" # one-shot task
+bin/operandi --openrouter deepseek/deepseek-v4-flash "task"
+bin/operandi --openrouter deepseek/deepseek-v4-flash --effort low tui
 ```
+
+Bare `bin/operandi` (no arguments) also opens the TUI. The default backend is
+a local llama.cpp on `http://127.0.0.1:8081`; `--openrouter` switches to
+OpenRouter (token at `~/.operandi/openrouter.token`).
+
+### From source (no core)
+
+The same arguments work through the `.lisp` entry point, at the cost of a full
+Quicklisp load each run — useful when you want to run against a modified tree
+without waiting for a core rebuild, or when the core can't be written:
+
+```
+sbcl --non-interactive --load bin/operandi.lisp -- "your task here"
+sbcl --non-interactive --load bin/operandi.lisp -- tui
+```
+
+## CLI
+
+```
+operandi [FLAGS] [COMMAND | "task description"]
+```
+
+**Commands** (the first non-flag argument):
+
+| Command | Meaning |
+|---------|---------|
+| *(none)* | interactive TUI |
+| `tui` / `shell` / `repl` | interactive TUI |
+| `ask <question>` | the question phase, non-interactively: rival hypotheses → a swarm settles them → an answer from the verdicts |
+| *anything else* | a one-shot task; the remaining arguments are joined into the prompt |
+
+**Flags** (any order, before the command):
+
+| Flag | Meaning |
+|------|---------|
+| `--openrouter [MODEL]` | use OpenRouter; `MODEL` is a `vendor/name` slug. Bare `--openrouter` uses the configured model (see below) |
+| `--worker-model M` | model for sub-agents: a `vendor/name` slug, `llama`, or `inherit` |
+| `--effort off\|low\|medium\|high\|default` | reasoning effort (also `OPERANDI_EFFORT`) |
+| `--resume [ID]` | resume a saved session (latest if no ID); with a task, runs one more non-interactive turn |
+| `--tools A,B,C` | allow-list: exactly these tools |
+| `--no-tools X,Y` | the default tool set minus these |
+| `--tui` | force the interactive TUI |
+| `--help` | usage |
+
+An unknown `--flag` is rejected (exit 2) rather than sent to the agent as task
+text. Before any path that runs a turn, the model is preflighted — a bad slug
+or an unreachable local server fails loud here instead of blank-per-turn
+(`OPERANDI_NO_PREFLIGHT=1` skips the check).
+
+`--effort` sets the model's reasoning: on OpenRouter `off` sends
+`reasoning.enabled=false` and the levels send `reasoning.effort`; on llama.cpp
+anything but `off`/`default` turns Qwen-style thinking on. The
+context-compaction budget follows the backend (24k tokens on llama, 96k on
+OpenRouter) unless `OPERANDI_CONTEXT_BUDGET` is set.
+
+Environment variables are read when the image loads. On the fast path that
+means the core build, so `OPERANDI_EFFORT` / `OPERANDI_CONTEXT_BUDGET` set at
+run time are ignored unless the core was built with them — prefer the flags or
+the `/effort` command.
+
+### Configuration
+
+`~/.operandi/config.json` sets the default model:
+
+```json
+{ "model": "deepseek/deepseek-v4.1-flash" }
+```
+
+It is applied unless the command line names a backend. `"llama"` selects the
+local backend; a `vendor/name` slug selects OpenRouter. A bare `--openrouter`
+uses the configured model if it is a slug, else `minimax/minimax-m2.7`.
 
 ## Use as a library
 
@@ -39,7 +104,10 @@ mcp/                  Node MCP server exposing operandi as dispatchable tools + 
 (operandi.engine:run "Summarize what's in the current directory.")
 ```
 
-By default the backend is a local llama.cpp on `http://127.0.0.1:8081`.
+`operandi.engine:run` takes the prompt plus `&key system tool-names
+max-iterations verbose history` and returns `(values final-text
+full-message-history n-iterations)`.
+
 Switch to OpenRouter (token at `~/.operandi/openrouter.token`):
 
 ```lisp
@@ -52,40 +120,32 @@ agent domain reach, load your own systems before calling `run` — then it
 can `(my.domain:some-fn ...)` directly from a tool call. To flavor its
 instructions, rebind `operandi.engine:*base-system-prompt*`.
 
-## CLI
+## Layout
 
 ```
-sbcl --non-interactive --load bin/operandi.lisp -- "your task here"
-sbcl --non-interactive --load bin/operandi.lisp -- tui
-sbcl --non-interactive --load bin/operandi.lisp -- --openrouter minimax/minimax-m2.7 "task"
+operandi.asd          ASDF system :operandi (and :operandi/nostr)
+src/
+  llm.lisp            operandi.llm      — backend-agnostic chat client (llama / OpenRouter)
+  store.lisp          operandi.store    — SQLite audit log (agent_tool_calls)
+  search.lisp         operandi.search   — web search (OpenRouter plugin / SearXNG / Brave)
+  hooks.lisp          operandi.hooks    — pre/post-tool hooks (default: log to SQLite)
+  tools.lisp          operandi.tools    — tool registry + the tool-sandbox limits
+  engine.lisp         operandi.engine   — the agent loop (retries, auto-compaction, cost)
+  subagent.lisp       operandi.subagent — Task/Fan/Spawn/Investigate/SendMessage (depth-capped)
+  cron.lisp           operandi.cron     — in-image scheduled-task runner (empty by default)
+  session.lisp        operandi.session  — conversation session state + persistence (shared)
+  tui.lisp            operandi.tui      — interactive REPL: streaming, tool rendering, /commands
+  acp.lisp            operandi.acp      — Agent Client Protocol server (drives operandi from editors)
+  actor.lisp http.lisp safefetch.lisp sessiontree.lisp text.lisp   — supporting modules
+bin/operandi.lisp     standalone CLI          (fast launcher: bin/operandi)
+bin/operandi-acp.lisp ACP server entry point  (fast launcher: bin/operandi-acp)
+mcp/                  Node MCP server exposing operandi as dispatchable tools + a swarm harness
 ```
 
-### Fast start (`bin/operandi`)
-
-Loading from source every run is slow — not SBCL (≈50ms) but the per-run
-Quicklisp dependency load, plus, if your
-`~/.config/common-lisp` points an ASDF `:tree` at a big directory, a full
-filesystem scan on every launch. `bin/operandi` sidesteps both: it dumps a
-**core image** with operandi baked in and launches from it with the
-init files skipped — **≈60ms to a ready agent** instead of ~16s.
-
-```
-bin/operandi tui
-bin/operandi "your task here"
-bin/operandi --openrouter deepseek/deepseek-v4-flash "task"
-bin/operandi --openrouter deepseek/deepseek-v4-flash --effort low tui
-```
-
-`--effort off|low|medium|high|default` (or `OPERANDI_EFFORT`) sets the
-model's reasoning: on OpenRouter `off` sends `reasoning.enabled=false` and
-the levels send `reasoning.effort`; on llama.cpp anything but `off`/`default`
-turns Qwen-style thinking on. The context-compaction budget follows the
-backend (24k tokens on llama, 96k on OpenRouter) unless
-`OPERANDI_CONTEXT_BUDGET` is set.
-
-The core (`operandi.core`, gitignored) is built on first run and rebuilt
-automatically whenever a source file changes. Same arguments as the `.lisp`
-entry point above.
+The default tool set is `Eval Read Write Edit Bash Grep Glob WebFetch
+WebSearch Remember Findings Task Fan Spawn Investigate SendMessage TodoWrite`
+(`Verdict` is deliberately absent — it is the worker's reporting channel, added
+by `Investigate` to the workers it spawns).
 
 ## macOS sandbox
 
@@ -137,13 +197,6 @@ Things to know:
 `tui` (aliases: `shell`, `repl`) launches the interactive REPL — an enhanced,
 inline terminal UI:
 
-- **type while it works** — on an interactive tty the input line is pinned to
-  the bottom row (a scroll region keeps it separate from streaming output) and
-  the agent turn runs on a background thread, so you can compose the next message
-  mid-turn. What you type is echoed as `⧗ queued` and submitted as the next user
-  turn when the current one (with all its tool use) finishes. `^C` aborts the
-  running turn (and drops the queue); `^D` quits. Piped/non-tty input falls back
-  to a simple line-at-a-time loop.
 - **live token streaming** of the assistant's reply,
 - **coloured tool-call lines** — `⏺ Bash(echo hi)` … `✔ 27ms  hi` — rendered as
   each tool fires (via `operandi.hooks`, so nothing in the engine changed),
@@ -165,7 +218,7 @@ inline terminal UI:
   it uses a SearXNG at `SEARXNG_URL` (default `http://127.0.0.1:8080`) if one
   answers, else Brave. `OPERANDI_SEARCH=openrouter|searxng|brave` or `/search`
   forces one,
-- slash commands: `/help /clear /sessions [all] /resume [id] /cost /model [id] /effort [lvl] /paste /search [be] /system /tools /quit`,
+- slash commands: `/help /clear /sessions [all] /resume [id] /cost /model [id] /effort [lvl] /workers [m] /paste /search [be] /system /tools /ask <question> /quit` (`/exit` and `/q` also quit),
 - each session is saved to `~/.operandi/sessions/<id>.{md,json}` from the
   first real message on and checkpointed after every tool result during a
   turn, so a crash or kill mid-turn loses at most a couple of seconds;
@@ -179,9 +232,11 @@ Colour and line editing ([quill](https://github.com/modus-lisp/quill): Emacs key
 Ctrl-J for a newline, history with Ctrl-R, Ctrl-V to attach a clipboard image)
 switch on only on an interactive tty; piped/non-interactive input and output are plain.
 
-```
-sbcl --non-interactive --load bin/operandi.lisp -- --openrouter deepseek/deepseek-v4-flash tui
-```
+The default interactive UI is the robust line REPL (plain writes, no cursor
+positioning). A concurrent UI — input line pinned to the bottom row, the turn
+on a background thread, so you can **type while it works** — is opt-in via
+`OPERANDI_FANCY_TUI=1`; it corrupts output under some terminal/multiplexer
+combos (e.g. tmux scroll-region interactions), which is why it isn't the default.
 
 ## ACP server (drive operandi from an editor)
 
@@ -198,7 +253,7 @@ via `session/request_permission`. Sessions persist and resume (`session/load`).
 { "operandi": { "command": "/path/to/operandi/bin/operandi-acp" } }
 ```
 
-`bin/operandi-acp` launches from a dumped core (~60 ms). Backend: set
+`bin/operandi-acp` launches from a dumped core (~30 ms). Backend: set
 `OPERANDI_ACP_MODEL` (an OpenRouter model id), else it uses deepseek-v4-flash if
 an OpenRouter token is present, else local llama.cpp. The mapping — operandi's
 streaming/hooks/plan/usage/session seams onto the ACP wire — lives in
@@ -206,7 +261,8 @@ streaming/hooks/plan/usage/session seams onto the ACP wire — lives in
 
 Methods: `initialize`, `authenticate`, `session/new`, `session/load`,
 `session/prompt`, and the `session/cancel` notification. Unknown methods get
-JSON-RPC `-32601`; an unknown session id gets `-32602`. `session/new` accepts a
+JSON-RPC `-32601`; an unknown session id on `session/prompt` gets `-32602`
+(`session/load` reports it as `-32603`). `session/new` accepts a
 non-standard `systemPrompt`, which hosts such as Buzz use to configure the agent.
 
 Tests (no model needed unless noted):
@@ -226,8 +282,9 @@ See `inspect/acp/README.md` for the three validation layers.
 ## MCP server
 
 `mcp/server.js` spawns the CLI per task and exposes `operandi_run` /
-`operandi_fan` / `operandi_swarm` tools over stdio. Point it at a
-different loader with `OPERANDI_ROOT` (default: the repo root above `mcp/`).
+`operandi_fan` / `operandi_swarm` (plus `operandi_get_run`, `operandi_cancel_run`,
+`operandi_swarm_status`) over stdio. Point it at a different loader with
+`OPERANDI_ROOT` (default: the repo root above `mcp/`).
 
 ```
 cd mcp && npm install && node server.js
@@ -268,13 +325,14 @@ sbcl --non-interactive --load inspect/robustness-test.lisp
 
 | What | Where |
 |------|-------|
+| Default model | `~/.operandi/config.json` (`{"model": "..."}`) |
 | OpenRouter token | `~/.operandi/openrouter.token` |
 | Brave Search token | `BRAVE_API_KEY`, else `~/.operandi/brave-search.token` |
 | Agent audit log DB | `~/.operandi/operandi.db` |
 | Persistent agent notes | `~/.operandi/operandi-notes.md` |
 | TUI session transcripts | `~/.operandi/sessions/` |
 | Compaction offload | `~/.operandi/offload/` |
-| Cron reports / state | `~/.operandi/` |
+| Cron reports / state | `~/.operandi/reports/`, `~/.operandi/cron.log` |
 
 Tool-sandbox limits (rebindable specials in `operandi.tools`):
 `*bash-timeout*` (120s — a Bash command is killed past this),

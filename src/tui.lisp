@@ -338,6 +338,9 @@
 
 (defun tui-pre-hook (name args)
   (md-flush)
+  ;; Text streamed before a tool call is narration, not the answer: start
+  ;; *STREAMED* over so it only ever holds the text since the last tool call.
+  (when *streamed* (get-output-stream-string *streamed*))
   (fresh)
   (emit (format nil "~A ~A~A~A~%"
                 (paint "⏺" :cyan)

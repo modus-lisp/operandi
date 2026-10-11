@@ -6,6 +6,9 @@
 ;;   __TMP__    getconf DARWIN_USER_TEMP_DIR  (pwd -P) e.g. /private/var/folders/xx/.../T
 ;;   __CACHE__  getconf DARWIN_USER_CACHE_DIR (pwd -P) e.g. /private/var/folders/xx/.../C
 ;; Absolute paths only; ~ does not expand inside profiles.
+;;   The Quicklisp local-projects token is the exception: a whole block of rules
+;;   (not a path), rendered from the symlinks in ~/quicklisp/local-projects.
+;;   Never write that token inside a comment: it gets substituted too.
 (version 1)
 (deny default)
 
@@ -128,3 +131,7 @@
 (allow file-read-metadata (literal "__HOME__/.cache"))
 ;; quickload downloads and unpacks new systems here
 (allow file-read* file-write* (subpath "__HOME__/quicklisp/tmp"))
+
+;; Quicklisp local-projects targets (sibling checkouts, read-only). Rendered by
+;; bin/operandi-sandbox-macos from the symlinks in ~/quicklisp/local-projects.
+__LOCAL_PROJECTS__

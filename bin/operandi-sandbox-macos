@@ -50,12 +50,43 @@ if [ "$CWD" = / ] || [[ "$HOME_DIR/" == "$CWD"/* ]]; then
   cd "$CWD"
 fi
 
+# Quicklisp local-projects: each entry is a symlink to a project wherever it
+# lives on this machine. Those dirs can be anywhere (outside the repo), so the
+# grant is computed from the links on every launch, not hardcoded. Each link's
+# containing directory gets READ access. Read-only: loading needs the sources,
+# not write access to them.
+LOCAL_RULES=""
+LOCAL_SEEN=""
+for link in "$HOME_DIR"/quicklisp/local-projects/*; do
+  [ -L "$link" ] || continue
+  target="$(readlink "$link")"
+  case "$target" in
+    /*) ;;
+    *) echo "operandi: skipping relative local-projects link: $link" >&2; continue ;;
+  esac
+  dir="$(resolve "$(dirname "$target")" 2>/dev/null)" || continue
+  case "$dir" in
+    *\"*|*\\*) echo "operandi: refusing local-projects path with quote/backslash: $dir" >&2; continue ;;
+  esac
+  # de-duplicate (bash 3.2 has no associative arrays)
+  if printf '%s\n' "$LOCAL_SEEN" | grep -qxF "$dir"; then continue; fi
+  LOCAL_SEEN="$LOCAL_SEEN$dir"$'\n'
+  LOCAL_RULES="$LOCAL_RULES  (allow-ancestor-metadata \"$dir\")"$'\n'
+  LOCAL_RULES="$LOCAL_RULES  (allow file-read* (subpath \"$dir\"))"$'\n'
+done
+
 # Render the profile. Plain bash string replacement, no sed escaping issues.
 PROFILE="$(<"$TEMPLATE")"
 PROFILE="${PROFILE//__HOME__/$HOME_DIR}"
 PROFILE="${PROFILE//__REPO__/$REPO}"
 PROFILE="${PROFILE//__TMP__/$TMP_DIR}"
 PROFILE="${PROFILE//__CACHE__/$CACHE_DIR}"
+PROFILE="${PROFILE//__LOCAL_PROJECTS__/$LOCAL_RULES}"
+
+if [ -n "${OPERANDI_SANDBOX_DRYRUN:-}" ]; then
+  printf '%s' "$LOCAL_RULES"
+  exit 0
+fi
 
 # Rebuild the core if sources changed — outside the sandbox, which can't see
 # ~/quicklisp or write the fasl cache.

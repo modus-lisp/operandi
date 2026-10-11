@@ -109,3 +109,16 @@
 ;; Loopback only — this does not expose anything off-machine.
 (allow network-bind   (local ip "localhost:*"))
 (allow network-inbound (local ip "localhost:*"))
+
+;; Quicklisp install + its dists/cache (read-only is enough once installed;
+;; the first run needs writes to download and unpack)
+(allow file-read* (subpath "/Users/vinnyfiano/quicklisp"))
+;; ASDF writes compiled fasls here; reads are already allowed, writes are not
+(allow file-read* file-write* (subpath "/Users/vinnyfiano/.cache/common-lisp"))
+;; SBCL opens ~/.sbclrc at startup; deny gives EPERM and kills the image
+(allow file-read* (literal "/Users/vinnyfiano/.sbclrc"))
+;; probe-file walks every ancestor of the fasl cache; ~/.cache had no metadata grant
+(allow file-read-metadata (literal "/Users/vinnyfiano/.cache"))
+;; quickload downloads and unpacks new systems here
+(allow file-read* file-write* (subpath "/Users/vinnyfiano/quicklisp/tmp"))
+

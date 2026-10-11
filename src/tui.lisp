@@ -125,6 +125,175 @@
   "Ensure the cursor is at column 0 (emit a newline only if it isn't)."
   (unless *at-bol* (emit (string #\Newline))))
 
+;;; ------------------------------ markdown ----------------------------
+;;; The model answers in markdown; the terminal shows it as styled text.
+;;; Rendering is line-at-a-time: tokens accumulate in *MD-LINE* until a
+;;; newline, then the finished line is styled and emitted.  Block rules
+;;; (headings, lists, quotes, rules, tables, fenced code) look at the whole
+;;; line; inline rules (code, bold, italic, links) run per line.  Styling goes
+;;; through PAINT, so with colour off the text still reads as clean plain
+;;; text (markers dropped, bullets as •).  No dependency: a hand-rolled
+;;; scanner covering the subset models actually emit.
+
+(defvar *md-line* nil
+  "Adjustable string: the streamed reply's current line, up to the next newline.")
+(defvar *md-fence* nil
+  "T while inside a ``` fenced code block (lines there are not inline-styled).")
+
+(defun md-new-buf ()
+  (make-array 80 :element-type 'character :adjustable t :fill-pointer 0))
+
+(defun md-prefix-p (prefix s)
+  (and (>= (length s) (length prefix)) (string= prefix s :end2 (length prefix))))
+
+(defun md-indent (line)
+  (subseq line 0 (- (length line) (length (string-left-trim " \t" line)))))
+
+(defun md-hr-p (trim)
+  (let ((core (remove #\Space trim)))
+    (and (>= (length core) 3)
+         (member (char core 0) '(#\- #\* #\_))
+         (every (lambda (c) (char= c (char core 0))) core))))
+
+(defun md-table-sep-p (trim)
+  (and (find #\- trim)
+       (every (lambda (c) (find c "|-: ")) trim)))
+
+(defparameter +md-colours+
+  '(("red" . :red) ("green" . :green) ("yellow" . :yellow) ("blue" . :blue)
+    ("magenta" . :magenta) ("purple" . :magenta) ("cyan" . :cyan) ("white" . :white)
+    ("gray" . :gray) ("grey" . :gray)))
+
+(defun md-colour-span (s i)
+  "If S has a colour span :NAME[text] whose colon is at I, return
+   (values SGR-keyword open-bracket-index close-bracket-index); else NIL."
+  (let* ((end (position-if-not #'alpha-char-p s :start (1+ i)))
+         (kw (and end (< (1+ i) end) (char= (char s end) #\[)
+                  (cdr (assoc (string-downcase (subseq s (1+ i) end)) +md-colours+
+                              :test #'string=))))
+         (close (and kw (position #\] s :start end))))
+    (when (and kw close (or (= i 0) (not (alphanumericp (char s (1- i))))))
+      (values kw end close))))
+
+(defun md-inline (s)
+  "Style the inline markdown in S: `code`, **bold**, *italic*/_italic_, [text](url)."
+  (let ((n (length s)))
+    (with-output-to-string (o)
+      (let ((i 0))
+        (loop while (< i n) do
+          (let ((c (char s i)))
+            (cond
+              ;; `code`
+              ((char= c #\`)
+               (let ((j (position #\` s :start (1+ i))))
+                 (cond (j (write-string (paint (subseq s (1+ i) j) :cyan) o)
+                          (setf i (1+ j)))
+                       (t (write-char c o) (incf i)))))
+              ;; **bold**
+              ((and (char= c #\*) (< (1+ i) n) (char= (char s (1+ i)) #\*))
+               (let ((j (search "**" s :start2 (+ i 2))))
+                 (cond ((and j (> j (+ i 2)))
+                        (write-string (paint (subseq s (+ i 2) j) :bold) o)
+                        (setf i (+ j 2)))
+                       (t (write-string "**" o) (incf i 2)))))
+              ;; *italic* / _italic_ (underscore only at a word start, so snake_case stays)
+              ((or (char= c #\*)
+                   (and (char= c #\_) (or (= i 0) (not (alphanumericp (char s (1- i)))))))
+               (let ((j (and (< (1+ i) n) (position c s :start (+ i 2)))))
+                 (cond ((and j (not (char= (char s (1+ i)) #\Space))
+                             (not (char= (char s (1- j)) #\Space)))
+                        (write-string (paint (subseq s (1+ i) j) :italic) o)
+                        (setf i (1+ j)))
+                       (t (write-char c o) (incf i)))))
+              ;; :red[text] -- colour span (Streamlit-style), so a reply can ask for colour
+              ((and (char= c #\:) (md-colour-span s i))
+               (multiple-value-bind (kw open close) (md-colour-span s i)
+                 (write-string (paint (subseq s (1+ open) close) kw) o)
+                 (setf i (1+ close))))
+              ;; [text](url)
+              ((char= c #\[)
+               (let* ((close (position #\] s :start (1+ i)))
+                      (paren (and close (< (1+ close) n) (char= (char s (1+ close)) #\()
+                                  (1+ close)))
+                      (end (and paren (position #\) s :start paren))))
+                 (cond (end (write-string (paint (subseq s (1+ i) close) :underline) o)
+                            (write-string (paint (format nil " (~A)" (subseq s (1+ paren) end))
+                                                 :gray)
+                                          o)
+                            (setf i (1+ end)))
+                       (t (write-char c o) (incf i)))))
+              (t (write-char c o) (incf i)))))))))
+
+(defun md-line (line)
+  "Style one complete markdown LINE; updates *MD-FENCE*.  Returns the styled text."
+  (let* ((line (coerce line '(simple-array character (*))))   ; box chars need CHARACTER, not BASE-CHAR
+         (indent (md-indent line))
+         (trim (subseq line (length indent)))
+         (n (length trim)))
+    (cond
+      ((md-prefix-p "```" trim)
+       (setf *md-fence* (not *md-fence*))
+       (paint "────" :gray))
+      (*md-fence* (paint line :cyan))
+      ((zerop n) "")
+      ((md-hr-p trim) (paint (make-string 24 :initial-element #\─) :gray))
+      ;; # heading
+      ((let ((hashes (position-if-not (lambda (c) (char= c #\#)) trim)))
+         (and hashes (<= 1 hashes 6) (char= (char trim hashes) #\Space)))
+       (let ((k (position #\Space trim)))
+         (paint (md-inline (subseq trim (1+ k))) :bold)))
+      ;; > quote
+      ((md-prefix-p ">" trim)
+       (concatenate 'string (paint "│ " :gray)
+                    (paint (md-inline (string-left-trim " " (subseq trim 1))) :italic)))
+      ;; - / * / + bullet
+      ((and (>= n 2) (find (char trim 0) "-*+") (char= (char trim 1) #\Space))
+       (concatenate 'string indent (paint "•" :cyan) " " (md-inline (subseq trim 2))))
+      ;; 1. / 1) numbered item
+      ((let ((p (position-if-not #'digit-char-p trim)))
+         (and p (> p 0) (< (1+ p) n) (find (char trim p) ".)")
+              (char= (char trim (1+ p)) #\Space)))
+       (let ((p (position-if-not #'digit-char-p trim)))
+         (concatenate 'string indent (paint (subseq trim 0 (1+ p)) :cyan) " "
+                      (md-inline (subseq trim (+ p 2))))))
+      ;; | table | row |
+      ((char= (char trim 0) #\|)
+       (if (md-table-sep-p trim)
+           (paint (substitute #\│ #\| (substitute #\─ #\- trim)) :gray)
+           (md-inline (substitute #\│ #\| trim))))
+      (t (concatenate 'string indent (md-inline trim))))))
+
+(defun md-feed (tok)
+  "Stream TOK through the renderer, emitting each line as its newline arrives."
+  (unless *md-line* (setf *md-line* (md-new-buf)))
+  (loop with start = 0
+        for nl = (position #\Newline tok :start start)
+        do (loop for i from start below (or nl (length tok))
+                 do (vector-push-extend (char tok i) *md-line*))
+           (cond (nl (emit (concatenate 'string (md-line (subseq *md-line* 0))
+                                        (string #\Newline)))
+                     (setf (fill-pointer *md-line*) 0)
+                     (setf start (1+ nl)))
+                 (t (return)))))
+
+(defun md-flush ()
+  "Emit the partial last line of a segment (no newline yet) and reset the
+   per-segment state.  Called before a tool line and at the end of a turn."
+  (when (and *md-line* (plusp (fill-pointer *md-line*)))
+    (emit (md-line (subseq *md-line* 0))))
+  (when *md-line* (setf (fill-pointer *md-line*) 0))
+  (setf *md-fence* nil))
+
+(defun md-render-text (text)
+  "Style a complete markdown TEXT in one go (for a final answer printed whole)."
+  (let ((*md-fence* nil))
+    (with-output-to-string (o)
+      (loop with start = 0
+            for nl = (position #\Newline text :start start)
+            do (write-string (md-line (subseq text start (or nl (length text)))) o)
+               (cond (nl (write-char #\Newline o) (setf start (1+ nl)))
+                     (t (return)))))))
+
 ;;; ------------------------------ tool lines --------------------------
 
 (defparameter +arg-key+
@@ -168,6 +337,7 @@
                (eql 0 (search "REFUSED" result))))))
 
 (defun tui-pre-hook (name args)
+  (md-flush)
   (fresh)
   (emit (format nil "~A ~A~A~A~%"
                 (paint "⏺" :cyan)
@@ -199,7 +369,7 @@
       (emit (paint "⏺ " :br-cyan))
       (setf *need-bullet* nil))
     (write-string tok *streamed*)
-    (emit tok)))
+    (md-feed tok)))
 
 ;;; ------------------------------ session -----------------------------
 ;;; Session state + persistence live in operandi.session (shared with the ACP
@@ -438,6 +608,8 @@
          (messages (if hist (append hist (list (user-msg prompt))) nil))
          (*at-bol* t)
          (*need-bullet* t)
+         (*md-line* (md-new-buf))
+         (*md-fence* nil)
          (*streamed* (make-string-output-stream))
          ;; add our renderers alongside whatever hooks are already installed
          ;; (e.g. the SQLite logger); scoped to this turn.
@@ -473,13 +645,15 @@
           (session:persist-session sess)          ; crash-safe: write after every turn
           ;; If nothing streamed (non-streaming turn, or a salvaged/synthetic
           ;; answer), or the final text diverged from the stream, print it.
+          (md-flush)
           (let ((streamed (string-right-trim '(#\Space #\Newline)
                                              (get-output-stream-string *streamed*)))
                 (final (string-right-trim '(#\Space #\Newline) (or text ""))))
             (when (and (plusp (length final)) (string/= final streamed))
               (fresh)
               (emit (paint "⏺ " :br-cyan))
-              (emit final)))
+              (emit (md-render-text final))
+              (emit (string #\Newline))))
           (fresh)
           (emit (paint (format nil "  ~A iter · ~A~%" iters (llm:usage-summary usage))
                        :gray))
@@ -492,6 +666,7 @@
             (setf (session:session-history sess) kept)
             (incf (gethash :turns sess))
             (session:persist-session sess)))
+        (md-flush)
         (fresh)
         (emit (paint "  ⎋ interrupted — partial turn kept in context." :yellow))
         (emit (string #\Newline))

@@ -358,7 +358,7 @@
          (mark (if err (paint "✗" :br-red) (paint "✔" :br-green)))
          (dur  (paint (format nil "~Ams" ms) :gray))
          (prev (oneline result 72)))
-    (emit (format nil "  ~A ~A  ~A~%"
+    (emit (format nil "  ~A ~A  ~A~%~%"
                   mark dur
                   (if err (paint prev :red) (paint prev :gray))))))
 
@@ -1124,7 +1124,7 @@
        (let ((busy *turn-active*))
          (unless busy (bt:with-lock-held (*ui-lock*) (resume-agent)))
          (ui-freshline)
-         (emit (format nil "~A ~A~%"
+         (emit (format nil "~%~A ~A~%~%"
                        (paint (if busy "⧗ queued ›" "you ›") (if busy :gray :green))
                        line))
          (setf *history* (append *history* (list line)))
@@ -1348,7 +1348,7 @@
            (cond
              ((eq cmd :quit) (return))
              (cmd)
-             (t (run-turn sess line))))))))
+             (t (terpri) (run-turn sess line))))))))
   (when greet (farewell sess)))
 
 (defun repl (&key (greet t) resume once)

@@ -22,6 +22,9 @@ while [ -L "$SELF" ]; do
 done
 ROOT="$(cd "$(dirname "$SELF")/.." && pwd -P)"
 OPERANDI="$ROOT/bin/operandi"
+# The program to run inside the sandbox. operandi-acp-sandbox-macos sets this to
+# bin/operandi-acp; the core-build step below always goes through bin/operandi.
+PAYLOAD="${OPERANDI_SANDBOX_TARGET:-$OPERANDI}"
 TEMPLATE="$ROOT/bin/sandbox.sb"
 
 # Resolve a path to its physical form: sandbox rules match resolved paths.
@@ -92,4 +95,4 @@ fi
 # ~/quicklisp or write the fasl cache.
 OPERANDI_BUILD_ONLY=1 "$OPERANDI"
 
-exec /usr/bin/sandbox-exec -D CWD="$CWD" -p "$PROFILE" "$OPERANDI" "$@"
+exec /usr/bin/sandbox-exec -D CWD="$CWD" -p "$PROFILE" "$PAYLOAD" "$@"

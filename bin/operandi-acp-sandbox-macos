@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Run the operandi ACP server (bin/operandi-acp) inside the same macOS sandbox
+# as bin/operandi-sandbox-macos. Editors (Zed, agent-shell, buzz-acp) spawn this
+# as their agent command; stdin/stdout pass straight through to the sandboxed
+# process, so JSON-RPC works unchanged.
+#
+#   "command": "/path/to/operandi/bin/operandi-acp-sandbox-macos"
+#
+# The project grant is the directory the editor launches the server from (CWD),
+# exactly as for the interactive wrapper.
+set -euo pipefail
+
+SELF="$0"
+while [ -L "$SELF" ]; do
+  TARGET="$(readlink "$SELF")"
+  case "$TARGET" in
+    /*) SELF="$TARGET" ;;
+    *)  SELF="$(dirname "$SELF")/$TARGET" ;;
+  esac
+done
+export OPERANDI_SANDBOX_TARGET="$(cd "$(dirname "$SELF")" && pwd -P)/operandi-acp"
+exec "$(dirname "$SELF")/operandi-sandbox-macos" "$@"

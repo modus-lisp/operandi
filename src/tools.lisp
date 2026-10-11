@@ -47,7 +47,9 @@
            #:tools-as-openai-array
            #:invoke-tool
            #:default-tools
-           #:load-notes))
+           #:load-notes
+           #:project-notes-file
+           #:system-notes-file))
 
 (in-package #:operandi.tools)
 
@@ -676,31 +678,56 @@ of titles + URLs + short descriptions."
 
 (defparameter *notes-file*
   (merge-pathnames ".operandi/operandi-notes.md" (user-homedir-pathname))
-  "Persistent notes operandi reads at the start of every run and can
-   append to via the Remember tool. Markdown — designed to be easy
-   for the operator to read and edit by hand.")
+  "SYSTEM notes: facts about operandi itself and the machine, true in every
+   project. Read into every run's system prompt. Never project-specific.")
+
+(defun system-notes-file () *notes-file*)
+
+(defun project-notes-file (&optional (cwd (uiop:getcwd)))
+  "PROJECT notes for the directory CWD: kept under ~/.operandi/projects/, keyed
+   by the directory's path, so nothing is written into the project itself and
+   notes from one project never leak into another. The key escapes % and / so
+   distinct paths never share a file."
+  (let* ((path (string-right-trim "/" (namestring cwd)))
+         (key (with-output-to-string (s)
+                (loop for ch across path
+                      do (case ch
+                           (#\% (write-string "%25" s))
+                           (#\/ (write-string "%2F" s))
+                           (t (write-char ch s)))))))
+    (merge-pathnames (format nil ".operandi/projects/~A/notes.md" key)
+                     (user-homedir-pathname))))
 
 (define-tool "Remember"
     (:description "Append a one-sentence note to persistent notes. Use for
 non-obvious facts your future self needs (schema quirks, paths, gotchas).
-Notes appear in every future run's system prompt — keep them tight."
+scope \"project\" (the default) keeps it with the current project only.
+scope \"system\" is for facts about operandi or this machine that hold in
+every project. Notes appear in future system prompts — keep them tight."
      :schema (llm:ht
               "type" "object"
               "properties" (llm:ht
                             "topic" (llm:ht "type" "string"
                                              "description" "Short label for the note (e.g. 'decisions-table', 'brave-token').")
                             "note"  (llm:ht "type" "string"
-                                             "description" "The note itself, ideally one or two sentences."))
+                                             "description" "The note itself, ideally one or two sentences.")
+                            "scope" (llm:ht "type" "string"
+                                             "enum" (vector "project" "system")
+                                             "description" "'project' (default) for this project only; 'system' for facts true everywhere."))
               "required" (vector "topic" "note")))
-  (let ((topic (gethash "topic" args))
-        (note  (gethash "note"  args)))
-    (ensure-directories-exist *notes-file*)
-    (with-open-file (out *notes-file*
+  (let* ((topic (gethash "topic" args))
+         (note  (gethash "note"  args))
+         (scope (or (gethash "scope" args) "project"))
+         (file  (if (string= scope "system")
+                    (system-notes-file)
+                    (project-notes-file))))
+    (ensure-directories-exist file)
+    (with-open-file (out file
                          :direction :output
                          :if-exists :append
                          :if-does-not-exist :create)
       (format out "~%- **~A** — ~A~%" topic note))
-    (format nil "noted: ~A" topic)))
+    (format nil "noted (~A): ~A" scope topic)))
 
 (define-tool "Eval"
     (:description "Evaluate Common Lisp in the running SBCL image. Every
@@ -761,11 +788,18 @@ large)."
     "WebSearch" "Remember" "Findings" "Task" "Fan" "Spawn" "Investigate"
     "SendMessage" "TodoWrite"))
 
-(defun load-notes ()
-  "Read the persistent notes file. Returns the contents as a string,
-   or empty string if it doesn't exist or is empty."
+(defun read-notes-if-any (file)
   (handler-case
-      (if (probe-file *notes-file*)
-          (uiop:read-file-string *notes-file*)
-          "")
+      (if (probe-file file) (uiop:read-file-string file) "")
     (error () "")))
+
+(defun load-notes (&optional (cwd (uiop:getcwd)))
+  "System notes followed by the notes for project CWD. Returns a string,
+   empty if neither exists."
+  (let ((sys (read-notes-if-any (system-notes-file)))
+        (proj (read-notes-if-any (project-notes-file cwd))))
+    (cond ((zerop (length proj)) sys)
+          ((zerop (length sys)) (format nil "~A~%## Project notes (~A)~%~A"
+                                        "" (string-right-trim "/" (namestring cwd)) proj))
+          (t (format nil "~A~%## Project notes (~A)~%~A" sys
+                     (string-right-trim "/" (namestring cwd)) proj)))))

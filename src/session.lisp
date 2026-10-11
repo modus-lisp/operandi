@@ -26,7 +26,8 @@
            #:session-history #:session-turns #:session-usage #:session-add-usage
            #:persist-session #:render-session #:session->json #:session-json-path
            #:list-sessions #:resume-session! #:model-label
-           #:checkpoint-session #:session-in-flight-p #:*last-checkpoint*))
+           #:checkpoint-session #:session-in-flight-p #:*last-checkpoint*
+           #:resume-note))
 
 (in-package #:operandi.session)
 
@@ -184,10 +185,26 @@
                               (eq (gethash "in_flight" d) t)))
                     (error () (list (pathname-name f) 0 "(unreadable)" nil))))))
 
+(defun resume-note (closed-at &optional (now (get-universal-time)))
+  "The text the model gets when a saved session is reopened: the session
+   was closed at CLOSED-AT (universal time, the file's last write) and is
+   resuming now. Phrased so the model knows its prior turns are a record of
+   an earlier process, not something happening right now."
+  (let ((gap (and closed-at (max 0 (- now closed-at)))))
+    (format nil "[session resumed — the session was closed~@[ ~A ago~] and has now been reopened. Earlier messages are the record of that earlier run; nothing between then and now happened in this conversation. Check the current state of files before relying on them.]"
+            (and gap (humanize-duration gap)))))
+
+(defun humanize-duration (secs)
+  (cond ((< secs 90) (format nil "~D seconds" secs))
+        ((< secs (* 90 60)) (format nil "~D minutes" (round secs 60)))
+        ((< secs (* 36 3600)) (format nil "~D hours" (round secs 3600)))
+        (t (format nil "~D days" (round secs 86400)))))
+
 (defun resume-session! (s target)
   "Load a saved session into hash-table S in place. TARGET is a session id
    string or :LATEST. Returns the id on success, NIL if not found/unreadable.
-   The resumed session keeps its id, so continuing appends to the same files."
+   The resumed session keeps its id, so continuing appends to the same files.
+   Also records the file's last-write time as :CLOSED-AT for RESUME-NOTE."
   (let ((id (if (eq target :latest)
                 (let ((all (list-sessions))) (and all (first (first all))))
                 target)))
@@ -198,7 +215,8 @@
             (when (hash-table-p d)
               (let ((u (gethash "usage" d)) (h (gethash "history" d)))
                 (flet ((u@ (k) (or (and (hash-table-p u) (gethash k u)) 0)))
-                  (setf (gethash :id s) id
+                  (setf (gethash :closed-at s) (file-write-date path)
+                        (gethash :id s) id
                         (gethash :history s) (if (vectorp h) (coerce h 'list) h)
                         (gethash :turns s) (or (gethash "turns" d) 0)
                         (gethash :in-flight s) (eq (gethash "in_flight" d) t)

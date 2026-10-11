@@ -412,6 +412,19 @@
                         missing)
                 (list (llm:ht "role" "assistant" "content" note))))))
 
+(defun add-resume-note (sess)
+  "Queue a note telling the model that this session was closed and reopened.
+   It is NOT added to the saved history: RUN-TURN-CONTENT splices it into the
+   next request only, and every history write strips it back out."
+  (setf (gethash :pending-resume-note sess)
+        (llm:ht "role" "user"
+                "content" (session:resume-note (gethash :closed-at sess)))))
+
+(defun strip-resume-note (sess msgs)
+  "MSGS without the pending resume note object, if it was spliced in this turn."
+  (let ((note (gethash :sent-resume-note sess)))
+    (if note (remove note msgs :test #'eq) msgs)))
+
 (defun repair-in-flight (sess)
   "A resumed session whose last write was a mid-turn checkpoint: close the
    open turn the way Ctrl-C does (stand-in results for dangling tool calls,
@@ -605,7 +618,14 @@
 (defun run-turn-content (sess prompt)
   "RUN-TURN proper, on PROMPT as message content (a string or a parts vector)."
   (let* ((hist (session:session-history sess))
-         (messages (if hist (append hist (list (user-msg prompt))) nil))
+         ;; a pending resume note rides along on this one request, never in the history
+         (note (gethash :pending-resume-note sess))
+         (messages (progn
+                     (setf (gethash :pending-resume-note sess) nil
+                           (gethash :sent-resume-note sess) note)
+                     (if hist
+                         (append hist (and note (list note)) (list (user-msg prompt)))
+                         nil)))
          (*at-bol* t)
          (*need-bullet* t)
          (*md-line* (md-new-buf))
@@ -619,7 +639,8 @@
          (eng:*on-token* #'on-token)
          ;; durable state DURING the turn: a long tool loop that dies
          ;; otherwise leaves no session file at all
-         (eng:*on-progress* (lambda (live) (session:checkpoint-session sess live)))
+         (eng:*on-progress* (lambda (live)
+                              (session:checkpoint-session sess (strip-resume-note sess live))))
          ;; ...and the first checkpoint of a turn (the user message) is never
          ;; throttled away by one from the end of the previous turn
          (session:*last-checkpoint* 0)
@@ -639,7 +660,7 @@
             (handler-bind ((user-interrupt
                              (lambda (c) (declare (ignore c)) (setf live eng:*live-messages*))))
               (eng:run prompt :history messages :verbose nil))
-          (setf (session:session-history sess) hist*)
+          (setf (session:session-history sess) (strip-resume-note sess hist*))
           (incf (gethash :turns sess))
           (session:session-add-usage sess usage)
           (session:persist-session sess)          ; crash-safe: write after every turn
@@ -661,7 +682,7 @@
       (user-interrupt ()
         ;; Keep what the agent got done before the interrupt (see
         ;; SALVAGE-INTERRUPTED); usage for the partial turn isn't recoverable.
-        (let ((kept (salvage-interrupted messages live)))
+        (let ((kept (strip-resume-note sess (salvage-interrupted messages live))))
           (when (> (length kept) (length messages))
             (setf (session:session-history sess) kept)
             (incf (gethash :turns sess))
@@ -1330,7 +1351,9 @@
    piped/non-tty falls back to the simple synchronous loop."
   (let* ((sess (session:make-session))
          (resumed (when resume (session:resume-session! sess resume))))
-    (when resumed (repair-in-flight sess))
+    (when resumed
+      (repair-in-flight sess)
+      (add-resume-note sess))
     (cond
       (once (run-turn sess once) nil)
       ;; Default: the robust line REPL (plain writes, no cursor positioning) —

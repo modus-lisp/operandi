@@ -42,6 +42,7 @@
            #:install-thread-error-guard
            #:*swarm-deadline*
            #:run-investigate
+           #:swarm-status-text
            #:elicit-hypotheses
            #:project-findings
            #:findings-brief
@@ -251,10 +252,102 @@
         (%stop-workers threads)))
     (not timed-out)))
 
+;;; ----------------------- swarm progress -----------------------------
+;;; Fan and Investigate used to be silent until every worker had returned:
+;;; the parent and the user saw nothing while N paid calls ran. These lines
+;;; say when each worker starts, reports, and finishes. They go to stderr by
+;;; default; *SWARM-PROGRESS* may be a stream, or NIL to silence them.
+;;; Writes are serialised so lines from parallel workers do not interleave.
+
+(defvar *swarm-progress* :stderr
+  "Where swarm progress lines go: :STDERR (default), a stream, or NIL.")
+
+(defvar *swarm-progress-lock* (bt:make-lock "swarm-progress"))
+
+(defun swarm-note (fmt &rest args)
+  "Write one [swarm] progress line to *SWARM-PROGRESS*. Never signals: a
+   progress line must not take down the swarm it reports on."
+  (let ((s (case *swarm-progress*
+             (:stderr *error-output*)
+             ((nil) nil)
+             (t *swarm-progress*))))
+    (when s
+      (bt:with-lock-held (*swarm-progress-lock*)
+        (ignore-errors
+         (format s "~&[swarm] ~?~%" fmt args)
+         (finish-output s))))))
+
+;;; --------------------- live-worker registry ---------------------------
+;;; Every Fan/Investigate worker registers here while it runs, so /swarm can
+;;; show what is in flight NOW (progress lines only say what happened).
+;;; An entry is removed when its worker returns, however it returns.
+
+(defvar *live-workers* nil
+  "Plists (:kind :index :desc :started :model) of workers currently running.")
+
+(defvar *live-workers-lock* (bt:make-lock "live-workers"))
+
+(defun register-worker (kind index desc)
+  "Record a worker as live; returns the entry, to pass to UNREGISTER-WORKER."
+  (let ((entry (list :kind kind :index index :desc desc
+                     :started (get-internal-real-time)
+                     :model (or *worker-model* "inherit"))))
+    (bt:with-lock-held (*live-workers-lock*)
+      (push entry *live-workers*))
+    entry))
+
+(defun unregister-worker (entry)
+  (bt:with-lock-held (*live-workers-lock*)
+    (setf *live-workers* (remove entry *live-workers* :test #'eq))))
+
+(defmacro with-registered-worker ((kind index desc) &body body)
+  "Run BODY with a worker registered as live, unregistering it on any exit
+   (normal return, error, or the swarm stopping the thread)."
+  (let ((e (gensym "ENTRY")))
+    `(let ((,e (register-worker ,kind ,index ,desc)))
+       (unwind-protect (progn ,@body)
+         (unregister-worker ,e)))))
+
+(defun live-workers-snapshot ()
+  "Copy of the live-worker entries, oldest first."
+  (bt:with-lock-held (*live-workers-lock*)
+    (reverse (copy-list *live-workers*))))
+
+(defun swarm-status-text (&optional (now (get-internal-real-time)))
+  "What /swarm shows: each live worker's kind, index, age, model and task."
+  (let ((live (live-workers-snapshot)))
+    (if (null live)
+        "no swarm workers running"
+        (with-output-to-string (s)
+          (format s "~D live swarm worker~:P:~%" (length live))
+          (dolist (e live)
+            (format s "  ~A ~D  ~,1Fs  model ~A~%      ~A~%"
+                    (getf e :kind) (getf e :index)
+                    (/ (float (- now (getf e :started)) 1d0) internal-time-units-per-second)
+                    (getf e :model)
+                    (%brief (getf e :desc) 90)))))))
+
+(defun %brief (text &optional (n 60))
+  "TEXT on one line, at most N characters, with an ellipsis if cut."
+  (let* ((flat (substitute #\Space #\Newline (or text "")))
+         (flat (string-trim " " flat)))
+    (if (> (length flat) n)
+        (concatenate 'string (subseq flat 0 (- n 3)) "...")
+        flat)))
+
+(defun %elapsed (t0)
+  "Seconds of real time since T0 (a GET-INTERNAL-REAL-TIME value)."
+  (/ (float (- (get-internal-real-time) t0) 1d0)
+     internal-time-units-per-second))
+
+(defun %errored-p (text)
+  (uiop:string-prefix-p "SUBAGENT ERROR:" (or text "")))
+
 (defun run-fan (tasks tool-names depth)
   "Run TASKS concurrently (batched at *FAN-MAX*), preserving order.
    Returns the formatted, labeled results + a cost/iteration footer, and
-   rolls the subagents' usage up into the parent run's total."
+   rolls the subagents' usage up into the parent run's total. Each worker
+   reports its start and finish as it happens (SWARM-NOTE)."
   (let ((results (make-array (length tasks) :initial-element nil)))
     (loop for start from 0 below (length tasks) by *fan-max*
           for end = (min (length tasks) (+ start *fan-max*))
@@ -263,8 +356,17 @@
                            collect (let ((idx i) (d (nth i tasks)))
                                      (bt:make-thread
                                       (lambda ()
-                                        (setf (aref results idx)
-                                              (run-one-subagent d tool-names depth)))
+                                        (let ((t0 (get-internal-real-time)))
+                                          (swarm-note "fan ~D started: ~A"
+                                                      (1+ idx) (%brief d))
+                                          (let ((r (with-registered-worker ("fan" (1+ idx) d)
+                                                     (run-one-subagent d tool-names depth))))
+                                            (setf (aref results idx) r)
+                                            (swarm-note "fan ~D done: ~D iters, ~A, ~,1Fs~:[~; — ERROR~]"
+                                                        (1+ idx) (getf r :iters)
+                                                        (llm:usage-summary (getf r :usage))
+                                                        (%elapsed t0)
+                                                        (%errored-p (getf r :text))))))
                                       :name (format nil "operandi-fan-~D" i))))))
                (join-or-stop threads)))
     (let ((batch (roll-up-usage! results)))
@@ -273,8 +375,11 @@
           (loop for r across results for i from 1
                 when r
                   do (incf total-iters (getf r :iters))
-                     (format s "~&=== subagent ~D (~A iters): ~A ===~%~A~%~%"
+                     (format s "~&=== subagent ~D (~A iters, ~A, model ~A~:[~;, ERROR~]): ~A ===~%~A~%~%"
                              i (getf r :iters)
+                             (llm:usage-summary (getf r :usage))
+                             (or (getf r :model) "?")
+                             (%errored-p (getf r :text))
                              (let ((d (getf r :desc)))
                                (subseq d 0 (min 60 (length d))))
                              (getf r :text)))
@@ -572,6 +677,28 @@ write it to a file there and run it in a SEPARATE process through Bash
 start may outlive you: kill every background process before you report."
           scratch))
 
+(defun investigate-status-block (results hypotheses)
+  "One line per hypothesis: its number, verdict, model, iterations and cost.
+   Placed before the JSON so the parent can see at a glance which workers
+   settled their claim and what each cost. RESULTS holds the worker plists
+   (or NIL for one that never reported); HYPOTHESES gives the count."
+  (with-output-to-string (s)
+    (format s "--- workers ---~%")
+    (loop for h in hypotheses
+          for i from 0
+          for r = (and (< i (length results)) (aref results i))
+          do (let ((v (and r (getf r :verdict))))
+               (format s "~D. ~A  model ~A, ~A iters, ~A~%"
+                       (1+ i)
+                       (if v
+                           (format nil "~A (~A)" (getf v :verdict) (getf v :confidence))
+                           "undetermined (no verdict)")
+                       (or (and r (getf r :model)) "?")
+                       (or (and r (getf r :iters)) 0)
+                       (llm:usage-summary (and r (getf r :usage))))
+               (format s "   ~A~%" (%brief h 100))))
+    (format s "---~%")))
+
 (defun run-investigate (hypotheses context tool-names depth &optional model)
   "Settle HYPOTHESES in parallel, batched at *FAN-MAX*. Returns a JSON
    array of verdict records plus a one-line cost footer. MODEL, when given,
@@ -596,15 +723,34 @@ start may outlive you: kill every background process before you report."
                            collect (let ((idx i) (h (nth i hypotheses)))
                                      (bt:make-thread
                                       (lambda ()
-                                        (let ((*worker-model* wm))
+                                        (let ((*worker-model* wm)
+                                              (t0 (get-internal-real-time)))
+                                          (swarm-note "investigate ~D started: ~A"
+                                                      (1+ idx) (%brief h))
                                           (setf (aref results idx)
-                                                (run-one-investigation
-                                                 h context tool-names depth
-                                                 :project project :commit commit
-                                                 ;; a reported verdict lands in its
-                                                 ;; slot at once; a normal return
-                                                 ;; overwrites it with the full record
-                                                 :report (lambda (r) (setf (aref results idx) r))))))
+                                                (with-registered-worker ("investigate" (1+ idx) h)
+                                                  (run-one-investigation
+                                                   h context tool-names depth
+                                                   :project project :commit commit
+                                                   ;; a reported verdict lands in its
+                                                   ;; slot at once; a normal return
+                                                   ;; overwrites it with the full record
+                                                   :report (lambda (r)
+                                                             (setf (aref results idx) r)
+                                                             (let ((v (getf r :verdict)))
+                                                               (swarm-note "investigate ~D verdict: ~A (~A) at ~,1Fs"
+                                                                           (1+ idx)
+                                                                           (if v (getf v :verdict) "?")
+                                                                           (if v (getf v :confidence) "?")
+                                                                           (%elapsed t0)))))))
+                                          (let ((r (aref results idx)))
+                                            (swarm-note "investigate ~D finished: ~A, ~D iters, ~A, ~,1Fs"
+                                                        (1+ idx)
+                                                        (let ((v (and r (getf r :verdict))))
+                                                          (if v (getf v :verdict) "no verdict"))
+                                                        (or (and r (getf r :iters)) 0)
+                                                        (llm:usage-summary (and r (getf r :usage)))
+                                                        (%elapsed t0)))))
                                       :name (format nil "operandi-investigate-~D" i))))))
                (join-or-stop threads deadline)))
     (let* ((batch (roll-up-usage! results))
@@ -628,8 +774,9 @@ start may outlive you: kill every background process before you report."
            ;; scratch rule. Reported, never deleted: they are in someone's repo.
            (debris (set-difference (%untracked-files) before :test #'string=)))
       (values
-       (format nil "~A~%[investigate: ~D hypotheses on ~A, ~A; ~D verdict~:P recorded to the ledger as reported; scratch ~A]~@[~%DEADLINE: the swarm hit its ~Ds deadline; unfinished workers were stopped and their hypotheses are marked undetermined.~]~@[~%WARNING: workers left ~D new file~:P in the project tree: ~{~A~^, ~}~]"
+       (format nil "~A~%~A[investigate: ~D hypotheses on ~A, ~A; ~D verdict~:P recorded to the ledger as reported; scratch ~A]~@[~%DEADLINE: the swarm hit its ~Ds deadline; unfinished workers were stopped and their hypotheses are marked undetermined.~]~@[~%WARNING: workers left ~D new file~:P in the project tree: ~{~A~^, ~}~]"
                (json:stringify (coerce records 'vector) :pretty t)
+               (investigate-status-block results hypotheses)
                (length records)
                (or wm "the orchestrator's model")
                (llm:usage-summary batch)

@@ -727,6 +727,7 @@
                  ("/model [id]"    "show or switch model (id like vendor/name → OpenRouter)")
                  ("/effort [lvl]"  "show or set reasoning effort: off, low, medium, high, default")
                  ("/workers [m]"   "show or set the subagent model (vendor/name, llama, or inherit)")
+                ("/swarm"         "list the Fan/Investigate workers running right now")
                  ("/rc <target|off>" "mirror each turn to a Marmot chat (npub/nprofile/NIP-05 starts a new chat; a chat name or group id joins an existing one; off: stop)")
                  ("/ask <question>" "rival hypotheses -> a swarm settles them -> an answer from the verdicts")
                  ("/system"        "print the active system prompt")
@@ -819,6 +820,9 @@ to start a new chat with that person, or a chat name / group id for an existing 
        (error (e)
          (format t "~&~A~%" (paint (format nil "rc: ~A" e) :yellow)))))))
 
+(defun cmd-swarm ()
+  (format t "~&~A~%" (operandi.subagent:swarm-status-text)))
+
 (defun cmd-effort (arg)
   (if (null arg)
       (format t "~&effort: ~A~A~%" (paint (effort-label) :cyan)
@@ -867,6 +871,7 @@ to start a new chat with that person, or a chat name / group id for an existing 
       ((string-equal verb "/model") (cmd-model arg) t)
       ((string-equal verb "/effort") (cmd-effort arg) t)
       ((string-equal verb "/workers") (cmd-workers arg) t)
+      ((string-equal verb "/swarm") (cmd-swarm) t)
       ((string-equal verb "/rc") (cmd-rc arg) t)
       ((string-equal verb "/system") (cmd-system sess) t)
       ((string-equal verb "/tools") (cmd-tools) t)

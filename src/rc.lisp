@@ -152,7 +152,8 @@ Returns the chat's display name."
       (setf *client* client
             *chat* chat
             *chat-name* (let ((n (%call "CHAT-NAME" found)))
-                          (if (plusp (length n)) n (%call "CHAT-ID" found))))
+                          (if (plusp (length n)) n (%call "CHAT-ID" found)))
+            *mention* (%new-mention))
       (%start-sync))
     *chat-name*))
 

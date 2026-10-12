@@ -689,7 +689,12 @@
               (fresh)
               (emit (paint "⏺ " :br-cyan))
               (emit (md-render-text final))
-              (emit (string #\Newline))))
+              (emit (string #\Newline)))
+            (when (and (stringp prompt) (operandi.rc:active-p))
+              (let ((err (operandi.rc:mirror-turn prompt (if (plusp (length final)) final streamed))))
+                (when err
+                  (fresh)
+                  (emit (paint (format nil "  ⚠ ~A~%" err) :yellow))))))
           (fresh)
           (emit (paint (format nil "  ~A iter · ~A~%~%" iters (llm:usage-summary usage))
                        :gray))
@@ -722,6 +727,7 @@
                  ("/model [id]"    "show or switch model (id like vendor/name → OpenRouter)")
                  ("/effort [lvl]"  "show or set reasoning effort: off, low, medium, high, default")
                  ("/workers [m]"   "show or set the subagent model (vendor/name, llama, or inherit)")
+                 ("/rc <target|off>" "mirror each turn to a Marmot chat (npub/nprofile/NIP-05 starts a new chat; a chat name or group id joins an existing one; off: stop)")
                  ("/ask <question>" "rival hypotheses -> a swarm settles them -> an answer from the verdicts")
                  ("/system"        "print the active system prompt")
                  ("/tools"         "list the tools the agent can call")
@@ -795,6 +801,24 @@
                    (format t "~&→ workers: ~A~%" (paint (or m "inherit") :cyan)))
             (format t "~&~A~%" (paint "workers takes a vendor/name slug, llama, or inherit" :yellow))))))
 
+(defun cmd-rc (arg)
+  "/rc TARGET mirrors each turn to a Marmot chat.  TARGET is an npub, nprofile or NIP-05
+to start a new chat with that person, or a chat name / group id for an existing one.
+/rc off stops; /rc alone shows status."
+  (cond
+    ((null arg)
+     (if (operandi.rc:active-p)
+         (format t "~&rc: mirroring to ~A~%" (paint (operandi.rc:status-chat) :cyan))
+         (format t "~&rc: off  (/rc TARGET to mirror, /rc off to stop)~%")))
+    ((string-equal arg "off")
+     (format t "~&~A~%" (if (operandi.rc:disable) "— rc off —" (paint "rc was not on" :gray))))
+    (t
+     (handler-case
+         (let ((name (operandi.rc:rc arg)))
+           (format t "~&→ rc: mirroring turns to ~A~%" (paint name :cyan)))
+       (error (e)
+         (format t "~&~A~%" (paint (format nil "rc: ~A" e) :yellow)))))))
+
 (defun cmd-effort (arg)
   (if (null arg)
       (format t "~&effort: ~A~A~%" (paint (effort-label) :cyan)
@@ -843,6 +867,7 @@
       ((string-equal verb "/model") (cmd-model arg) t)
       ((string-equal verb "/effort") (cmd-effort arg) t)
       ((string-equal verb "/workers") (cmd-workers arg) t)
+      ((string-equal verb "/rc") (cmd-rc arg) t)
       ((string-equal verb "/system") (cmd-system sess) t)
       ((string-equal verb "/tools") (cmd-tools) t)
       ;; /ask is a TURN, not a command: returning NIL here lets both REPLs

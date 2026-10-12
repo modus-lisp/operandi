@@ -70,7 +70,9 @@
       (let ((streamed (string-right-trim '(#\Space #\Newline) (get-output-stream-string buf))))
         (unless (string= (string-right-trim '(#\Space #\Newline) (or text "")) streamed)
           (format t "~&~A" text)))
-      (format t "~&~%[~A iters, ~A]~%" iters (llm:usage-summary usage)))))
+      (format t "~&~%[~A iters, ~A]~%" iters (llm:usage-summary usage))
+      (let ((err (funcall (find-symbol "MIRROR-TURN" "OPERANDI.RC") prompt (or text ""))))
+        (when err (format *error-output* "~&operandi: ~A~%" err))))))
 
 (defun run-once (prompt &optional (tool-names (tools:default-tools)))
   (handler-case (display-run prompt tool-names)
@@ -195,6 +197,18 @@
                     (setf tool-names (%tools-deny (second acc)) acc (cddr acc)))
                    ((and acc (string= (first acc) "--tui"))
                     (setf tui-p t acc (rest acc)))
+                   ;; --rc TARGET: mirror every turn to a Marmot chat (see operandi.rc:rc).
+                   ;; npub/nprofile/NIP-05 start a new chat; a hex id or chat name uses an existing one.
+                   ((and acc (string= (first acc) "--rc"))
+                    (unless (and (second acc) (plusp (length (second acc)))
+                                 (not (uiop:string-prefix-p "--" (second acc))))
+                      (format *error-output* "operandi: --rc takes an npub, nprofile, NIP-05, chat name or group id~%")
+                      (sb-ext:exit :code 2))
+                    (handler-case (funcall (find-symbol "RC" "OPERANDI.RC") (second acc))
+                      (error (e)
+                        (format *error-output* "operandi: --rc: ~A~%" e)
+                        (sb-ext:exit :code 2)))
+                    (setf acc (cddr acc)))
                    ;; Any other leading --flag is a typo or unknown option: fail loud
                    ;; instead of sending it to the agent as task text.
                    ((and acc (> (length (first acc)) 2) (string= "--" (first acc) :end2 2)
@@ -220,6 +234,7 @@
      (format t "  operandi.lisp -- \"task description\"~%")
      (format t "  operandi.lisp              (no args, or --tui: interactive REPL: streaming, tools, /commands)~%")
      (format t "  operandi.lisp -- --resume [ID] tui  (resume a saved session; latest if no ID)~%")
+     (format t "  operandi.lisp -- --rc TARGET \"task\"   (mirror each turn to a Marmot chat: TARGET is an npub, nprofile or NIP-05 to start a new chat, or a chat name / group id for an existing one; also /rc in the TUI)~%")
      (format t "  operandi.lisp -- --openrouter [MODEL] \"task\"~%")
      (format t "  operandi.lisp -- --effort off|low|medium|high \"task\"   (reasoning; also OPERANDI_EFFORT)~%")
      (format t "  operandi.lisp -- --openrouter STRONG --worker-model CHEAP tui   (orchestrator and subagents on different models)~%")
@@ -244,4 +259,6 @@
 ;; drops into SBCL's own REPL after the TUI quits — forcing an extra Ctrl-D.
 ;; (`bin/operandi` and the MCP already pass --non-interactive; this is harmless
 ;; there and makes the bare --load form behave the same.)
+;; Tear down any per-run Marmot identity (--rc) before exiting.
+(ignore-errors (funcall (find-symbol "DISABLE" "OPERANDI.RC")))
 (sb-ext:exit :code 0)

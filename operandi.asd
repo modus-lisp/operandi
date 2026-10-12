@@ -26,6 +26,8 @@
                "cl-ppcre"
                "sqlite"
                "bordeaux-threads"
+               "lispqr"         ; pure-CL QR encoder (mare5x, MIT) -- for payment invoices; pulls zpng
+               "png-pure"       ; pure-CL PNG encoder (cram's deflate) -- QR image for :open
                "quill")         ; pure-CL line editor for the REPL prompt -- replaced linedit
   :serial nil
   :components
@@ -33,6 +35,7 @@
     :components
     ((:file "text")                                           ; operandi.text
      (:file "http")                                           ; operandi.http
+     (:file "payments" :depends-on ("http"))                  ; operandi.payments
      (:file "llm"      :depends-on ("http"))                  ; operandi.llm
      (:file "actor")                                          ; operandi.actor
      (:file "store")                                          ; operandi.store

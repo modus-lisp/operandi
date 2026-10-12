@@ -135,6 +135,8 @@
    failing the run — a worker on the wrong model beats no worker."
   (cond ((null model) (funcall thunk))
         ((string-equal model "llama") (llm:with-llama (funcall thunk)))
+        ((and (find #\/ model) (eq llm:*llm-backend* :routstr))
+         (llm:with-routstr (:model model) (funcall thunk)))
         ((find #\/ model) (llm:with-openrouter (:model model) (funcall thunk)))
         (t (funcall thunk))))
 

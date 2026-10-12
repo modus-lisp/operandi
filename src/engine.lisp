@@ -603,7 +603,7 @@ completed). Do not shorten for brevity — nothing may be lost.")
    through OpenRouter gets 96k. An explicit OPERANDI_CONTEXT_BUDGET wins."
   (unless (uiop:getenv "OPERANDI_CONTEXT_BUDGET")
     (setf *context-token-budget*
-          (if (eq llm:*llm-backend* :openrouter) 96000 24000))))
+          (if (llm:cloud-backend-p) 96000 24000))))
 
 (defvar *last-offload-path* nil
   "Set by OFFLOAD-MIDDLE for the *ON-COMPACT* hook; NIL after a tier-1-only pass.")
@@ -891,7 +891,7 @@ another tool or give a final answer.")
     ;; explicit was chosen.
     (llm:apply-reasoning body (or llm:*llm-effort*
                                   (and *do-chat-disable-reasoning* :off)))
-    (when (eq llm:*llm-backend* :openrouter)         ; cost/token accounting
+    (when (llm:cloud-backend-p)                      ; cost/token accounting
       (setf (gethash "usage" body) (ht "include" t)))
     (when llm:*llm-model* (setf (gethash "model" body) llm:*llm-model*))
     body))

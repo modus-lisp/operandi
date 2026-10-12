@@ -30,8 +30,9 @@
            #:llm-chat #:ht #:extract-json
            #:image-part #:text-part #:user-content #:content-text #:content-images
            #:image-file-p
-           #:set-backend-openrouter! #:set-backend-llama!
-           #:with-llama #:with-openrouter #:openrouter-credits
+           #:set-backend-openrouter! #:set-backend-llama! #:set-backend-routstr!
+           #:with-llama #:with-openrouter #:with-routstr #:openrouter-credits
+           #:cloud-backend-p
            #:*usage-sink* #:usage #:make-usage #:copy-usage
            #:usage-calls #:usage-prompt-tokens #:usage-completion-tokens
            #:usage-cost-usd #:usage-cached-tokens #:with-usage-accounting
@@ -108,7 +109,15 @@
 (defparameter *llm-backend* :llama
   ":LLAMA = local llama.cpp at *llm-url* (default).
    :OPENROUTER = OpenRouter API; *llm-url*, *llm-auth-token*, and
-   *llm-model* must be set. Use USE-OPENROUTER to flip.")
+   *llm-model* must be set. Use USE-OPENROUTER to flip.
+   :ROUTSTR = Routstr (api.routstr.com/v1, OpenAI-compatible, Cashu-paid).
+   Same request shape as OpenRouter; the bearer token is a Cashu token or
+   an sk- API key.")
+
+(defun cloud-backend-p (&optional (backend *llm-backend*))
+  "True for hosted backends that speak OpenRouter's request dialect
+   (usage accounting, reasoning.effort): :OPENROUTER and :ROUTSTR."
+  (member backend '(:openrouter :routstr)))
 
 (defparameter *llm-effort* nil
   "Reasoning effort for the AGENT LOOP: NIL (leave it to the provider/model
@@ -139,7 +148,7 @@
   "Set the backend-specific reasoning fields on request BODY (a hash table)
    for EFFORT, and return BODY. The single place the two dialects live."
   (case *llm-backend*
-    (:openrouter
+    ((:openrouter :routstr)
      (case effort
        (:off (setf (gethash "reasoning" body) (ht "enabled" nil)))
        ((:low :medium :high)
@@ -307,7 +316,7 @@
     (when *llm-model*
       (setf (gethash "model" body-ht) *llm-model*))
     ;; OpenRouter only reports real USD cost when asked; harmless to llama.
-    (when (eq *llm-backend* :openrouter)
+    (when (cloud-backend-p)
       (setf (gethash "usage" body-ht) (ht "include" t)))
     (loop for (k v) on extra by #'cddr
           do (setf (gethash (string-downcase (string k)) body-ht) v))
@@ -381,6 +390,36 @@
              *llm-read-timeout* 240)
        t))))
 
+(defparameter *routstr-url* "https://routstr.cypherpunk.today/v1/chat/completions"
+  "Chat endpoint of one Routstr provider NODE. Routstr is a network of
+   independent OpenAI-compatible nodes that each validate the Cashu token
+   and serve their own model ids (hyphenated, e.g. gemini-3-6-flash).
+   api.routstr.com is only the provider directory, not a chat endpoint.
+   Any live node works; set this to choose another.")
+
+(defun set-backend-routstr! (&key (model "gemini-3-6-flash")
+                             (token-file (merge-pathnames
+                                          ".operandi/routstr.token"
+                                          (user-homedir-pathname))))
+  "Switch the LLM client to Routstr. Reads the bearer token (a Cashu eCash
+   token or an sk- API key from chat.routstr.com) from TOKEN-FILE (default
+   ~/.operandi/routstr.token, mode 600). Returns T on success, NIL if the
+   token file is missing or empty."
+  (let ((token (read-token-file token-file)))
+    (cond
+      ((or (null token) (zerop (length token)))
+       (format *error-output*
+               "~&set-backend-routstr!: token file ~A missing or empty~%"
+               token-file)
+       nil)
+      (t
+       (setf *llm-backend*    :routstr
+             *llm-url*        *routstr-url*
+             *llm-auth-token* token
+             *llm-model*      model
+             *llm-read-timeout* 240)
+       t))))
+
 (defun set-backend-llama! (&key (url "http://127.0.0.1:8081/v1/chat/completions"))
   "Switch the LLM client back to the local llama.cpp server."
   (setf *llm-backend*    :llama
@@ -422,6 +461,30 @@
          (t
           (let ((*llm-backend* :openrouter)
                 (*llm-url* "https://openrouter.ai/api/v1/chat/completions")
+                (*llm-auth-token* ,tok)
+                (*llm-model* ,model)
+                (*llm-read-timeout* 240))
+            ,@body))))))
+
+(defmacro with-routstr ((&key (model "gemini-3-6-flash")
+                              (token-file (merge-pathnames
+                                           ".operandi/routstr.token"
+                                           (user-homedir-pathname))))
+                        &body body)
+  "Run BODY with the LLM client temporarily switched to Routstr."
+  (let ((tok (gensym))
+        (tf  (gensym)))
+    `(let* ((,tf ,token-file)
+            (,tok (read-token-file ,tf)))
+       (cond
+         ((or (null ,tok) (zerop (length ,tok)))
+          (format *error-output*
+                  "~&with-routstr: token file ~A missing — falling through to current backend~%"
+                  ,tf)
+          ,@body)
+         (t
+          (let ((*llm-backend* :routstr)
+                (*llm-url* *routstr-url*)
                 (*llm-auth-token* ,tok)
                 (*llm-model* ,model)
                 (*llm-read-timeout* 240))

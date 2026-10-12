@@ -395,6 +395,7 @@
 (defun model-label ()
   (case llm:*llm-backend*
     (:openrouter (or llm:*llm-model* "openrouter"))
+    (:routstr (or llm:*llm-model* "routstr"))
     (t "llama.cpp")))
 
 (defparameter *cut-off-note*
@@ -798,7 +799,7 @@
   (if (null arg)
       (format t "~&effort: ~A~A~%" (paint (effort-label) :cyan)
               (case llm:*llm-backend*
-                (:openrouter "  (OpenRouter: off → reasoning disabled; low/medium/high → reasoning.effort)")
+                ((:openrouter :routstr) "  (OpenRouter/Routstr: off → reasoning disabled; low/medium/high → reasoning.effort)")
                 (t "  (llama.cpp: off/default → no thinking; low/medium/high → thinking on)")))
       (multiple-value-bind (e ok) (llm:parse-effort arg)
         (if ok
@@ -1234,7 +1235,7 @@
 (defun banner-model ()
   "Model and backend for the banner, e.g. \"· deepseek/... · openrouter\"."
   (format nil "· ~A~@[ · ~A~]" (model-label)
-          (and (eq llm:*llm-backend* :openrouter) "openrouter")))
+          (case llm:*llm-backend* (:openrouter "openrouter") (:routstr "routstr"))))
 
 (defun ui-banner (sess)
   (emit (format nil "~A ~A~%~A~%~A~%"
@@ -1317,7 +1318,7 @@
   "The shell command that brings SESS back, model flag included — a bare
    --resume would reopen it on the default backend, not the one it ran on."
   (format nil "operandi~@[ --openrouter ~A~]~@[ --effort ~A~] --resume ~A tui"
-          (and (eq llm:*llm-backend* :openrouter) llm:*llm-model*)
+          (and (member llm:*llm-backend* '(:openrouter :routstr)) llm:*llm-model*)
           (and llm:*llm-effort* (effort-label))
           (gethash :id sess)))
 

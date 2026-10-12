@@ -39,6 +39,7 @@
 (defun model-label ()
   (case llm:*llm-backend*
     (:openrouter (or llm:*llm-model* "openrouter"))
+    (:routstr (or llm:*llm-model* "routstr"))
     (t "llama.cpp")))
 
 (defun session-id ()

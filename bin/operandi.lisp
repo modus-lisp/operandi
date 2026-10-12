@@ -133,7 +133,8 @@
 ;; Apply the configured default model unless the command line names a backend
 ;; explicitly (--openrouter, with or without a model; a bare --openrouter also
 ;; reads the config, below). Doing both would announce the backend twice.
-(let ((m (and (not (member "--openrouter" (uiop:command-line-arguments) :test #'string=))
+(let ((m (and (not (member-if (lambda (a) (member a '("--openrouter" "--routstr") :test #'string=))
+                                 (uiop:command-line-arguments)))
               (config-default-model))))
   (when m
     (if (string-equal m "llama")
@@ -162,6 +163,12 @@
                                   :model (if (and cfg (find #\/ cfg)) cfg
                                              "minimax/minimax-m2.7")))
                                (setf acc tail)))
+                      (eng:apply-backend-defaults)))
+                   ((and acc (string= (first acc) "--routstr"))
+                    (let* ((tail (rest acc)) (next (first tail))
+                           (is-model (and next (find #\/ next) (not (find #\Space next)))))
+                      (cond (is-model (llm:set-backend-routstr! :model next) (setf acc (rest tail)))
+                            (t (llm:set-backend-routstr!) (setf acc tail)))
                       (eng:apply-backend-defaults)))
                    ((and acc (string= (first acc) "--worker-model"))
                     (multiple-value-bind (m ok)
@@ -221,6 +228,7 @@
      (format t "  bin/operandi-acp                 (ACP server over stdio for editors: Zed, Buzz; see README)~%")
      (format t "~%env: OPERANDI_MAX_TOKENS (per-turn output cap, default 16384),~%")
      (format t "     OPERANDI_CONTEXT_BUDGET (compaction threshold), OPERANDI_MAX_ITERS.~%")
+     (format t "  operandi.lisp -- --routstr [MODEL] \"task\"   (Routstr: Cashu token in ~~/.operandi/routstr.token)~%")
      (format t "~%--openrouter reads token from ~~/.operandi/openrouter.token.~%")
      (format t "Sessions are saved under ~~/.operandi/sessions/; --resume continues one.~%")
      (format t "Default backend is a local llama.cpp on http://127.0.0.1:8081.~%"))

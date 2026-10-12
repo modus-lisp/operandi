@@ -20,6 +20,7 @@
 (in-package #:operandi.rc)
 
 (defvar *client* nil "The open cl-marmot client, or NIL when not mirroring.")
+(defvar *ephemeral-home* nil "Temp MARMOT_HOME of the per-run identity, deleted on DISABLE.")
 (defvar *chat* nil "The chat designator given to ENABLE (name or group id), or NIL.")
 (defvar *chat-name* nil "The resolved display name of *CHAT*.")
 
@@ -157,8 +158,6 @@ Returns the chat's display name."
 
 (defparameter *ephemeral-relays*
   '("wss://relay.damus.io" "wss://nos.lol" "wss://relay.primal.net"))
-
-(defvar *ephemeral-home* nil "Temp MARMOT_HOME of the per-run identity, deleted on DISABLE.")
 
 (defun %fresh-home ()
   (let ((dir (format nil "~A/operandi-rc-~36R-~36R/"

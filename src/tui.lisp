@@ -816,7 +816,10 @@ to start a new chat with that person, or a chat name / group id for an existing 
     (t
      (handler-case
          (let ((name (operandi.rc:rc arg)))
-           (format t "~&→ rc: mirroring turns to ~A~%" (paint name :cyan)))
+           (format t "~&→ rc: mirroring turns to ~A~%" (paint name :cyan))
+           (when operandi.rc:*mention*
+             (format t "~&  tell them to write ~A in the chat to drive a turn~%"
+                     (paint operandi.rc:*mention* :cyan))))
        (error (e)
          (format t "~&~A~%" (paint (format nil "rc: ~A" e) :yellow)))))))
 
@@ -1294,6 +1297,8 @@ to start a new chat with that person, or a chat name / group id for an existing 
                            (format nil "no prior session to resume; starting fresh~%"))
                        (if resumed :br-cyan :yellow))))
         (setf *worker* (bt:make-thread (lambda () (worker-loop sess)) :name "operandi-turn"))
+        ;; /rc inbound: a chat message mentioning @operandi queues a turn, same as typed input.
+        (operandi.rc:set-inbound #'rc-inbound)
         (bt:with-lock-held (*ui-lock*) (go-idle))
         (loop
           (let ((key (read-key)))

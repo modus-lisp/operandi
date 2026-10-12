@@ -1440,7 +1440,10 @@ Queues it as the next turn (behind any in-flight turn), like typed input.  Takes
       ;; scroll region + absolute ESC7/ESC8 positioning) gives type-while-working
       ;; but corrupts output under some terminal/multiplexer combos (e.g. tmux
       ;; scroll-region + DECSC interactions), so it's OPT-IN via OPERANDI_FANCY_TUI=1.
-      ((and (stdin-tty-p) (stdout-tty-p) (uiop:getenv "OPERANDI_FANCY_TUI")
+      ;; An active --rc / /rc mirror needs the concurrent UI: only it attaches the
+      ;; inbound consumer (set-inbound), so an invitee's @op- message can queue a turn.
+      ((and (stdin-tty-p) (stdout-tty-p)
+            (or (uiop:getenv "OPERANDI_FANCY_TUI") (operandi.rc:active-p))
             (raw-mode-available-p))
        (handler-case (repl-concurrent sess :greet greet :resume resume :resumed resumed)
          (error ()

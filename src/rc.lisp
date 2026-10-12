@@ -8,7 +8,7 @@
 ;;;; successful turn, MIRROR-TURN sends one chat message:  "> prompt" then a blank
 ;;;; line then the answer.
 ;;;;
-;;;; cl-marmot is loaded at run time, not at build time, so operandi itself keeps
+;;;; cl-marmot is loaded at run time (ql:quickload), not at build time, so operandi keeps
 ;;;; no dependency on it.  All marmot access goes through FIND-SYMBOL so this file
 ;;;; compiles whether or not cl-marmot is present.
 
@@ -29,26 +29,11 @@
 (defun %call (name &rest args)
   (apply (%marmot name) args))
 
-(defun %modus-lisp-root ()
-  "The directory holding the modus-lisp checkouts (cl-marmot and its deps), or NIL.
-Same search order as cl-marmot/load-deps.lisp: $MODUS_LISP, ~/workspace/modus-lisp/, ~/modus-lisp/."
-  (let* ((env (uiop:getenv "MODUS_LISP"))
-         (candidates (remove nil
-                             (list (and env (plusp (length env)) (uiop:ensure-directory-pathname env))
-                                   (merge-pathnames "workspace/modus-lisp/" (user-homedir-pathname))
-                                   (merge-pathnames "modus-lisp/" (user-homedir-pathname))))))
-    (find-if (lambda (d) (probe-file (merge-pathnames "cl-marmot/cl-marmot.asd" d))) candidates)))
-
 (defun %ensure-loaded ()
-  "Make the MARMOT package available, loading cl-marmot and its modus-lisp deps on first use."
+  "Make the MARMOT package available. cl-marmot and its deps are quickloaded from
+~/quicklisp/local-projects (each is a symlink to its checkout), so no path search here."
   (unless (find-package "MARMOT")
-    (let ((root (%modus-lisp-root)))
-      (unless root
-        (error "cl-marmot checkout not found (set MODUS_LISP or put modus-lisp under ~~/workspace)"))
-      (dolist (lib '("cl-marmot" "natrium" "secp256k1-fast" "seal" "cl-nostr" "json-simple"))
-        (let ((dir (merge-pathnames (concatenate 'string lib "/") root)))
-          (when (probe-file dir) (pushnew dir asdf:*central-registry* :test #'equal))))
-      (funcall (read-from-string "ql:quickload") :cl-marmot :silent t)))
+    (funcall (read-from-string "ql:quickload") :cl-marmot :silent t))
   (unless (find-package "MARMOT") (error "cl-marmot did not load"))
   t)
 

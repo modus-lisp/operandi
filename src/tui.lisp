@@ -396,6 +396,7 @@
   (case llm:*llm-backend*
     (:openrouter (or llm:*llm-model* "openrouter"))
     (:routstr (or llm:*llm-model* "routstr"))
+    (:ppq (or llm:*llm-model* "ppq"))
     (t "llama.cpp")))
 
 (defparameter *cut-off-note*
@@ -831,6 +832,7 @@ to start a new chat with that person, or a chat name / group id for an existing 
       (format t "~&effort: ~A~A~%" (paint (effort-label) :cyan)
               (case llm:*llm-backend*
                 ((:openrouter :routstr) "  (OpenRouter/Routstr: off → reasoning disabled; low/medium/high → reasoning.effort)")
+                (:ppq "  (ppq: reasoning is the provider model's own; this backend does not set it)")
                 (t "  (llama.cpp: off/default → no thinking; low/medium/high → thinking on)")))
       (multiple-value-bind (e ok) (llm:parse-effort arg)
         (if ok
@@ -1160,6 +1162,18 @@ to start a new chat with that person, or a chat name / group id for an existing 
 
 ;;; --- submit + commands ---
 
+(defun rc-inbound (text)
+  "Called from the cl-marmot sync thread with a chat message that mentions this run's
+mention token (operandi.rc:*mention*, e.g. @op-7k3q9z).
+Queues it as the next turn (behind any in-flight turn), like typed input.  Takes only
+*turn-lock*; the echo goes through EMIT, which takes *ui-lock*, so it runs outside it."
+  (let ((busy *turn-active*))
+    (ui-freshline)
+    (emit (format nil "~%~A ~A~%~%" (paint (if busy "⧗ queued (chat) ›" "chat ›") :cyan) text))
+    (bt:with-lock-held (*turn-lock*)
+      (setf *queue* (append *queue* (list text)))
+      (bt:condition-notify *turn-cv*))))
+
 (defun ui-submit (sess)
   (let ((line (string-trim " " *buf*)))
     (cond
@@ -1268,7 +1282,8 @@ to start a new chat with that person, or a chat name / group id for an existing 
 (defun banner-model ()
   "Model and backend for the banner, e.g. \"· deepseek/... · openrouter\"."
   (format nil "· ~A~@[ · ~A~]" (model-label)
-          (case llm:*llm-backend* (:openrouter "openrouter") (:routstr "routstr"))))
+          (case llm:*llm-backend* (:openrouter "openrouter") (:routstr "routstr")
+                                  (:ppq (if llm:*confidential* "ppq confidential" "ppq")))))
 
 (defun ui-banner (sess)
   (emit (format nil "~A ~A~%~A~%~A~%"
@@ -1352,8 +1367,12 @@ to start a new chat with that person, or a chat name / group id for an existing 
 (defun resume-command (sess)
   "The shell command that brings SESS back, model flag included — a bare
    --resume would reopen it on the default backend, not the one it ran on."
-  (format nil "operandi~@[ --openrouter ~A~]~@[ --effort ~A~] --resume ~A tui"
-          (and (member llm:*llm-backend* '(:openrouter :routstr)) llm:*llm-model*)
+  (format nil "operandi~@[ ~A ~A~]~@[ --effort ~A~] --resume ~A tui"
+          (case llm:*llm-backend*
+            (:ppq (if llm:*confidential* "--confidential --ppq" "--ppq"))
+            ((:openrouter :routstr) "--openrouter")
+            (t nil))
+          (and (member llm:*llm-backend* '(:openrouter :routstr :ppq)) llm:*llm-model*)
           (and llm:*llm-effort* (effort-label))
           (gethash :id sess)))
 

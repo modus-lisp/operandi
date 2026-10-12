@@ -40,6 +40,7 @@
   (case llm:*llm-backend*
     (:openrouter (or llm:*llm-model* "openrouter"))
     (:routstr (or llm:*llm-model* "routstr"))
+    (:ppq (or llm:*llm-model* "ppq"))
     (t "llama.cpp")))
 
 (defun session-id ()

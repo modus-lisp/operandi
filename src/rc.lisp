@@ -14,7 +14,8 @@
 
 (defpackage #:operandi.rc
   (:use #:cl)
-  (:export #:rc #:enable #:create-chat-with #:disable #:active-p #:status-chat #:mirror-turn))
+  (:export #:rc #:enable #:create-chat-with #:disable #:active-p #:status-chat #:mirror-turn
+           #:set-inbound #:*mention*))
 
 (in-package #:operandi.rc)
 
@@ -43,6 +44,64 @@
                        (concatenate 'string home "account.sexp"))))
     (length (funcall (find-symbol "ACCOUNT-OUTBOX" "CL-MARMOT") acct))))
 
+(defvar *on-inbound* nil
+  "Called with the message text (the part after the @operandi mention is NOT stripped)
+when a chat member sends a message that mentions @operandi.  The TUI sets this to
+queue a turn.  NIL means inbound messages are ignored.")
+
+(defvar *mention* nil
+  "The token a chat message must contain to drive a turn: \"@\" plus this run's
+ephemeral id (see %NEW-MENTION).  NIL when not mirroring.")
+
+(defun %new-mention ()
+  "A fresh per-run mention token, e.g. \"@op-7k3q9z\".  Random, so each run's id is unique."
+  (format nil "@op-~(~36R~)" (random (expt 36 6) (make-random-state t))))
+
+(defun %inbound-text (content)
+  "The message CONTENT if it is an inbound request: it contains *MENTION* and is not
+one of our own '> prompt' mirrors.  NIL otherwise."
+  (when (and (stringp content) *mention*
+             (not (uiop:string-prefix-p ">" (string-left-trim '(#\Space #\Tab #\Newline) content)))
+             (search *mention* content :test #'char-equal))
+    (string-trim '(#\Space #\Tab #\Newline) content)))
+
+(defvar *pending-inbound* '()
+  "Inbound requests that arrived before a consumer was attached (cl-marmot's sync
+consumes a message once, so it must not be dropped).  Oldest first.")
+
+(defvar *inbound-lock* (bt:make-lock "rc-inbound"))
+
+(defun %deliver-inbound (text)
+  "Hand TEXT to *ON-INBOUND*, or hold it in *PENDING-INBOUND* until a consumer exists."
+  (let ((fn (bt:with-lock-held (*inbound-lock*)
+              (or *on-inbound*
+                  (progn (setf *pending-inbound* (append *pending-inbound* (list text)))
+                         nil)))))
+    (when fn (funcall fn text))))
+
+(defun set-inbound (fn)
+  "Attach FN as the inbound consumer and flush anything that arrived before it."
+  (let ((backlog (bt:with-lock-held (*inbound-lock*)
+                   (setf *on-inbound* fn)
+                   (prog1 *pending-inbound* (setf *pending-inbound* '())))))
+    (when fn (dolist (text backlog) (funcall fn text)))
+    fn))
+
+(defun %on-event (event)
+  "cl-marmot handler: forward inbound chat messages that mention *MENTION* on.
+Our own messages are skipped (they are the mirrors)."
+  (let ((msg (funcall (%marmot "EVENT-MESSAGE") event)))
+    (when (and (eq (funcall (%marmot "EVENT-TYPE") event) :message)
+               msg
+               (not (funcall (%marmot "MESSAGE-OWN-P") msg)))
+      (let ((text (%inbound-text (funcall (%marmot "MESSAGE-CONTENT") msg))))
+        (when text (%deliver-inbound text))))))
+
+(defun %start-sync ()
+  "Run cl-marmot's background sync on the open client so inbound messages arrive."
+  (%call "ADD-HANDLER" *client* #'%on-event)
+  (%call "START" *client* :serve nil))
+
 (defun active-p () (and *client* *chat* t))
 
 (defun status-chat () *chat-name*)
@@ -51,6 +110,7 @@
   "Stop mirroring and close the cl-marmot account.  Returns T if it was on."
   (let ((was (active-p)))
     (when *client*
+      (ignore-errors (%call "STOP" *client*))
       (ignore-errors (%call "CLOSE-ACCOUNT" *client*)))
     ;; The ephemeral identity's keys and group state go with the run, EXCEPT when a
     ;; Welcome is still owed (outbox non-empty): that home is the only copy, so keep
@@ -61,7 +121,7 @@
             (format *error-output* "~&rc: ~D Welcome~:P still undelivered; kept identity in ~A~%"
                     owed *ephemeral-home*)
             (ignore-errors (uiop:delete-directory-tree (pathname *ephemeral-home*) :validate t)))))
-    (setf *client* nil *chat* nil *chat-name* nil *ephemeral-home* nil)
+    (setf *client* nil *chat* nil *chat-name* nil *ephemeral-home* nil *mention* nil)
     was))
 
 (defun enable (chat)
@@ -91,7 +151,8 @@ Returns the chat's display name."
       (setf *client* client
             *chat* chat
             *chat-name* (let ((n (%call "CHAT-NAME" found)))
-                          (if (plusp (length n)) n (%call "CHAT-ID" found)))))
+                          (if (plusp (length n)) n (%call "CHAT-ID" found))))
+      (%start-sync))
     *chat-name*))
 
 (defparameter *ephemeral-relays*
@@ -124,7 +185,9 @@ chat's display name.  On failure the temp home is removed and an error is signal
             (setf *client* client
                   *ephemeral-home* home
                   *chat* (%call "CHAT-ID" chat)
-                  *chat-name* (if (plusp (length name)) name invitee))
+                  *chat-name* (if (plusp (length name)) name invitee)
+                  *mention* (%new-mention))
+            (%start-sync)
             *chat-name*))
       (error (e)
         (when client (ignore-errors (%call "CLOSE-ACCOUNT" client)))

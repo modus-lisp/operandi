@@ -138,6 +138,13 @@
         ((string-equal model "llama") (llm:with-llama (funcall thunk)))
         ((and (find #\/ model) (eq llm:*llm-backend* :routstr))
          (llm:with-routstr (:model model) (funcall thunk)))
+        ;; A worker on :PPQ stays on it, and stays in the same mode: under
+        ;; --confidential it stays Path A, and a model that is not private/*
+        ;; is refused by WITH-PPQ rather than quietly becoming a plaintext
+        ;; OpenRouter call.  Without --confidential it is an ordinary hosted
+        ;; call, so any PPQ model id is fine.
+        ((eq llm:*llm-backend* :ppq)
+         (llm:with-ppq (:model model :confidential llm:*confidential*) (funcall thunk)))
         ((find #\/ model) (llm:with-openrouter (:model model) (funcall thunk)))
         (t (funcall thunk))))
 

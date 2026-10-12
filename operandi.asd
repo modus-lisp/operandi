@@ -20,6 +20,9 @@
   :depends-on ("json-simple"
                "seal/http"      ; pure-CL HTTP/TLS (on natrium) -- replaced dexador, which was
                                 ; the only way FFI entered this stack (cl+ssl, iolib, static-vectors)
+               "cl-sev-snp"     ; AMD SEV-SNP / AWS Nitro attestation verification, pure CL --
+                                ; what makes :PPQ --confidential a local trust decision, not a promise
+               "cl-sev-snp/kds" ; ...plus the AMD KDS fetch for the ARK/ASK chain
                "babel"
                "quri"
                "cl-base64"
@@ -36,7 +39,8 @@
     ((:file "text")                                           ; operandi.text
      (:file "http")                                           ; operandi.http
      (:file "payments" :depends-on ("http"))                  ; operandi.payments
-     (:file "llm"      :depends-on ("http"))                  ; operandi.llm
+     (:file "ppq"      :depends-on ("http"))                  ; operandi.ppq
+     (:file "llm"      :depends-on ("http" "ppq"))            ; operandi.llm
      (:file "actor")                                          ; operandi.actor
      (:file "store")                                          ; operandi.store
      (:file "search"   :depends-on ("http" "llm"))            ; operandi.search

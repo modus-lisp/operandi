@@ -31,8 +31,12 @@
            #:image-part #:text-part #:user-content #:content-text #:content-images
            #:image-file-p
            #:set-backend-openrouter! #:set-backend-llama! #:set-backend-routstr!
-           #:with-llama #:with-openrouter #:with-routstr #:openrouter-credits
-           #:cloud-backend-p
+           #:set-backend-ppq!
+           #:with-llama #:with-openrouter #:with-routstr #:with-ppq
+           #:openrouter-credits
+           #:cloud-backend-p #:*sealed-post* #:post-chat
+           #:*confidential* #:confidential-backend-p
+           #:enable-confidential! #:require-confidential!
            #:*usage-sink* #:usage #:make-usage #:copy-usage
            #:usage-calls #:usage-prompt-tokens #:usage-completion-tokens
            #:usage-cost-usd #:usage-cached-tokens #:with-usage-accounting
@@ -112,12 +116,71 @@
    *llm-model* must be set. Use USE-OPENROUTER to flip.
    :ROUTSTR = Routstr (api.routstr.com/v1, OpenAI-compatible, Cashu-paid).
    Same request shape as OpenRouter; the bearer token is a Cashu token or
-   an sk- API key.")
+   an sk- API key.
+   :PPQ = PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/Lightning.  By
+   default it is an ordinary hosted provider: *llm-model* is any PPQ model id
+   and the request goes out in the clear, exactly like OpenRouter.
+   With *CONFIDENTIAL* bound true (the --confidential flag) it becomes Path A
+   only: *llm-model* must be a private/* id, every request is EHBP-sealed to
+   the HPKE key of an AMD-attested Tinfoil enclave verified locally against
+   the pinned AMD ARK, and there is NO fallback — an unverifiable enclave or a
+   plaintext answer is an error, not a downgrade.  See OPERANDI.PPQ.")
 
 (defun cloud-backend-p (&optional (backend *llm-backend*))
   "True for hosted backends that speak OpenRouter's request dialect
-   (usage accounting, reasoning.effort): :OPENROUTER and :ROUTSTR."
-  (member backend '(:openrouter :routstr)))
+   (usage accounting, reasoning.effort): :OPENROUTER and :ROUTSTR — and
+   :PPQ, which is hosted and metered too (it just may seal the body)."
+  (member backend '(:openrouter :routstr :ppq)))
+
+(defvar *confidential* nil
+  "When true, the current backend must be able to prove it is talking to a
+   measured enclave, and every request must be sealed to it.  Set by the
+   --confidential flag (and by WITH-PPQ :CONFIDENTIAL T).
+
+   This is a property of the SESSION, not of the backend: it is what turns
+   :PPQ from \"a hosted provider\" into \"Path A only, no fallback\".  It is
+   deliberately separate from the backend choice so that a caller can say
+   \"I do not care which provider, but I do care that it is attested\" and
+   have that be a checkable claim rather than a naming convention.")
+
+(defun confidential-backend-p (&optional (backend *llm-backend*))
+  "True when BACKEND can actually satisfy *CONFIDENTIAL*.  Only :PPQ can: it
+   is the one backend whose transport we can seal to a locally verified
+   enclave.  :OPENROUTER, :ROUTSTR and :LLAMA cannot, so --confidential with
+   any of them is a configuration error, not a silent downgrade."
+  (eq backend :ppq))
+
+(defun enable-confidential! ()
+  "Turn on confidential mode for the current session (the --confidential flag).
+
+   If the backend is already :PPQ, this also (re)installs the sealer and
+   re-checks that the current model is a private/* id — so `--ppq X
+   --confidential` and `--confidential --ppq X` behave identically.  On any
+   other backend it just sets the flag; REQUIRE-CONFIDENTIAL! then fails the
+   run at startup rather than letting plaintext out."
+  (setf *confidential* t)
+  (when (eq *llm-backend* :ppq)
+    (unless (operandi.ppq:confidential-p *llm-model*)
+      (error "confidential mode: ~s is not a private/* model — Path B (PPQ's own \
+enclave, plaintext upstream) is not allowed. Use --ppq private/<model>."
+             *llm-model*))
+    (setf *llm-url* (format nil "~A/v1/chat/completions" operandi.ppq:*ppq-private-base*)
+          *sealed-post* (lambda (url body headers)
+                          (operandi.ppq:sealed-post
+                           url body headers :base operandi.ppq:*ppq-private-base*
+                           :model (operandi.ppq:ppq-wire-model *llm-model*)))))
+  t)
+
+(defun require-confidential! ()
+  "Signal unless the current backend can honour *CONFIDENTIAL*.  Called at
+   startup so that `--confidential --openrouter ...` fails immediately and
+   loudly instead of quietly sending plaintext for the whole session."
+  (when (and *confidential* (not (confidential-backend-p)))
+    (error "confidential mode is not available on the ~(~a~) backend: only PPQ \
+can seal a request to a locally verified enclave. Use --confidential --ppq \
+private/<model>, or drop --confidential."
+           *llm-backend*))
+  t)
 
 (defparameter *llm-effort* nil
   "Reasoning effort for the AGENT LOOP: NIL (leave it to the provider/model
@@ -264,25 +327,67 @@
    timeout) before giving up. Backoff is exponential. A provider 429 must not
    kill a whole scan/report — it usually clears within a few seconds.")
 
+(defvar *sealed-post* nil
+  "When bound to a function, %LLM-POST hands the request to it instead of
+   sending it in the clear.  The function is called (URL BODY HEADERS) and
+   returns the response body as a string.  This is how confidential :PPQ seals
+   every request to a verified enclave without the call sites knowing: the
+   body is built exactly as for any other backend, and the transport is what
+   changes.  NIL means an ordinary HTTP POST.")
+
 (defun %llm-post (url body headers)
   "POST a chat completion with retry + exponential backoff on transient
    failures. Retries HTTP 429 and 5xx and network/timeout errors; resignals
-   non-transient failures (4xx other than 429) immediately."
-  (let ((attempt 0))
-    (loop
-      (handler-case
-          (return (http:post url :content body :headers headers
-                                 :read-timeout *llm-read-timeout*))
-        (http:http-request-failed (e)
-          (let ((code (ignore-errors (http:response-status e))))
-            (if (and (or (eql code 429) (and (integerp code) (>= code 500)))
-                     (< attempt *llm-max-retries*))
-                (progn (sleep (min 30 (* 3 (expt 2 attempt)))) (incf attempt))
-                (error e))))           ; 4xx (not 429) etc. — not recoverable
-        (error (e)                      ; network / read-timeout — transient
-          (if (< attempt *llm-max-retries*)
-              (progn (sleep (min 30 (* 3 (expt 2 attempt)))) (incf attempt))
-              (error e)))))))
+   non-transient failures (4xx other than 429) immediately.
+
+   When *SEALED-POST* is bound, the request goes through it (EHBP-sealed to an
+   attested enclave) and the retry policy is the sealer's business — it has
+   its own, and it must not be retried here, because a refusal from the
+   sealer is a trust decision, not a transient network fault."
+  (if *sealed-post*
+      (funcall *sealed-post* url body headers)
+      (progn
+        ;; Belt and braces: *CONFIDENTIAL* is a promise that the body is
+        ;; sealed, so a plaintext POST while it is set is a bug in the caller,
+        ;; not a request to send.  Fail here rather than leak the prompt.
+        (when *confidential*
+          (error "confidential mode is on but no sealer is installed — refusing to send ~
+                  a plaintext request to ~A" url))
+        (let ((attempt 0))
+        (loop
+          (handler-case
+              (return (http:post url :content body :headers headers
+                                     :read-timeout *llm-read-timeout*))
+            (http:http-request-failed (e)
+              (let ((code (ignore-errors (http:response-status e))))
+                (if (and (or (eql code 429) (and (integerp code) (>= code 500)))
+                         (< attempt *llm-max-retries*))
+                    (progn (sleep (min 30 (* 3 (expt 2 attempt)))) (incf attempt))
+                    (error e))))           ; 4xx (not 429) etc. — not recoverable
+            (error (e)                      ; network / read-timeout — transient
+              (if (< attempt *llm-max-retries*)
+                  (progn (sleep (min 30 (* 3 (expt 2 attempt)))) (incf attempt))
+                  (error e)))))))))
+
+(defun post-chat (url body headers &key want-stream)
+  "The single transport for a chat completion, so that EVERY caller — the
+   engine's blocking and streaming paths as well as LLM-CHAT — goes through
+   the same door.  When *SEALED-POST* is bound (confidential :PPQ)
+   the body is EHBP-sealed to a locally verified enclave and the response is
+   decrypted; otherwise it is an ordinary HTTP POST.
+
+   WANT-STREAM asks for the raw response stream (SSE).  A sealer cannot
+   stream — the whole body is one encrypted frame — so asking for a stream
+   under a sealer is a programming error, not something to paper over."
+  (if *sealed-post*
+      (progn
+        (when want-stream
+          (error "post-chat: the sealed (confidential :ppq) transport cannot stream; \
+call with :want-stream nil"))
+        (funcall *sealed-post* url body headers))
+      (http:post url :content body :headers headers
+                     :read-timeout *llm-read-timeout*
+                     :want-stream want-stream)))
 
 (defun llm-chat (prompt &key system
                              (max-tokens *llm-default-max-tokens*)
@@ -316,7 +421,9 @@
     (when *llm-model*
       (setf (gethash "model" body-ht) *llm-model*))
     ;; OpenRouter only reports real USD cost when asked; harmless to llama.
-    (when (cloud-backend-p)
+    ;; Not sent to confidential :PPQ — the enclave's OpenAI dialect is not
+    ;; OpenRouter's, and an unknown field is a 400 we would have to debug.
+    (when (member *llm-backend* '(:openrouter :routstr))
       (setf (gethash "usage" body-ht) (ht "include" t)))
     (loop for (k v) on extra by #'cddr
           do (setf (gethash (string-downcase (string k)) body-ht) v))
@@ -387,7 +494,8 @@
              *llm-url*        "https://openrouter.ai/api/v1/chat/completions"
              *llm-auth-token* token
              *llm-model*      model
-             *llm-read-timeout* 240)
+             *llm-read-timeout* 240
+             *sealed-post*    nil)
        t))))
 
 (defparameter *routstr-url* "https://routstr.cypherpunk.today/v1/chat/completions"
@@ -417,8 +525,101 @@
              *llm-url*        *routstr-url*
              *llm-auth-token* token
              *llm-model*      model
-             *llm-read-timeout* 240)
+             *llm-read-timeout* 240
+             *sealed-post*    nil)
        t))))
+
+(defun set-backend-ppq! (&key (model "private/gpt-oss-120b")
+                              confidential
+                              (base operandi.ppq:*ppq-base*)
+                              (private-base operandi.ppq:*ppq-private-base*)
+                              (token-file operandi.ppq:*ppq-token-file*))
+  "Switch the LLM client to PPQ.
+
+   Without CONFIDENTIAL this is an ordinary hosted provider: MODEL is any PPQ
+   model id (gpt-6.1-sol, claude-sonnet-5.5, …) and requests go out in the
+   clear to BASE, exactly as they would to OpenRouter.
+
+   With CONFIDENTIAL, MODEL must be a `private/<name>` id and every request is
+   EHBP-sealed to the HPKE key of an AMD-attested Tinfoil enclave, verified
+   locally against the pinned AMD ARK before the first byte is sent.  A
+   non-private model is refused HERE rather than at request time, so a
+   misconfiguration fails at startup instead of silently sending plaintext.
+
+   Returns T on success, NIL if the token file is missing or empty."
+  (let ((token (read-token-file token-file))
+        ;; --confidential may have been given BEFORE --ppq (the natural order
+        ;; is `--confidential --ppq private/x`), so the session flag wins over
+        ;; the keyword: once confidential mode is on, choosing a backend must
+        ;; not silently turn it off.
+        (conf (or confidential *confidential*)))
+    (cond
+      ((or (null token) (zerop (length token)))
+       (format *error-output* "~&set-backend-ppq!: token file ~A missing or empty~%"
+               token-file)
+       nil)
+      ((and conf (not (operandi.ppq:confidential-p model)))
+       (format *error-output*
+               "~&set-backend-ppq!: ~s is not a private/* model — Path B is not allowed under --confidential~%"
+               model)
+       nil)
+      (t
+       (setf *llm-backend*    :ppq
+             *llm-url*        (format nil "~A/v1/chat/completions"
+                                      (if conf private-base base))
+             *llm-auth-token* token
+             *llm-model*      model
+             *llm-read-timeout* 240
+             *confidential*   conf
+             ;; The sealer is what makes confidential mode what it is.  Setting
+             ;; the mode WITHOUT it would send the body in the clear — PPQ
+             ;; answers 400 "the Ehbp-Encapsulated-Key header is missing", so
+             ;; the failure is loud, but the point is that the two must never
+             ;; come apart.  (WITH-PPQ binds it dynamically; this is the
+             ;; global/CLI path, so it is setf'd.)
+             *sealed-post*    (and conf
+                                    (lambda (url body headers)
+                                      (operandi.ppq:sealed-post
+                                       url body headers :base private-base
+                                       :model (operandi.ppq:ppq-wire-model model)))))
+       t))))
+
+(defmacro with-ppq ((&key (model "private/gpt-oss-120b")
+                          confidential
+                          (base operandi.ppq:*ppq-base*)
+                          (private-base operandi.ppq:*ppq-private-base*)
+                          (token-file operandi.ppq:*ppq-token-file*))
+                    &body body)
+  "Run BODY with the LLM client switched to :PPQ.
+
+   With CONFIDENTIAL, MODEL must be a private/* id and the exchange is sealed
+   to a locally verified enclave; if the token is missing or MODEL is not
+   private/*, this SIGNALS — it does not fall through to the current backend,
+   because a silent downgrade to plaintext is exactly what confidential mode
+   exists to prevent.  Without CONFIDENTIAL it is an ordinary hosted call."
+  (let ((tok (gensym)) (tf (gensym)) (md (gensym)))
+    `(let* ((,tf ,token-file)
+            (,md ,model)
+            (,tok (read-token-file ,tf)))
+       (unless (and ,tok (plusp (length ,tok)))
+         (error "with-ppq: no PPQ API key at ~A" ,tf))
+       ,@(when confidential
+           `((unless (operandi.ppq:confidential-p ,md)
+               (error "with-ppq: ~s is not a private/* model — Path B is not allowed under :confidential t"
+                      ,md))))
+       (let ((*llm-backend* :ppq)
+             (*llm-url* (format nil "~A/v1/chat/completions"
+                                (if ,confidential ,private-base ,base)))
+             (*llm-auth-token* ,tok)
+             (*llm-model* ,md)
+             (*llm-read-timeout* 240)
+             (*confidential* (and ,confidential t))
+             (*sealed-post* (and ,confidential
+                                 (lambda (url body headers)
+                                   (operandi.ppq:sealed-post
+                                    url body headers :base ,private-base
+                                    :model (operandi.ppq:ppq-wire-model ,md))))))
+         ,@body))))
 
 (defun set-backend-llama! (&key (url "http://127.0.0.1:8081/v1/chat/completions"))
   "Switch the LLM client back to the local llama.cpp server."
@@ -426,7 +627,12 @@
         *llm-url*        url
         *llm-auth-token* nil
         *llm-model*      nil
-        *llm-read-timeout* 120)
+        *llm-read-timeout* 120
+        ;; Leaving a sealer installed would EHBP-seal a request to a backend
+        ;; that never asked for it.  The sealer belongs to confidential :PPQ
+        ;; alone, so every other backend switch clears it.
+        *sealed-post*    nil
+        *confidential*   nil)
   t)
 
 (defmacro with-llama (&body body)
@@ -439,7 +645,8 @@
          (*llm-url* "http://127.0.0.1:8081/v1/chat/completions")
          (*llm-auth-token* nil)
          (*llm-model* nil)
-         (*llm-read-timeout* 120))
+         (*llm-read-timeout* 120)
+         (*sealed-post* nil))
      ,@body))
 
 (defmacro with-openrouter ((&key (model "anthropic/claude-sonnet-4-5")
@@ -463,7 +670,8 @@
                 (*llm-url* "https://openrouter.ai/api/v1/chat/completions")
                 (*llm-auth-token* ,tok)
                 (*llm-model* ,model)
-                (*llm-read-timeout* 240))
+                (*llm-read-timeout* 240)
+                (*sealed-post* nil))
             ,@body))))))
 
 (defmacro with-routstr ((&key (model "gemini-3-6-flash")
@@ -487,5 +695,6 @@
                 (*llm-url* *routstr-url*)
                 (*llm-auth-token* ,tok)
                 (*llm-model* ,model)
-                (*llm-read-timeout* 240))
+                (*llm-read-timeout* 240)
+                (*sealed-post* nil))
             ,@body))))))

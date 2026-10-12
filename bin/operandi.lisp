@@ -135,7 +135,7 @@
 ;; Apply the configured default model unless the command line names a backend
 ;; explicitly (--openrouter, with or without a model; a bare --openrouter also
 ;; reads the config, below). Doing both would announce the backend twice.
-(let ((m (and (not (member-if (lambda (a) (member a '("--openrouter" "--routstr") :test #'string=))
+(let ((m (and (not (member-if (lambda (a) (member a '("--openrouter" "--routstr" "--ppq") :test #'string=))
                                  (uiop:command-line-arguments)))
               (config-default-model))))
   (when m
@@ -172,6 +172,38 @@
                       (cond (is-model (llm:set-backend-routstr! :model next) (setf acc (rest tail)))
                             (t (llm:set-backend-routstr!) (setf acc tail)))
                       (eng:apply-backend-defaults)))
+                   ((and acc (string= (first acc) "--ppq"))
+                    ;; PPQ, in one of two modes. A model here is any PPQ id
+                    ;; (gpt-6.1-sol, private/gpt-oss-120b, ...); a bare flag
+                    ;; takes the library default. Under --confidential the
+                    ;; backend refuses anything that is not private/*, so a
+                    ;; typo cannot silently become a plaintext Path B request.
+                    ;;
+                    ;; Unlike OpenRouter, PPQ ids are often slashless
+                    ;; (gpt-6.1-sol), so "has a slash" is not enough to tell a
+                    ;; model from the task: a token is taken as the model when
+                    ;; it has a slash, or when something follows it (the task).
+                    (let* ((tail (rest acc)) (next (first tail))
+                           (is-model (and next (not (find #\Space next))
+                                          (or (find #\/ next) (rest tail)))))
+                      (let ((ok (if is-model
+                                    (llm:set-backend-ppq! :model next)
+                                    (llm:set-backend-ppq!))))
+                        ;; A refused switch (no key, or a non-private model
+                        ;; under --confidential) must not fall through to
+                        ;; whatever backend was configured before — that is
+                        ;; exactly the silent downgrade this flag exists to
+                        ;; prevent.
+                        (unless ok (sb-ext:exit :code 2))
+                        (setf acc (if is-model (rest tail) tail)))
+                      (eng:apply-backend-defaults)))
+                   ((and acc (string= (first acc) "--confidential"))
+                    ;; Require that the exchange be attested. This is a
+                    ;; session-wide claim, not a backend: it is checked at
+                    ;; startup (below) and again on every request, and it
+                    ;; FAILS rather than downgrading to plaintext.
+                    (setf acc (rest acc))
+                    (llm:enable-confidential!))
                    ((and acc (string= (first acc) "--worker-model"))
                     (multiple-value-bind (m ok)
                         (funcall (find-symbol "PARSE-WORKER-MODEL" "OPERANDI.SUBAGENT") (second acc))
@@ -220,7 +252,15 @@
        ;; --tui and no argument at all are the same thing: the interactive TUI.
        (cmd (if tui-p "tui" (first args))))
   ;; Preflight the model on any path that will actually run a turn (not bare help).
-  (unless (equal cmd "--help") (preflight-or-die))
+  (unless (equal cmd "--help")
+    ;; A confidential session on a backend that cannot seal is a configuration
+    ;; error, and it must be fatal BEFORE the first turn — not a warning that
+    ;; scrolls past while plaintext goes out.
+    (handler-case (llm:require-confidential!)
+      (error (e)
+        (format *error-output* "~&operandi: ~A~%" e)
+        (sb-ext:exit :code 2)))
+    (preflight-or-die))
   (cond
     ;; --resume alone or with an explicit tui command → resumed interactive TUI
     ((and resume (or (null cmd) (member cmd '("tui" "shell" "repl") :test #'string-equal)))
@@ -244,6 +284,15 @@
      (format t "~%env: OPERANDI_MAX_TOKENS (per-turn output cap, default 16384),~%")
      (format t "     OPERANDI_CONTEXT_BUDGET (compaction threshold), OPERANDI_MAX_ITERS.~%")
      (format t "  operandi.lisp -- --routstr [MODEL] \"task\"   (Routstr: Cashu token in ~~/.operandi/routstr.token)~%")
+     (format t "  operandi.lisp -- --ppq [MODEL] \"task\"~%")
+     (format t "      PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/Lightning. MODEL is~%")
+     (format t "      any PPQ id (gpt-6.1-sol, claude-sonnet-5.5, ...); requests go out in~%")
+     (format t "      the clear, like OpenRouter. Key in ~~/.operandi/ppq.token.~%")
+     (format t "  operandi.lisp -- --confidential --ppq private/MODEL \"task\"~%")
+     (format t "      Path A only: MODEL must be private/*, and every request is EHBP-sealed~%")
+     (format t "      to an AMD-attested Tinfoil enclave verified locally against the pinned~%")
+     (format t "      AMD ARK. No fallback — an unverifiable enclave or a plaintext answer is~%")
+     (format t "      an error, not a downgrade. --confidential on any other backend fails.~%")
      (format t "~%--openrouter reads token from ~~/.operandi/openrouter.token.~%")
      (format t "Sessions are saved under ~~/.operandi/sessions/; --resume continues one.~%")
      (format t "Default backend is a local llama.cpp on http://127.0.0.1:8081.~%"))

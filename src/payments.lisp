@@ -14,7 +14,10 @@
   (:local-nicknames (#:json #:json-simple) (#:http #:operandi.http))
   (:export #:create-invoice #:poll-invoice #:await-payment #:request-payment
            #:render-terminal #:open-image #:payment-error
-           #:*routstr-node* #:*default-token-file*))
+           #:*routstr-node* #:*default-token-file*
+           ;; PPQ (ppq.ai) Lightning top-up -- same shape, different endpoint.
+           #:create-ppq-topup #:ppq-topup-status #:request-ppq-payment
+           #:ppq-token #:*ppq-api* #:*ppq-token-file*))
 
 (in-package #:operandi.payments)
 
@@ -28,6 +31,96 @@
 (defparameter *default-token-file*
   (merge-pathnames ".operandi/routstr.token" (user-homedir-pathname))
   "Where a paid api_key is stored for the :routstr backend.")
+
+;;; ---------------------------------------------------------------
+;;; PPQ (ppq.ai) -- Lightning top-up for an existing account
+;;; ---------------------------------------------------------------
+;;; PPQ sells API credit for Lightning: POST /topup/create/btc-lightning with
+;;; {"amount":N,"currency":"SATS"} returns a bolt11 invoice (100..1,000,000 sats,
+;;; 15-minute expiry); GET /topup/status/{invoice_id} reports payment.  Unlike
+;;; Routstr the invoice does not mint a key -- the account already has one -- so
+;;; there is nothing to store on payment.
+
+(defparameter *ppq-api* "https://api.ppq.ai"
+  "PPQ API base URL.")
+
+(defparameter *ppq-token-file*
+  (merge-pathnames ".operandi/ppq.token" (user-homedir-pathname))
+  "PPQ API key (sk-...), read-only; authorizes the top-up.")
+
+(defun ppq-token ()
+  "The PPQ API key from *PPQ-TOKEN-FILE* (first line, trimmed)."
+  (string-trim '(#\Space #\Tab #\Newline #\Return)
+               (with-open-file (s *ppq-token-file*)
+                 (or (read-line s nil nil) ""))))
+
+(defun %ppq-auth ()
+  (list (cons "Authorization" (format nil "Bearer ~A" (ppq-token)))))
+
+(defun create-ppq-topup (sats)
+  "Create a PPQ Lightning top-up invoice for SATS.  Returns a plist:
+   :invoice-id :bolt11 :amount :expires-at :checkout-url."
+  (unless (and (integerp sats) (<= 100 sats 1000000))
+    (error 'payment-error :message (format nil "PPQ amount must be 100..1000000 sats, got ~A" sats)))
+  (let* ((h (make-hash-table :test 'equal)))
+    (setf (gethash "amount" h) sats
+          (gethash "currency" h) "SATS")
+    (let* ((text (http:post (format nil "~A/topup/create/btc-lightning" *ppq-api*)
+                            :content (%json-body h)
+                            :headers (cons (cons "Content-Type" "application/json")
+                                           (%ppq-auth))
+                            :read-timeout 25))
+           (j (%parse text)))
+      (unless (gethash "lightning_invoice" j)
+        (error 'payment-error :message (format nil "PPQ top-up failed: ~A" text)))
+      (list :invoice-id (gethash "invoice_id" j)
+            :bolt11 (gethash "lightning_invoice" j)
+            :amount (gethash "amount" j)
+            :expires-at (gethash "expires_at" j)
+            :checkout-url (gethash "checkout_url" j)))))
+
+(defun ppq-topup-status (invoice-id)
+  "Status plist for a PPQ top-up: :status (\"paid\"/...), :raw."
+  (let* ((text (http:get (format nil "~A/topup/status/~A" *ppq-api* invoice-id)
+                         :headers (%ppq-auth)
+                         :read-timeout 20))
+         (j (ignore-errors (%parse text))))
+    (list :status (and (hash-table-p j)
+                       (or (gethash "status" j) (gethash "payment_status" j)))
+          :raw text)))
+
+(defun request-ppq-payment (sats &key (provider :terminal) (timeout 900)
+                                       (interval 5)
+                                       (out-path (merge-pathnames
+                                                  "ppq-invoice.png"
+                                                  (user-homedir-pathname))))
+  "Create a PPQ Lightning top-up for SATS, show its bolt11 as a QR code, and wait
+   for payment.  PROVIDER is :terminal (half-block QR) or :open (PNG in the image
+   viewer).  Returns the paid status plist, or NIL on timeout/expiry."
+  (let* ((inv (create-ppq-topup sats))
+         (bolt11 (getf inv :bolt11))
+         (id (getf inv :invoice-id)))
+    (format t "~&PPQ top-up: ~D sats~%invoice_id: ~A~%expires_at: ~A~%checkout:   ~A~%~%~A~%~%"
+            sats id (getf inv :expires-at) (getf inv :checkout-url) bolt11)
+    (ecase provider
+      (:terminal (render-terminal bolt11))
+      (:open (open-image (%write-qr-png bolt11 out-path))))
+    (format t "~&Waiting for payment (timeout ~Ds)...~%" timeout)
+    (let ((deadline (+ (get-universal-time) timeout)))
+      (loop
+        (let ((st (ppq-topup-status id)))
+          (when (and (stringp (getf st :status))
+                     (member (string-downcase (getf st :status))
+                             '("paid" "completed" "settled" "success")
+                             :test #'equal))
+            (format t "~&Paid.~%~A~%" (getf st :raw))
+            (return st)))
+        (when (> (get-universal-time) deadline)
+          (format t "~&No payment received.~%")
+          (return nil))
+        (princ ".")
+        (finish-output)
+        (sleep interval)))))
 
 (defun %json-body (hash)
   (json:stringify hash))

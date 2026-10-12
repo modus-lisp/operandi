@@ -28,19 +28,21 @@
   (:use #:cl)
   (:shadow #:get)
   (:export #:get #:post #:request
-           #:http-request-failed #:response-status #:response-body #:response-url))
+           #:http-request-failed #:response-status #:response-body #:response-url
+           #:response-headers))
 
 (in-package #:operandi.http)
 
 (define-condition http-request-failed (error)
   ((status :initarg :status :reader response-status)
    (body   :initarg :body   :reader response-body)
-   (url    :initarg :url    :reader response-url))
+   (url    :initarg :url    :reader response-url)
+   (headers :initarg :headers :initform nil :reader response-headers))
   (:report (lambda (c s)
              (let ((b (response-body c)))
                (format s "HTTP ~a from ~a~@[: ~a~]" (response-status c) (response-url c)
-                       (and (stringp b) (plusp (length b))
-                            (subseq b 0 (min 200 (length b)))))))))
+                       (cond ((not (stringp b)) nil)
+                             ((plusp (length b)) (subseq b 0 (min 200 (length b))))))))))
 
 (defparameter *error-body-cap* 65536
   "How much of a FAILED streamed response is read into the condition.  Error bodies are small;
@@ -66,10 +68,15 @@
                do (write-line line o) (incf n (1+ (length line)))))
     (ignore-errors (close stream))))
 
-(defun request (method url &key content headers (read-timeout 30) want-stream max-bytes)
+(defun request (method url &key content headers (read-timeout 30) want-stream max-bytes binary)
   "Perform METHOD against URL.  Returns the body as a string (plus the status and headers as
    further values), or with WANT-STREAM a character stream over the body that the caller must
-   close.  Signals HTTP-REQUEST-FAILED on any non-2xx status."
+   close.  Signals HTTP-REQUEST-FAILED on any non-2xx status.
+
+   BINARY returns the body as a (VECTOR (UNSIGNED-BYTE 8)) instead of a decoded string — for
+   payloads that are not text at all (an EHBP-sealed body, an attestation document).  The error
+   body of a failed request is still decoded as text, since that is what a provider's refusal
+   message is."
   (let ((body (%octets content)))
     (if want-stream
         (let* ((s (seal.http:open-request method url :headers headers :body body
@@ -82,15 +89,23 @@
         (let* ((r (seal.http:request method url :headers headers :body body
                                                 :timeout read-timeout :max-body max-bytes))
                (code (seal.http:response-status r))
-               (text (%text (seal.http:response-body r))))
+               (raw (seal.http:response-body r))
+               (text (%text raw)))
           (if (<= 200 code 299)
-              (values text code (seal.http:response-headers r))
-              (error 'http-request-failed :status code :body text :url url))))))
+              (values (if binary (coerce raw '(vector (unsigned-byte 8))) text)
+                      code (seal.http:response-headers r))
+              ;; A BINARY caller gets the raw octets in the condition too: its
+              ;; error body may itself be an encrypted frame, and decoding it as
+              ;; text would destroy the only copy of the bytes it needs.
+              (error 'http-request-failed
+                     :status code :url url
+                     :body (if binary (coerce raw '(vector (unsigned-byte 8))) text)
+                     :headers (seal.http:response-headers r)))))))
 
-(defun get (url &rest keys &key headers read-timeout want-stream max-bytes)
-  (declare (ignore headers read-timeout want-stream max-bytes))
+(defun get (url &rest keys &key headers read-timeout want-stream max-bytes binary)
+  (declare (ignore headers read-timeout want-stream max-bytes binary))
   (apply #'request "GET" url keys))
 
-(defun post (url &rest keys &key content headers read-timeout want-stream)
-  (declare (ignore content headers read-timeout want-stream))
+(defun post (url &rest keys &key content headers read-timeout want-stream binary)
+  (declare (ignore content headers read-timeout want-stream binary))
   (apply #'request "POST" url keys))

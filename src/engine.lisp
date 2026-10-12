@@ -880,8 +880,16 @@ another tool or give a final answer.")
                         (anthropic-model-p llm:*llm-model*))
                    (cache-control-system messages)
                    (coerce messages 'vector)))
-         (body (ht "messages" msgs "tools" tools-vec "tool_choice" "auto"
+         (body (ht "messages" msgs
                    "max_tokens" max-tokens "temperature" temperature)))
+    ;; An EMPTY tools array is not the same as no tools: vLLM (which is what
+    ;; serves the attested enclave) rejects `"tools": []` with a 400, and it
+    ;; rejects `tool_choice` without `tools` too.  Omit BOTH keys when there is
+    ;; nothing to offer — json-simple writes CL NIL as JSON false, not null, so
+    ;; "set it to nil" would send `"tool_choice": false`, which is also a 400.
+    (when (and (vectorp tools-vec) (plusp (length tools-vec)))
+      (setf (gethash "tools" body) tools-vec
+            (gethash "tool_choice" body) "auto"))
     (when stream
       (setf (gethash "stream" body) t)
       ;; ask providers to send a final usage chunk in the stream
@@ -891,7 +899,10 @@ another tool or give a final answer.")
     ;; explicit was chosen.
     (llm:apply-reasoning body (or llm:*llm-effort*
                                   (and *do-chat-disable-reasoning* :off)))
-    (when (llm:cloud-backend-p)                      ; cost/token accounting
+    ;; Cost/token accounting.  OpenRouter and Routstr want {"usage":{"include":true}};
+    ;; the enclave's OpenAI dialect does not know the field and 400s on it, so
+    ;; :PPQ is excluded (it reports usage unprompted anyway).
+    (when (member llm:*llm-backend* '(:openrouter :routstr))
       (setf (gethash "usage" body) (ht "include" t)))
     (when llm:*llm-model* (setf (gethash "model" body) llm:*llm-model*))
     body))
@@ -899,13 +910,12 @@ another tool or give a final answer.")
 (defun do-chat-blocking (messages tools-vec &key (max-tokens *do-chat-max-tokens*)
                                                  (temperature 0.0))
   "One blocking chat completion. Returns the parsed top-level hash table."
-  (let ((resp (http:post llm:*llm-url*
-                         :content (with-output-to-string (s)
-                                    (json:stringify (build-chat-body messages tools-vec
-                                                                     max-tokens temperature nil)
-                                                    :stream s))
-                         :headers (chat-headers)
-                         :read-timeout llm:*llm-read-timeout*)))
+  (let ((resp (llm:post-chat llm:*llm-url*
+                            (with-output-to-string (s)
+                              (json:stringify (build-chat-body messages tools-vec
+                                                               max-tokens temperature nil)
+                                              :stream s))
+                            (chat-headers))))
     (json:parse resp)))
 
 (defun parse-sse-line (line)
@@ -999,15 +1009,24 @@ another tool or give a final answer.")
   "Streaming chat completion. Reads the SSE deltas, feeds CONTENT tokens to
    *ON-TOKEN* as they arrive, and returns the assembled response in the SAME
    shape as the blocking path. Closes the stream on any exit — including a
-   Ctrl-C mid-generation."
-  (let ((stream (http:post llm:*llm-url*
-                           :content (with-output-to-string (s)
-                                      (json:stringify (build-chat-body messages tools-vec
-                                                                       max-tokens temperature t)
-                                                      :stream s))
-                           :headers (chat-headers)
-                           :read-timeout llm:*llm-read-timeout*
-                           :want-stream t))
+   Ctrl-C mid-generation.
+
+   Under the sealed (confidential :PPQ) transport there is no SSE to read: the
+   request body is one EHBP frame and the response is one encrypted frame, so
+   the whole answer arrives at once.  Rather than send a plaintext request
+   (which would defeat the backend) or fail, fall back to the blocking path —
+   same return shape, no incremental tokens."
+  (when llm:*sealed-post*
+    (return-from do-chat-stream
+      (do-chat-blocking messages tools-vec :max-tokens max-tokens
+                                            :temperature temperature)))
+  (let ((stream (llm:post-chat llm:*llm-url*
+                               (with-output-to-string (s)
+                                 (json:stringify (build-chat-body messages tools-vec
+                                                                  max-tokens temperature t)
+                                                 :stream s))
+                               (chat-headers)
+                               :want-stream t))
         (state (make-sse-state)))
     (unwind-protect
          (loop for line = (read-line stream nil :eof)

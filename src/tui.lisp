@@ -1446,7 +1446,9 @@ Queues it as the next turn (behind any in-flight turn), like typed input.  Takes
             (or (uiop:getenv "OPERANDI_FANCY_TUI") (operandi.rc:active-p))
             (raw-mode-available-p))
        (handler-case (repl-concurrent sess :greet greet :resume resume :resumed resumed)
-         (error ()
+         (error (e)
+           ;; Say why: falling back silently to repl-simple drops inbound (--rc) chat turns.
+           (format *error-output* "~&operandi: interactive UI failed (~A); using the simple REPL, which does NOT take chat (--rc) turns~%" e)
            (ignore-errors (raw-off))
            (setf *ui-out* (lambda (s) (write-string s) (force-output)))
            (repl-simple sess :greet greet :resume resume :resumed resumed))))

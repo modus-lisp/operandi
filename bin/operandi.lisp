@@ -236,7 +236,12 @@
                                  (not (uiop:string-prefix-p "--" (second acc))))
                       (format *error-output* "operandi: --rc takes an npub, nprofile, NIP-05, chat name or group id~%")
                       (sb-ext:exit :code 2))
-                    (handler-case (funcall (find-symbol "RC" "OPERANDI.RC") (second acc))
+                    (handler-case
+                        (let ((name (funcall (find-symbol "RC" "OPERANDI.RC") (second acc))))
+                          (format t "~&→ rc: mirroring turns to ~A~%" name)
+                          ;; Same as /rc in the TUI: the invitee needs this token to drive a turn.
+                          (format t "~&  tell them to write ~A in the chat to drive a turn~%"
+                                  (symbol-value (find-symbol "*MENTION*" "OPERANDI.RC"))))
                       (error (e)
                         (format *error-output* "operandi: --rc: ~A~%" e)
                         (sb-ext:exit :code 2)))

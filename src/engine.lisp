@@ -1283,7 +1283,14 @@ another tool or give a final answer.")
          (*subagents* (make-hash-table :test 'equal))
          (sf:*fetch-history* (make-hash-table :test 'equal))
          (sf:*fetch-raw-cache* (make-hash-table :test 'equal))
-         (*live-messages* messages))
+         (*live-messages* messages)
+         ;; Calibrated and set DURING the run: bound here so those SETFs land
+         ;; in this run's binding.  On modus a run is often an actor (an ACP
+         ;; session), and storing its freshly consed double / pathname into the
+         ;; global is refused ("a thread stored one of its own objects into
+         ;; shared memory") -- every real-backend turn ended in refusal.
+         (*chars-per-token* *chars-per-token*)
+         (*last-offload-path* nil))
     (declare (special hooks:*current-run-id*
                        tools:*file-read-state*
                        tools:*todos*

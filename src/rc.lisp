@@ -58,12 +58,18 @@ ephemeral id (see %NEW-MENTION).  NIL when not mirroring.")
   "A fresh per-run mention token, e.g. \"@op-7k3q9z\".  Random, so each run's id is unique."
   (format nil "@op-~(~36R~)" (random (expt 36 6) (make-random-state t))))
 
-(defun %inbound-text (content)
-  "The message CONTENT if it is an inbound request: it contains *MENTION* and is not
-one of our own '> prompt' mirrors.  NIL otherwise."
+(defun %mentions-us-p (content npub)
+  "True if CONTENT addresses us: it contains *MENTION* or our NPUB (WhiteNoise rewrites
+a typed @token into an @npub1… mention, so both forms count)."
+  (or (and *mention* (search *mention* content :test #'char-equal))
+      (and npub (search npub content :test #'char-equal))))
+
+(defun %inbound-text (content &optional npub)
+  "The message CONTENT if it is an inbound request: it mentions us (see %MENTIONS-US-P)
+and is not one of our own '> prompt' mirrors.  NIL otherwise."
   (when (and (stringp content) *mention*
              (not (uiop:string-prefix-p ">" (string-left-trim '(#\Space #\Tab #\Newline) content)))
-             (search *mention* content :test #'char-equal))
+             (%mentions-us-p content npub))
     (string-trim '(#\Space #\Tab #\Newline) content)))
 
 (defvar *pending-inbound* '()
@@ -95,7 +101,8 @@ Our own messages are skipped (they are the mirrors)."
     (when (and (eq (funcall (%marmot "EVENT-TYPE") event) :message)
                msg
                (not (funcall (%marmot "MESSAGE-OWN-P") msg)))
-      (let ((text (%inbound-text (funcall (%marmot "MESSAGE-CONTENT") msg))))
+      (let ((text (%inbound-text (funcall (%marmot "MESSAGE-CONTENT") msg)
+                                 (ignore-errors (%call "NPUB" *client*)))))
         (when text (%deliver-inbound text))))))
 
 (defun %start-sync ()

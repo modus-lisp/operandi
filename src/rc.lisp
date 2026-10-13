@@ -103,7 +103,17 @@ Our own messages are skipped (they are the mirrors)."
                (not (funcall (%marmot "MESSAGE-OWN-P") msg)))
       (let ((text (%inbound-text (funcall (%marmot "MESSAGE-CONTENT") msg)
                                  (ignore-errors (%call "NPUB" *client*)))))
-        (when text (%deliver-inbound text))))))
+        (when text
+          (%react-eyes msg)
+          (%deliver-inbound text))))))
+
+(defun %react-eyes (msg)
+  "Acknowledge an accepted request with a :eyes: reaction (NIP-25 kind 7, content \"👀\")
+on MSG, so the sender sees it was picked up.  Best-effort: a failure is ignored."
+  (ignore-errors
+   (%call "SEND" *client* *chat* "👀"
+          :kind 7
+          :tags (list (list "e" (funcall (%marmot "MESSAGE-ID") msg))))))
 
 (defun %start-sync ()
   "Run cl-marmot's background sync on the open client so inbound messages arrive."

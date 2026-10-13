@@ -150,7 +150,7 @@ Returns the chat's display name."
                                    (if (plusp (length n)) n (%call "CHAT-ID" c))))
                    '("none"))))
       (setf *client* client
-            *chat* chat
+            *chat* found
             *chat-name* (let ((n (%call "CHAT-NAME" found)))
                           (if (plusp (length n)) n (%call "CHAT-ID" found)))
             *mention* (%new-mention))

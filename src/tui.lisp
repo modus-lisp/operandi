@@ -1165,9 +1165,12 @@ to start a new chat with that person, or a chat name / group id for an existing 
 (defun rc-inbound (text)
   "Called from the cl-marmot sync thread with a chat message that mentions this run's
 mention token (operandi.rc:*mention*, e.g. @op-7k3q9z).
-Queues it as the next turn (behind any in-flight turn), like typed input.  Takes only
-*turn-lock*; the echo goes through EMIT, which takes *ui-lock*, so it runs outside it."
+Queues it as the next turn (behind any in-flight turn), like typed input.  When idle,
+restores the agent cursor first (as UI-SUBMIT does) so the echo is not written onto the
+input row and erased by the next repaint.  The echo goes through EMIT, which takes
+*ui-lock*, so it runs outside it."
   (let ((busy *turn-active*))
+    (unless busy (bt:with-lock-held (*ui-lock*) (resume-agent)))
     (ui-freshline)
     (emit (format nil "~%~A ~A~%~%" (paint (if busy "⧗ queued (chat) ›" "chat ›") :cyan) text))
     (bt:with-lock-held (*turn-lock*)

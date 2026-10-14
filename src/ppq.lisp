@@ -52,6 +52,7 @@
            #:*tinfoil-base* #:*tinfoil-attestation-url* #:*tinfoil-token-file*
            #:ppq-error #:ppq-error-reason
            #:ppq-token #:ppq-model-p #:ppq-wire-model #:confidential-p
+           #:*routstr-tinfoil-prefix* #:routstr-confidential-p #:routstr-wire-model
            #:verify-attested-key
            #:sealed-post #:plain-post #:ppq-post #:ppq-chat #:tinfoil-chat
            #:attestation-status))
@@ -174,6 +175,54 @@
    the model NAME, so the choice of path is explicit at the call site instead
    of a lookup table we would have to keep in sync with PPQ's catalogue."
   (ppq-model-p model))
+
+;;; ---- Routstr's Tinfoil models ----------------------------------------------
+;;;
+;;; Routstr is a network of independent Lightning-paid nodes.  A node that
+;;; carries Tinfoil models exposes them as `tinfoil-<name>` and forwards EHBP
+;;; bodies to the enclave as a BLIND RELAY: it never holds a key, it never
+;;; decrypts, and it bills from the X-Tinfoil-Usage-Metrics header the enclave
+;;; returns outside the sealed body (routstr/upstream/tinfoil.py: "Routstr acts
+;;; as a blind relay: it forwards the opaque encrypted body, never sees
+;;; plaintext").
+;;;
+;;; That makes the trust story identical to PPQ's Path A: we verify the
+;;; enclave's AMD SEV-SNP bundle against the pinned AMD ARK, seal to the HPKE
+;;; key bound into report_data[32:64], and require an Ehbp-Response-Nonce back.
+;;; The node is on the path but not in the trust set — it can drop the request,
+;;; it cannot read it, and it cannot answer it, because only the enclave holds
+;;; the private key that opens our sealed body.
+;;;
+;;; The one thing the node DOES control is where the sealed body is forwarded
+;;; (X-Tinfoil-Enclave-Url, restricted by the node to *.tinfoil.sh).  That is
+;;; not a downgrade: a body sealed to the attested key is unreadable anywhere
+;;; else, so a misrouted request fails rather than leaks.  We do not send the
+;;; header at all, so the node uses its own configured enclave.
+
+(defparameter *routstr-tinfoil-prefix* "tinfoil-"
+  "The namespace a Routstr node puts on its Tinfoil-backed models.  It is the
+   node's own convention (routstr/upstream/ehbp.py: TINFOIL_MODEL_PREFIX), and
+   it is what tells us a model is served by the attested enclave rather than by
+   some ordinary upstream the node terminates in the clear.")
+
+(defun routstr-confidential-p (model)
+  "True when MODEL, as named on a Routstr node, is served by the attested
+   Tinfoil enclave — i.e. it carries the `tinfoil-` prefix.  Everything else a
+   node offers (e2ee-*, plain vendor ids) is terminated by the node itself and
+   is therefore NOT confidential, however the node markets it."
+  (and (stringp model)
+       (> (length model) (length *routstr-tinfoil-prefix*))
+       (string-equal *routstr-tinfoil-prefix* model
+                     :end2 (length *routstr-tinfoil-prefix*))))
+
+(defun routstr-wire-model (model)
+  "The model name the ENCLAVE expects inside the sealed body: MODEL with the
+   `tinfoil-` prefix removed.  The full node-facing id travels in the
+   X-Routstr-Model header, which the node strips before forwarding, so the
+   enclave sees only the bare id it knows."
+  (if (routstr-confidential-p model)
+      (subseq model (length *routstr-tinfoil-prefix*))
+      model))
 
 ;;; ---- attestation -----------------------------------------------------------
 
@@ -308,6 +357,7 @@
       (error () nil))))
 
 (defun sealed-post (url body headers &key (base *ppq-private-base*) (model nil)
+                                            (model-header "X-Private-Model")
                                             attestation-url
                                             (read-timeout 240) (retries 2))
   "POST BODY (a JSON string) to URL with the request EHBP-sealed to BASE's
@@ -315,7 +365,10 @@
 
    HEADERS are the caller's headers; Content-Type and Authorization are kept,
    and Ehbp-Encapsulated-Key is added.  MODEL, when given, is the bare wire name
-   and is written into the body and into X-Private-Model.
+   and is written into the body and into MODEL-HEADER — X-Private-Model for
+   PPQ's relay, X-Routstr-Model for a Routstr node.  Both are proxy control
+   headers: the peer strips them before forwarding, so the enclave sees only
+   the bare id inside the sealed body.
 
    The response must be EHBP-framed and carry Ehbp-Response-Nonce — anything
    else is a refusal, because a plaintext answer means the peer did not decrypt
@@ -333,7 +386,7 @@
                (hdrs (append (remove-if (lambda (h) (string-equal (car h) "Ehbp-Encapsulated-Key"))
                                         headers)
                              `(("Ehbp-Encapsulated-Key" . ,enc))
-                             (when model `(("X-Private-Model" . ,model))))))
+                             (when model `((,model-header . ,model))))))
           (handler-case
               (multiple-value-bind (raw code resp-headers)
                   (http:post url :content (seal:ehbp-request-body req)

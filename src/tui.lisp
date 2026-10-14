@@ -1285,7 +1285,8 @@ input row and erased by the next repaint.  The echo goes through EMIT, which tak
 (defun banner-model ()
   "Model and backend for the banner, e.g. \"· deepseek/... · openrouter\"."
   (format nil "· ~A~@[ · ~A~]" (model-label)
-          (case llm:*llm-backend* (:openrouter "openrouter") (:routstr "routstr")
+          (case llm:*llm-backend* (:openrouter "openrouter")
+                                  (:routstr (if llm:*confidential* "routstr confidential" "routstr"))
                                   (:ppq (if llm:*confidential* "ppq confidential" "ppq")))))
 
 (defun ui-banner (sess)
@@ -1374,7 +1375,8 @@ input row and erased by the next repaint.  The echo goes through EMIT, which tak
           (case llm:*llm-backend*
             (:ppq (if llm:*confidential* "--confidential --ppq" "--ppq"))
             (:tinfoil "--tinfoil")
-            ((:openrouter :routstr) "--openrouter")
+            (:routstr (if llm:*confidential* "--confidential --routstr" "--routstr"))
+            (:openrouter "--openrouter")
             (t nil))
           (and (member llm:*llm-backend* '(:openrouter :routstr :ppq :tinfoil)) llm:*llm-model*)
           (and llm:*llm-effort* (effort-label))

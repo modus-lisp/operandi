@@ -65,10 +65,25 @@
          (handler-case (progn (llm:require-confidential!) nil)
            (error () t))))
 
-(check "--confidential + :routstr is refused at startup"
-       (let ((llm:*llm-backend* :routstr) (llm:*confidential* t))
+(check "--confidential + :routstr with a non-tinfoil model is refused at startup"
+       (let ((llm:*llm-backend* :routstr) (llm:*llm-model* "gemini-3-6-flash")
+             (llm:*confidential* t))
          (handler-case (progn (llm:require-confidential!) nil)
            (error () t))))
+
+(check "--confidential + :routstr with a tinfoil-* model is allowed"
+       (let ((llm:*llm-backend* :routstr) (llm:*llm-model* "tinfoil-gemma4-31b")
+             (llm:*confidential* t))
+         (llm:require-confidential!)))
+
+(check "the tinfoil- prefix is what makes a Routstr model confidential"
+       (and (ppq:routstr-confidential-p "tinfoil-gemma4-31b")
+            (not (ppq:routstr-confidential-p "gemma4-31b"))
+            (not (ppq:routstr-confidential-p "e2ee-kimi-k2-6"))
+            (not (ppq:routstr-confidential-p "tinfoil-"))))
+
+(check "the enclave gets the bare id, the node gets the prefixed one"
+       (string= (ppq:routstr-wire-model "tinfoil-gemma4-31b") "gemma4-31b"))
 
 (check "--confidential + :ppq is allowed"
        (let ((llm:*llm-backend* :ppq) (llm:*confidential* t))
@@ -121,6 +136,46 @@
                    (and (stringp text) (search "PONG" text)))
                (error (e) (format t "~&         (live check skipped: ~a)~%" e) t)))
       (format t "~&  skip no Tinfoil key at ~a~%" ppq:*tinfoil-token-file*)))
+
+;;; ---- 5. live: a Routstr node relays the sealed body blind -------------------
+;;;
+;;; The node is on the path but not in the trust set: we seal to the enclave's
+;;; attested key, the node forwards the opaque body, and the answer comes back
+;;; sealed.  The proof that the NODE could not read it is that the response
+;;; carries an Ehbp-Response-Nonce and decrypts — only the enclave holds the
+;;; private key that opens our sealed body, so a node that had terminated the
+;;; request itself could not have produced it.
+;;;
+;;; Needs a node URL and a node-local key, neither of which is a fixture we can
+;;; ship, so it is opt-in: OPERANDI_ROUTSTR_NODE + OPERANDI_ROUTSTR_KEY.
+
+(format t "~&~%[5] live sealed round trip (Routstr node, blind relay)~%")
+
+(let ((node (uiop:getenv "OPERANDI_ROUTSTR_NODE"))
+      (key (uiop:getenv "OPERANDI_ROUTSTR_KEY"))
+      (model (or (uiop:getenv "OPERANDI_ROUTSTR_MODEL") "tinfoil-gemma4-31b")))
+  (if (and node key)
+      (check "a Routstr node relays the sealed body to the attested enclave"
+             (handler-case
+                 ;; The key is node-local, so it arrives in the environment and
+                 ;; is written to a private temp file for the duration of the
+                 ;; call — SET-BACKEND-ROUTSTR! reads a token FILE, and widening
+                 ;; that API just for a test would be the wrong trade.
+                 (uiop:with-temporary-file (:pathname keyfile :stream s :keep t)
+                   (write-string key s)
+                   (finish-output s)
+                   (close s)
+                   (let ((llm:*llm-backend* :routstr)
+                         (llm:*llm-model* model)
+                         (llm:*confidential* t))
+                     (llm:set-backend-routstr! :model model :url node :token-file keyfile)
+                     (llm:require-confidential!)
+                     (multiple-value-bind (text parsed)
+                         (llm:llm-chat "Reply with exactly: PONG" :max-tokens 300)
+                       (declare (ignore parsed))
+                       (and (stringp text) (search "PONG" text)))))
+               (error (e) (format t "~&         (live check skipped: ~a)~%" e) t)))
+      (format t "~&  skip set OPERANDI_ROUTSTR_NODE and OPERANDI_ROUTSTR_KEY to run~%")))
 
 ;;; ---- summary ---------------------------------------------------------------
 

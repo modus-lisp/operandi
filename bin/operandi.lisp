@@ -167,10 +167,32 @@
                                (setf acc tail)))
                       (eng:apply-backend-defaults)))
                    ((and acc (string= (first acc) "--routstr"))
-                    (let* ((tail (rest acc)) (next (first tail))
-                           (is-model (and next (find #\/ next) (not (find #\Space next)))))
-                      (cond (is-model (llm:set-backend-routstr! :model next) (setf acc (rest tail)))
-                            (t (llm:set-backend-routstr!) (setf acc tail)))
+                    ;; Routstr, in one of two modes.  A node URL (http...) may
+                    ;; come first, then a model.  A model is any token that is
+                    ;; not a flag and is followed by the task, or that carries a
+                    ;; slash (vendor/model ids); a bare flag takes the library
+                    ;; default.  Under --confidential the backend refuses
+                    ;; anything that is not a tinfoil-* model, so a typo cannot
+                    ;; silently become a plaintext request to a node that
+                    ;; terminates it itself.
+                    (let* ((tail (rest acc))
+                           (node (and (first tail)
+                                      (uiop:string-prefix-p "http" (first tail))
+                                      (first tail)))
+                           (tail (if node (rest tail) tail))
+                           (next (first tail))
+                           (is-model (and next (not (uiop:string-prefix-p "--" next))
+                                          (or (find #\/ next) (rest tail)))))
+                      (let ((ok (if is-model
+                                    (llm:set-backend-routstr! :model next :url (or node llm:*routstr-url*))
+                                    (llm:set-backend-routstr! :url (or node llm:*routstr-url*)))))
+                        ;; A refused switch (no key, or a non-tinfoil model
+                        ;; under --confidential) must not fall through to
+                        ;; whatever backend was configured before — that is
+                        ;; exactly the silent downgrade this flag exists to
+                        ;; prevent.
+                        (unless ok (sb-ext:exit :code 2))
+                        (setf acc (if is-model (rest tail) tail)))
                       (eng:apply-backend-defaults)))
                    ((and acc (string= (first acc) "--ppq"))
                     ;; PPQ, in one of two modes. A model here is any PPQ id
@@ -226,7 +248,14 @@
                     ;; startup (below) and again on every request, and it
                     ;; FAILS rather than downgrading to plaintext.
                     (setf acc (rest acc))
-                    (llm:enable-confidential!))
+                    ;; A backend already chosen may not be able to honour it
+                    ;; (e.g. --routstr with a model the node terminates itself).
+                    ;; That is a configuration error, so say so and stop — do
+                    ;; not fall through to a plaintext session.
+                    (handler-case (llm:enable-confidential!)
+                      (error (e)
+                        (format *error-output* "~&operandi: ~A~%" e)
+                        (sb-ext:exit :code 2))))
                    ((and acc (string= (first acc) "--worker-model"))
                     (multiple-value-bind (m ok)
                         (funcall (find-symbol "PARSE-WORKER-MODEL" "OPERANDI.SUBAGENT") (second acc))
@@ -311,7 +340,15 @@
      (format t "  bin/operandi-acp                 (ACP server over stdio for editors: Zed, Buzz; see README)~%")
      (format t "~%env: OPERANDI_MAX_TOKENS (per-turn output cap, default 16384),~%")
      (format t "     OPERANDI_CONTEXT_BUDGET (compaction threshold), OPERANDI_MAX_ITERS.~%")
-     (format t "  operandi.lisp -- --routstr [MODEL] \"task\"   (Routstr: Cashu token in ~~/.operandi/routstr.token)~%")
+     (format t "  operandi.lisp -- --routstr [NODE-URL] [MODEL] \"task\"~%")
+     (format t "      Routstr: a network of independent Lightning-paid nodes. NODE-URL~%")
+     (format t "      (https://...) picks the node; default ~~/.operandi/routstr.token.~%")
+     (format t "  operandi.lisp -- --confidential --routstr tinfoil-MODEL \"task\"~%")
+     (format t "      MODEL must be a tinfoil-* id on a node that carries Tinfoil. The node~%")
+     (format t "      relays the EHBP body blind: we seal to the AMD-attested enclave's HPKE~%")
+     (format t "      key (verified locally against the pinned AMD ARK), the node holds no key~%")
+     (format t "      and cannot read or answer it. Any other Routstr model is refused under~%")
+     (format t "      --confidential — the node terminates those itself.~%")
      (format t "  operandi.lisp -- --ppq [MODEL] \"task\"~%")
      (format t "      PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/Lightning. MODEL is~%")
      (format t "      any PPQ id (gpt-6.1-sol, claude-sonnet-5.5, ...); requests go out in~%")

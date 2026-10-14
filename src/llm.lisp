@@ -146,25 +146,51 @@
    have that be a checkable claim rather than a naming convention.")
 
 (defun confidential-backend-p (&optional (backend *llm-backend*) (model *llm-model*))
-  "True when BACKEND can actually satisfy *CONFIDENTIAL* for MODEL.  :PPQ (Path
-   A) and :TINFOIL can: they are the backends whose transport we can seal to a
-   locally verified enclave, and in both cases the key we seal to is the key
-   bound into the attestation report we verified.
+  "True when BACKEND can satisfy *CONFIDENTIAL* for MODEL.
 
-   :ROUTSTR cannot, and MODEL is ignored.  A Routstr node's `tinfoil-*` models
-   ARE relayed blind to a genuine Tinfoil enclave — we have driven that round
-   trip and the answer comes back sealed — but the key we can seal to is the
-   ROUTER's (inference.tinfoil.sh), not the model enclave's.  The router then
-   re-seals to the per-model container, and that second hop is a trust hop we
-   cannot check from here: the container's own TDX quote is not verifiable
-   against a pinned root the way the SEV-SNP one is, and the router's claim
-   about which container it picked is exactly the thing in question.  So a
-   Routstr request is encrypted, but not end-to-end attested, and --confidential
-   must not accept it.  :OPENROUTER and :LLAMA cannot seal at all.  In every
-   case --confidential with a backend that cannot prove the claim is a
+   THE CRITERION.  --confidential is satisfied iff a cleartext leak would
+   require breaking the hardware TEE the request is sealed to, or leaking the
+   silicon vendor's key.  It is NOT a claim about how many parties sit on the
+   path, and it is NOT a claim that every hop is independently verified.  A
+   party that can only drop, delay, or observe the metadata of an opaque body
+   is not a party that can leak it, so its presence does not defeat the claim.
+
+   HOW EACH BACKEND MEETS IT.  In all three cases the client seals to a key
+   that is bound into an AMD SEV-SNP report we verify locally against the pinned
+   AMD ARK, so the body can only be opened by an enclave running the measured
+   image — a leak requires breaking SEV-SNP or AMD's key.
+
+     :PPQ (Path A)  seal to api.ppq.ai/private's key.  That key is byte-identical
+                    to inference.tinfoil.sh's (b92b915f…): PPQ's private base IS
+                    the Tinfoil router, reached through PPQ's billing.
+     :TINFOIL       seal to inference.tinfoil.sh's key directly.
+     :ROUTSTR       seal to the same router key, for a `tinfoil-*` model.  The
+                    node is a BLIND RELAY and we have proved it: sealing to the
+                    model container's key instead makes the node answer 422
+                    \"failed to read decrypted request body\", so it cannot open
+                    what we send.  It forwards opaque bytes and relays the sealed
+                    answer.  It can drop the request or see the model and
+                    timing; it cannot read the body or forge the reply, because
+                    the response nonce is derived from our ephemeral key.
+
+   THE ONE UNVERIFIED HOP, WHICH ALL THREE SHARE.  The router terminates our
+   sealed body and re-seals to a per-model container (the response names it:
+   tinfoil-enclave: <model>-infN-M.tinfoil.containers.tinfoil.dev).  That
+   container is Intel TDX, and we cannot verify its quote against a pinned root
+   the way we verify the SEV-SNP one — ATC refuses it outright (\"only supports
+   sev-snp-guest/v2\").  So the container hop rests on the router's word.  This
+   is a real limit, but it is a limit of the TINFOIL ROUTER, not of Routstr:
+   --tinfoil and --confidential --ppq private/… go through the same router and
+   the same re-seal.  Refusing Routstr for it while accepting the other two
+   would be incoherent.  What the router's word buys an attacker is bounded by
+   the same hardware: to turn it into a cleartext leak they must still break the
+   TDX container, or the SEV-SNP router, or AMD's key.
+
+   :OPENROUTER and :LLAMA cannot seal at all, so --confidential with either is a
    configuration error, not a silent downgrade."
   (case backend
     ((:ppq :tinfoil) t)
+    (:routstr (operandi.ppq:routstr-confidential-p model))
     (t nil)))
 
 (defun enable-confidential! ()
@@ -189,13 +215,24 @@ enclave, plaintext upstream) is not allowed. Use --ppq private/<model>."
                             url body headers :base operandi.ppq:*ppq-private-base*
                             :model (operandi.ppq:ppq-wire-model *llm-model*)))))
     (:routstr
-     (error "confidential mode: a Routstr node is not an attested transport.  Its \
-tinfoil-* models are relayed blind to a real Tinfoil enclave, but the key we can \
-seal to is the ROUTER's, and the router re-seals to the per-model container — a \
-second hop we cannot verify from here.  The request is encrypted, not \
-end-to-end attested.  Use --tinfoil <model> or --confidential --ppq \
-private/<model>, or drop --confidential to use the node as an ordinary \
-provider.")))
+     (unless (operandi.ppq:routstr-confidential-p *llm-model*)
+       (error "confidential mode: ~s is not a tinfoil-* model — a Routstr node \
+terminates every other model itself, so it is not sealed to an enclave at all. \
+Use --routstr tinfoil-<model> on a node that carries Tinfoil, or drop \
+--confidential."
+              *llm-model*))
+     ;; *LLM-URL* already names the node (SET-BACKEND-ROUTSTR! set it); only the
+     ;; transport changes here, so a node chosen on the command line survives.
+     ;; The node is a blind relay: it cannot open this body (proved — sealing to
+     ;; the container key instead makes it answer 422), so it is on the path but
+     ;; not in the trust set.
+     (setf *sealed-post* (lambda (url body headers)
+                           (operandi.ppq:sealed-post
+                            url body headers
+                            :base operandi.ppq:*tinfoil-base*
+                            :attestation-url operandi.ppq:*tinfoil-attestation-url*
+                            :model (operandi.ppq:routstr-wire-model *llm-model*)
+                            :model-header "X-Routstr-Model")))))
   t)
 
 (defun require-confidential! ()
@@ -204,11 +241,10 @@ provider.")))
    loudly instead of quietly sending plaintext for the whole session."
   (when (and *confidential* (not (confidential-backend-p)))
     (error "confidential mode is not available on the ~(~a~) backend~@[ for model ~s~]: \
-only PPQ (Path A) and Tinfoil seal to a key that is bound into an attestation \
-report we verify locally. Use --confidential --ppq private/<model>, \
---tinfoil <model>, or drop --confidential.  (A Routstr node's tinfoil-* models \
-are encrypted but not end-to-end attested — the router re-seals to the model \
-container — so they do not satisfy --confidential.)"
+--confidential requires that a cleartext leak would need the hardware TEE broken \
+or the silicon vendor's key leaked. Use --confidential --ppq private/<model>, \
+--tinfoil <model>, or --confidential --routstr tinfoil-<model> on a node that \
+carries Tinfoil, or drop --confidential."
            *llm-backend* (and (eq *llm-backend* :routstr) *llm-model*)))
   t)
 
@@ -581,15 +617,11 @@ call with :want-stream nil"))
                "~&set-backend-routstr!: token file ~A missing or empty~%"
                token-file)
        nil)
-      ((and conf (operandi.ppq:routstr-confidential-p model))
+      ((and conf (not (operandi.ppq:routstr-confidential-p model)))
        (format *error-output*
-               "~&operandi: --confidential cannot be satisfied by a Routstr node.  \
-~s is relayed blind to a real Tinfoil enclave, but the key we can seal to is the \
-ROUTER's (inference.tinfoil.sh), and the router re-seals to the per-model \
-container — a second hop we cannot verify from here.  The request is encrypted, \
-not end-to-end attested.  Use --tinfoil ~a, or --confidential --ppq \
-private/<model>, or drop --confidential to use the node as an ordinary provider.~%"
-               model (operandi.ppq:routstr-wire-model model))
+               "~&operandi: ~s is not a tinfoil-* model — a Routstr node \
+terminates every other model itself, so it is not sealed to an enclave at all~%"
+               model)
        nil)
       (t
        (setf *llm-backend*    :routstr
@@ -600,12 +632,12 @@ private/<model>, or drop --confidential to use the node as an ordinary provider.
              *confidential*   conf
              ;; A tinfoil-* model has NO plaintext mode: the node relays EHBP
              ;; bodies to the enclave and 404s anything else, so the sealer is
-             ;; installed whenever the model is one of those.  This is
-             ;; ENCRYPTION, not attestation: we seal to the ROUTER's key
-             ;; (inference.tinfoil.sh), and the router re-seals to the per-model
-             ;; container, so the node and the router both sit inside the trust
-             ;; set.  That is why --confidential refuses :routstr outright (see
-             ;; CONFIDENTIAL-BACKEND-P) while the model stays usable without it.
+             ;; installed whenever the model is one of those.  The node is a
+             ;; BLIND RELAY — sealing to the container's key instead makes it
+             ;; answer 422, so it cannot open this body — and the key we seal to
+             ;; is the router's, verified locally against the pinned AMD ARK.
+             ;; --confidential only decides whether an unattestable transport is
+             ;; an ERROR; see CONFIDENTIAL-BACKEND-P for the criterion.
              *sealed-post*    (and (operandi.ppq:routstr-confidential-p model)
                                    (lambda (url body headers)
                                      (operandi.ppq:sealed-post

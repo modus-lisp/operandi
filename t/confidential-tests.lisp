@@ -65,23 +65,25 @@
          (handler-case (progn (llm:require-confidential!) nil)
            (error () t))))
 
-(check "--confidential + :routstr is refused at startup, even for a tinfoil-* model"
-       (let ((llm:*llm-backend* :routstr) (llm:*llm-model* "tinfoil-gemma4-31b")
-             (llm:*confidential* t))
-         (handler-case (progn (llm:require-confidential!) nil)
-           (error () t))))
-
-(check "--confidential + :routstr is refused for an ordinary model too"
+(check "--confidential + :routstr with a non-tinfoil model is refused at startup"
        (let ((llm:*llm-backend* :routstr) (llm:*llm-model* "gemini-3-6-flash")
              (llm:*confidential* t))
          (handler-case (progn (llm:require-confidential!) nil)
            (error () t))))
 
-(check "a Routstr node is not a confidential backend, whatever the model"
-       (and (not (llm:confidential-backend-p :routstr "tinfoil-gemma4-31b"))
-            (not (llm:confidential-backend-p :routstr "gemma4-31b"))))
+(check "--confidential + :routstr with a tinfoil-* model is allowed"
+       (let ((llm:*llm-backend* :routstr) (llm:*llm-model* "tinfoil-gemma4-31b")
+             (llm:*confidential* t))
+         (llm:require-confidential!)))
 
-(check "the tinfoil- prefix still marks a model as EHBP-relayed (encryption)"
+(check "the criterion is the hardware root, not the hop count"
+       ;; A blind relay cannot leak an opaque body, so it does not defeat the
+       ;; claim; a node that terminates the model itself does.
+       (and (llm:confidential-backend-p :routstr "tinfoil-gemma4-31b")
+            (not (llm:confidential-backend-p :routstr "gemma4-31b"))
+            (not (llm:confidential-backend-p :routstr "e2ee-kimi-k2-6"))))
+
+(check "the tinfoil- prefix is what marks a Routstr model as EHBP-relayed"
        (and (ppq:routstr-confidential-p "tinfoil-gemma4-31b")
             (not (ppq:routstr-confidential-p "gemma4-31b"))
             (not (ppq:routstr-confidential-p "e2ee-kimi-k2-6"))
@@ -161,25 +163,23 @@
       (model (or (uiop:getenv "OPERANDI_ROUTSTR_MODEL") "tinfoil-gemma4-31b")))
   (if (and node key)
       (check "a Routstr node relays the sealed body to the attested enclave"
-             (handler-case
-                 ;; The key is node-local, so it arrives in the environment and
-                 ;; is written to a private temp file for the duration of the
-                 ;; call — SET-BACKEND-ROUTSTR! reads a token FILE, and widening
-                 ;; that API just for a test would be the wrong trade.
-                 (uiop:with-temporary-file (:pathname keyfile :stream s :keep t)
-                   (write-string key s)
-                   (finish-output s)
-                   (close s)
-                   (let ((llm:*llm-backend* :routstr)
-                         (llm:*llm-model* model)
-                         (llm:*confidential* t))
-                     (llm:set-backend-routstr! :model model :url node :token-file keyfile)
-                     (llm:require-confidential!)
-                     (multiple-value-bind (text parsed)
-                         (llm:llm-chat "Reply with exactly: PONG" :max-tokens 300)
-                       (declare (ignore parsed))
-                       (and (stringp text) (search "PONG" text)))))
-               (error (e) (format t "~&         (live check skipped: ~a)~%" e) t)))
+             ;; No blanket error handler here: if a node and key were supplied,
+             ;; the round trip MUST succeed.  Catching the error and returning
+             ;; true would make this test pass on a 401, which is exactly the
+             ;; kind of vacuous green that lets a broken transport ship.
+             (uiop:with-temporary-file (:pathname keyfile :stream s :keep t)
+               (write-string key s)
+               (finish-output s)
+               (close s)
+               (let ((llm:*llm-backend* :routstr)
+                     (llm:*llm-model* model)
+                     (llm:*confidential* t))
+                 (llm:set-backend-routstr! :model model :url node :token-file keyfile)
+                 (llm:require-confidential!)
+                 (multiple-value-bind (text parsed)
+                     (llm:llm-chat "Reply with exactly: PONG" :max-tokens 300)
+                   (declare (ignore parsed))
+                   (and (stringp text) (search "PONG" text))))))
       (format t "~&  skip set OPERANDI_ROUTSTR_NODE and OPERANDI_ROUTSTR_KEY to run~%")))
 
 ;;; ---- summary ---------------------------------------------------------------

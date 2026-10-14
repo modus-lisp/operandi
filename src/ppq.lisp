@@ -186,16 +186,24 @@
 ;;; as a blind relay: it forwards the opaque encrypted body, never sees
 ;;; plaintext").
 ;;;
-;;; That makes the trust story identical to PPQ's Path A: we verify the
-;;; enclave's AMD SEV-SNP bundle against the pinned AMD ARK, seal to the HPKE
-;;; key bound into report_data[32:64], and require an Ehbp-Response-Nonce back.
-;;; The node is on the path but not in the trust set — it can drop the request,
-;;; it cannot read it, and it cannot answer it, because only the enclave holds
-;;; the private key that opens our sealed body.
+;;; That makes the node itself a blind relay — but it does NOT make the path
+;;; end-to-end attested, and the difference is the whole reason --confidential
+;;; refuses :routstr.  The key a client can seal to is the ROUTER's
+;;; (inference.tinfoil.sh), not the model enclave's: the router terminates our
+;;; sealed body, then re-seals to the per-model container it picked.  So the
+;;; router is inside the trust set, and the container it picked is exactly the
+;;; thing in question.  The router does publish its view of that choice at
+;;; /.well-known/tinfoil-proxy (repo, release tag, expected measurement, and per
+;;; enclave the HPKE key + TLS fingerprint), and we have checked that the
+;;; container's own TDX quote agrees with it — but the quote is TDX, which we
+;;; cannot verify against a pinned root the way we verify the SEV-SNP one, and
+;;; the manifest is served by the very enclave whose honesty is at issue.  So a
+;;; Routstr request is ENCRYPTED, not ATTESTED.  Use --tinfoil for the attested
+;;; path; use --routstr without --confidential for the encrypted one.
 ;;;
 ;;; The one thing the node DOES control is where the sealed body is forwarded
 ;;; (X-Tinfoil-Enclave-Url, restricted by the node to *.tinfoil.sh).  That is
-;;; not a downgrade: a body sealed to the attested key is unreadable anywhere
+;;; not a downgrade: a body sealed to the router's key is unreadable anywhere
 ;;; else, so a misrouted request fails rather than leaks.  We do not send the
 ;;; header at all, so the node uses its own configured enclave.
 

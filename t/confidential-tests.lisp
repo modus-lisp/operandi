@@ -65,18 +65,23 @@
          (handler-case (progn (llm:require-confidential!) nil)
            (error () t))))
 
-(check "--confidential + :routstr with a non-tinfoil model is refused at startup"
+(check "--confidential + :routstr is refused at startup, even for a tinfoil-* model"
+       (let ((llm:*llm-backend* :routstr) (llm:*llm-model* "tinfoil-gemma4-31b")
+             (llm:*confidential* t))
+         (handler-case (progn (llm:require-confidential!) nil)
+           (error () t))))
+
+(check "--confidential + :routstr is refused for an ordinary model too"
        (let ((llm:*llm-backend* :routstr) (llm:*llm-model* "gemini-3-6-flash")
              (llm:*confidential* t))
          (handler-case (progn (llm:require-confidential!) nil)
            (error () t))))
 
-(check "--confidential + :routstr with a tinfoil-* model is allowed"
-       (let ((llm:*llm-backend* :routstr) (llm:*llm-model* "tinfoil-gemma4-31b")
-             (llm:*confidential* t))
-         (llm:require-confidential!)))
+(check "a Routstr node is not a confidential backend, whatever the model"
+       (and (not (llm:confidential-backend-p :routstr "tinfoil-gemma4-31b"))
+            (not (llm:confidential-backend-p :routstr "gemma4-31b"))))
 
-(check "the tinfoil- prefix is what makes a Routstr model confidential"
+(check "the tinfoil- prefix still marks a model as EHBP-relayed (encryption)"
        (and (ppq:routstr-confidential-p "tinfoil-gemma4-31b")
             (not (ppq:routstr-confidential-p "gemma4-31b"))
             (not (ppq:routstr-confidential-p "e2ee-kimi-k2-6"))

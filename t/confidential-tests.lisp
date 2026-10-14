@@ -1,4 +1,4 @@
-;;;; confidential-tests.lisp — the invariants that make --confidential mean
+;;;; confidential-tests.lisp — the invariants that make --confidential-tinfoil mean
 ;;;; something.  Run with:
 ;;;;
 ;;;;   sbcl --non-interactive --load t/confidential-tests.lisp
@@ -56,22 +56,22 @@
        (and (ppq:confidential-p "private/glm-5-3")
             (not (ppq:confidential-p "glm-5-3"))))
 
-;;; ---- 2. --confidential on a backend that cannot seal ------------------------
+;;; ---- 2. --confidential-tinfoil on a backend that cannot seal ------------------------
 
-(format t "~&~%[2] --confidential must fail on a backend that cannot seal~%")
+(format t "~&~%[2] --confidential-tinfoil must fail on a backend that cannot seal~%")
 
-(check "--confidential + :openrouter is refused at startup"
+(check "--confidential-tinfoil + :openrouter is refused at startup"
        (let ((llm:*llm-backend* :openrouter) (llm:*confidential* t))
          (handler-case (progn (llm:require-confidential!) nil)
            (error () t))))
 
-(check "--confidential + :routstr with a non-tinfoil model is refused at startup"
+(check "--confidential-tinfoil + :routstr with a non-tinfoil model is refused at startup"
        (let ((llm:*llm-backend* :routstr) (llm:*llm-model* "gemini-3-6-flash")
              (llm:*confidential* t))
          (handler-case (progn (llm:require-confidential!) nil)
            (error () t))))
 
-(check "--confidential + :routstr with a tinfoil-* model is allowed"
+(check "--confidential-tinfoil + :routstr with a tinfoil-* model is allowed"
        (let ((llm:*llm-backend* :routstr) (llm:*llm-model* "tinfoil-gemma4-31b")
              (llm:*confidential* t))
          (llm:require-confidential!)))
@@ -92,15 +92,15 @@
 (check "the enclave gets the bare id, the node gets the prefixed one"
        (string= (ppq:routstr-wire-model "tinfoil-gemma4-31b") "gemma4-31b"))
 
-(check "--confidential + :ppq is allowed"
+(check "--confidential-tinfoil + :ppq is allowed"
        (let ((llm:*llm-backend* :ppq) (llm:*confidential* t))
          (llm:require-confidential!)))
 
-(check "--confidential + :tinfoil is allowed"
+(check "--confidential-tinfoil + :tinfoil is allowed"
        (let ((llm:*llm-backend* :tinfoil) (llm:*confidential* t))
          (llm:require-confidential!)))
 
-(check "no --confidential means no check"
+(check "no --confidential-tinfoil means no check"
        (let ((llm:*llm-backend* :openrouter) (llm:*confidential* nil))
          (llm:require-confidential!)))
 

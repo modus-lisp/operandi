@@ -171,7 +171,7 @@
                     ;; come first, then a model.  A model is any token that is
                     ;; not a flag and is followed by the task, or that carries a
                     ;; slash (vendor/model ids); a bare flag takes the library
-                    ;; default.  Under --confidential the backend refuses
+                    ;; default.  Under --confidential-tinfoil the backend refuses
                     ;; anything that is not a tinfoil-* model, so a typo cannot
                     ;; silently become a plaintext request to a node that
                     ;; terminates it itself.
@@ -187,7 +187,7 @@
                                     (llm:set-backend-routstr! :model next :url (or node llm:*routstr-url*))
                                     (llm:set-backend-routstr! :url (or node llm:*routstr-url*)))))
                         ;; A refused switch (no key, or a non-tinfoil model
-                        ;; under --confidential) must not fall through to
+                        ;; under --confidential-tinfoil) must not fall through to
                         ;; whatever backend was configured before — that is
                         ;; exactly the silent downgrade this flag exists to
                         ;; prevent.
@@ -197,7 +197,7 @@
                    ((and acc (string= (first acc) "--ppq"))
                     ;; PPQ, in one of two modes. A model here is any PPQ id
                     ;; (gpt-6.1-sol, private/gpt-oss-120b, ...); a bare flag
-                    ;; takes the library default. Under --confidential the
+                    ;; takes the library default. Under --confidential-tinfoil the
                     ;; backend refuses anything that is not private/*, so a
                     ;; typo cannot silently become a plaintext Path B request.
                     ;;
@@ -212,7 +212,7 @@
                                     (llm:set-backend-ppq! :model next)
                                     (llm:set-backend-ppq!))))
                         ;; A refused switch (no key, or a non-private model
-                        ;; under --confidential) must not fall through to
+                        ;; under --confidential-tinfoil) must not fall through to
                         ;; whatever backend was configured before — that is
                         ;; exactly the silent downgrade this flag exists to
                         ;; prevent.
@@ -222,7 +222,7 @@
                    ((and acc (string= (first acc) "--tinfoil"))
                     ;; Tinfoil's OWN enclave (inference.tinfoil.sh), sealed end
                     ;; to end. There is only one path here, so there is no
-                    ;; --confidential to ask for: every request is EHBP-sealed
+                    ;; --confidential-tinfoil to ask for: every request is EHBP-sealed
                     ;; to a locally verified AMD SEV-SNP enclave, and a
                     ;; plaintext answer is an error. A model is a bare Tinfoil
                     ;; id (gpt-oss-120b, glm-5-3, ...); a bare flag takes the
@@ -242,11 +242,15 @@
                         (unless ok (sb-ext:exit :code 2))
                         (setf acc (if is-model (rest tail) tail)))
                       (eng:apply-backend-defaults)))
-                   ((and acc (string= (first acc) "--confidential"))
-                    ;; Require that the exchange be attested. This is a
-                    ;; session-wide claim, not a backend: it is checked at
-                    ;; startup (below) and again on every request, and it
-                    ;; FAILS rather than downgrading to plaintext.
+                   ((and acc (string= (first acc) "--confidential-tinfoil"))
+                    ;; Require that the exchange be sealed to a Tinfoil enclave.
+                    ;; The name is deliberately narrow: it does NOT claim the
+                    ;; request is confidential in general, only that it is
+                    ;; EHBP-sealed to a key bound into a Tinfoil attestation
+                    ;; report we verify locally.  This is a session-wide claim,
+                    ;; not a backend: it is checked at startup (below) and again
+                    ;; on every request, and it FAILS rather than downgrading to
+                    ;; plaintext.
                     (setf acc (rest acc))
                     ;; A backend already chosen may not be able to honour it
                     ;; (e.g. --routstr with a model the node terminates itself).
@@ -256,6 +260,16 @@
                       (error (e)
                         (format *error-output* "~&operandi: ~A~%" e)
                         (sb-ext:exit :code 2))))
+                   ((and acc (string= (first acc) "--confidential"))
+                    ;; The old name.  It overclaimed — it read as a promise
+                    ;; about the whole exchange when all it ever meant was
+                    ;; "sealed to a Tinfoil enclave" — so it is not accepted
+                    ;; silently.  Say what it became and stop.
+                    (format *error-output*
+                            "~&operandi: --confidential was renamed to --confidential-tinfoil.~%~
+                             ~&  It only ever meant \"sealed to a Tinfoil enclave\", and the old~%~
+                             ~&  name read as a broader promise than that.~%")
+                    (sb-ext:exit :code 2))
                    ((and acc (string= (first acc) "--worker-model"))
                     (multiple-value-bind (m ok)
                         (funcall (find-symbol "PARSE-WORKER-MODEL" "OPERANDI.SUBAGENT") (second acc))
@@ -340,26 +354,34 @@
      (format t "  bin/operandi-acp                 (ACP server over stdio for editors: Zed, Buzz; see README)~%")
      (format t "~%env: OPERANDI_MAX_TOKENS (per-turn output cap, default 16384),~%")
      (format t "     OPERANDI_CONTEXT_BUDGET (compaction threshold), OPERANDI_MAX_ITERS.~%")
+     (format t "  --confidential-tinfoil  (flag; formerly --confidential)~%")
+     (format t "      Require that every request be EHBP-sealed to a Tinfoil enclave whose~%")
+     (format t "      key is bound into an attestation report verified locally against the~%")
+     (format t "      pinned AMD ARK. It is a claim about the SEAL, not about the whole~%")
+     (format t "      exchange — hence the narrow name. It fails rather than downgrading:~%")
+     (format t "      an unverifiable enclave or a plaintext answer is an error. Valid with~%")
+     (format t "      --ppq private/MODEL, --tinfoil, and --routstr tinfoil-MODEL; on any~%")
+     (format t "      other backend it is a configuration error.~%")
      (format t "  operandi.lisp -- --routstr [NODE-URL] [MODEL] \"task\"~%")
      (format t "      Routstr: a network of independent Lightning-paid nodes. NODE-URL~%")
      (format t "      (https://...) picks the node; default ~~/.operandi/routstr.token.~%")
-     (format t "  operandi.lisp -- --confidential --routstr tinfoil-MODEL \"task\"~%")
+     (format t "  operandi.lisp -- --confidential-tinfoil --routstr tinfoil-MODEL \"task\"~%")
      (format t "      MODEL must be a tinfoil-* id on a node that carries Tinfoil. The node~%")
      (format t "      is a BLIND RELAY: we seal to the Tinfoil router's HPKE key (verified~%")
      (format t "      locally against the pinned AMD ARK) and the node cannot open the body —~%")
      (format t "      sealing to the model container's key instead makes it answer 422. It~%")
      (format t "      can drop the request or see the model and timing; it cannot read the~%")
      (format t "      body or forge the reply. Any other Routstr model is refused under~%")
-     (format t "      --confidential — the node terminates those itself.~%")
+     (format t "      --confidential-tinfoil — the node terminates those itself.~%")
      (format t "  operandi.lisp -- --ppq [MODEL] \"task\"~%")
      (format t "      PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/Lightning. MODEL is~%")
      (format t "      any PPQ id (gpt-6.1-sol, claude-sonnet-5.5, ...); requests go out in~%")
      (format t "      the clear, like OpenRouter. Key in ~~/.operandi/ppq.token.~%")
-     (format t "  operandi.lisp -- --confidential --ppq private/MODEL \"task\"~%")
+     (format t "  operandi.lisp -- --confidential-tinfoil --ppq private/MODEL \"task\"~%")
      (format t "      Path A only: MODEL must be private/*, and every request is EHBP-sealed~%")
      (format t "      to an AMD-attested Tinfoil enclave verified locally against the pinned~%")
      (format t "      AMD ARK. No fallback — an unverifiable enclave or a plaintext answer is~%")
-     (format t "      an error, not a downgrade. --confidential on any other backend fails.~%")
+     (format t "      an error, not a downgrade. --confidential-tinfoil on any other backend fails.~%")
      (format t "  operandi.lisp -- --tinfoil [MODEL] \"task\"~%")
      (format t "      Tinfoil's OWN enclave (inference.tinfoil.sh), sealed end to end.~%")
      (format t "      MODEL is a bare Tinfoil id (gpt-oss-120b, glm-5-3, kimi-k3, ...).~%")

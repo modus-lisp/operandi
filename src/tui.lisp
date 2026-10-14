@@ -1373,9 +1373,9 @@ input row and erased by the next repaint.  The echo goes through EMIT, which tak
    --resume would reopen it on the default backend, not the one it ran on."
   (format nil "operandi~@[ ~A ~A~]~@[ --effort ~A~] --resume ~A tui"
           (case llm:*llm-backend*
-            (:ppq (if llm:*confidential* "--confidential --ppq" "--ppq"))
+            (:ppq (if llm:*confidential* "--confidential-tinfoil --ppq" "--ppq"))
             (:tinfoil "--tinfoil")
-            (:routstr (if llm:*confidential* "--confidential --routstr" "--routstr"))
+            (:routstr (if llm:*confidential* "--confidential-tinfoil --routstr" "--routstr"))
             (:openrouter "--openrouter")
             (t nil))
           (and (member llm:*llm-backend* '(:openrouter :routstr :ppq :tinfoil)) llm:*llm-model*)

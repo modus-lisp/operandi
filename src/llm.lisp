@@ -121,7 +121,7 @@
    :PPQ = PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/Lightning.  By
    default it is an ordinary hosted provider: *llm-model* is any PPQ model id
    and the request goes out in the clear, exactly like OpenRouter.
-   With *CONFIDENTIAL* bound true (the --confidential flag) it becomes Path A
+   With *CONFIDENTIAL* bound true (the --confidential-tinfoil flag) it becomes Path A
    only: *llm-model* must be a private/* id, every request is EHBP-sealed to
    the HPKE key of an AMD-attested Tinfoil enclave verified locally against
    the pinned AMD ARK, and there is NO fallback — an unverifiable enclave or a
@@ -137,7 +137,7 @@
 (defvar *confidential* nil
   "When true, the current backend must be able to prove it is talking to a
    measured enclave, and every request must be sealed to it.  Set by the
-   --confidential flag (and by WITH-PPQ :CONFIDENTIAL T).
+   --confidential-tinfoil flag (and by WITH-PPQ :CONFIDENTIAL T).
 
    This is a property of the SESSION, not of the backend: it is what turns
    :PPQ from \"a hosted provider\" into \"Path A only, no fallback\".  It is
@@ -148,7 +148,7 @@
 (defun confidential-backend-p (&optional (backend *llm-backend*) (model *llm-model*))
   "True when BACKEND can satisfy *CONFIDENTIAL* for MODEL.
 
-   THE CRITERION.  --confidential is satisfied iff a cleartext leak would
+   THE CRITERION.  --confidential-tinfoil is satisfied iff a cleartext leak would
    require breaking the hardware TEE the request is sealed to, or leaking the
    silicon vendor's key.  It is NOT a claim about how many parties sit on the
    path, and it is NOT a claim that every hop is independently verified.  A
@@ -180,13 +180,13 @@
    the way we verify the SEV-SNP one — ATC refuses it outright (\"only supports
    sev-snp-guest/v2\").  So the container hop rests on the router's word.  This
    is a real limit, but it is a limit of the TINFOIL ROUTER, not of Routstr:
-   --tinfoil and --confidential --ppq private/… go through the same router and
+   --tinfoil and --confidential-tinfoil --ppq private/… go through the same router and
    the same re-seal.  Refusing Routstr for it while accepting the other two
    would be incoherent.  What the router's word buys an attacker is bounded by
    the same hardware: to turn it into a cleartext leak they must still break the
    TDX container, or the SEV-SNP router, or AMD's key.
 
-   :OPENROUTER and :LLAMA cannot seal at all, so --confidential with either is a
+   :OPENROUTER and :LLAMA cannot seal at all, so --confidential-tinfoil with either is a
    configuration error, not a silent downgrade."
   (case backend
     ((:ppq :tinfoil) t)
@@ -194,11 +194,11 @@
     (t nil)))
 
 (defun enable-confidential! ()
-  "Turn on confidential mode for the current session (the --confidential flag).
+  "Turn on confidential mode for the current session (the --confidential-tinfoil flag).
 
    If the backend is already :PPQ or :ROUTSTR, this also (re)installs the sealer
    and re-checks that the current model is one that can be served confidentially
-   — so `--ppq X --confidential` and `--confidential --ppq X` behave
+   — so `--ppq X --confidential-tinfoil` and `--confidential-tinfoil --ppq X` behave
    identically.  On any other backend it just sets the flag;
    REQUIRE-CONFIDENTIAL! then fails the run at startup rather than letting
    plaintext out."
@@ -219,7 +219,7 @@ enclave, plaintext upstream) is not allowed. Use --ppq private/<model>."
        (error "confidential mode: ~s is not a tinfoil-* model — a Routstr node \
 terminates every other model itself, so it is not sealed to an enclave at all. \
 Use --routstr tinfoil-<model> on a node that carries Tinfoil, or drop \
---confidential."
+--confidential-tinfoil."
               *llm-model*))
      ;; *LLM-URL* already names the node (SET-BACKEND-ROUTSTR! set it); only the
      ;; transport changes here, so a node chosen on the command line survives.
@@ -237,14 +237,14 @@ Use --routstr tinfoil-<model> on a node that carries Tinfoil, or drop \
 
 (defun require-confidential! ()
   "Signal unless the current backend can honour *CONFIDENTIAL*.  Called at
-   startup so that `--confidential --openrouter ...` fails immediately and
+   startup so that `--confidential-tinfoil --openrouter ...` fails immediately and
    loudly instead of quietly sending plaintext for the whole session."
   (when (and *confidential* (not (confidential-backend-p)))
     (error "confidential mode is not available on the ~(~a~) backend~@[ for model ~s~]: \
---confidential requires that a cleartext leak would need the hardware TEE broken \
-or the silicon vendor's key leaked. Use --confidential --ppq private/<model>, \
---tinfoil <model>, or --confidential --routstr tinfoil-<model> on a node that \
-carries Tinfoil, or drop --confidential."
+--confidential-tinfoil requires that a cleartext leak would need the hardware TEE broken \
+or the silicon vendor's key leaked. Use --confidential-tinfoil --ppq private/<model>, \
+--tinfoil <model>, or --confidential-tinfoil --routstr tinfoil-<model> on a node that \
+carries Tinfoil, or drop --confidential-tinfoil."
            *llm-backend* (and (eq *llm-backend* :routstr) *llm-model*)))
   t)
 
@@ -600,14 +600,14 @@ call with :want-stream nil"))
    ~/.operandi/routstr.token, mode 600). Returns T on success, NIL if the
    token file is missing or empty.
 
-   With CONFIDENTIAL (or with *CONFIDENTIAL* already set by --confidential),
+   With CONFIDENTIAL (or with *CONFIDENTIAL* already set by --confidential-tinfoil),
    MODEL must be a `tinfoil-*` id and every request is EHBP-sealed to the HPKE
    key of an AMD-attested Tinfoil enclave, verified locally against the pinned
    AMD ARK before the first byte is sent.  The node then relays the sealed body
    blind.  Any other model is refused HERE rather than at request time, so a
    misconfiguration fails at startup instead of silently sending plaintext."
   (let ((token (read-token-file token-file))
-        ;; --confidential may have been given BEFORE --routstr, so the session
+        ;; --confidential-tinfoil may have been given BEFORE --routstr, so the session
         ;; flag wins over the keyword: once confidential mode is on, choosing a
         ;; backend must not silently turn it off.
         (conf (or confidential *confidential*)))
@@ -636,7 +636,7 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
              ;; BLIND RELAY — sealing to the container's key instead makes it
              ;; answer 422, so it cannot open this body — and the key we seal to
              ;; is the router's, verified locally against the pinned AMD ARK.
-             ;; --confidential only decides whether an unattestable transport is
+             ;; --confidential-tinfoil only decides whether an unattestable transport is
              ;; an ERROR; see CONFIDENTIAL-BACKEND-P for the criterion.
              *sealed-post*    (and (operandi.ppq:routstr-confidential-p model)
                                    (lambda (url body headers)
@@ -654,7 +654,7 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
                                   (token-file operandi.ppq:*tinfoil-token-file*))
   "Switch the LLM client to Tinfoil's OWN enclave (inference.tinfoil.sh).
 
-   There is no plaintext mode here and no --confidential to ask for: this
+   There is no plaintext mode here and no --confidential-tinfoil to ask for: this
    backend exists only as the sealed one.  Every request is EHBP-sealed to the
    HPKE key of an AMD SEV-SNP enclave verified locally against the pinned AMD
    ARK, and a response without an Ehbp-Response-Nonce is refused rather than
@@ -702,8 +702,8 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
 
    Returns T on success, NIL if the token file is missing or empty."
   (let ((token (read-token-file token-file))
-        ;; --confidential may have been given BEFORE --ppq (the natural order
-        ;; is `--confidential --ppq private/x`), so the session flag wins over
+        ;; --confidential-tinfoil may have been given BEFORE --ppq (the natural order
+        ;; is `--confidential-tinfoil --ppq private/x`), so the session flag wins over
         ;; the keyword: once confidential mode is on, choosing a backend must
         ;; not silently turn it off.
         (conf (or confidential *confidential*)))
@@ -714,7 +714,7 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
        nil)
       ((and conf (not (operandi.ppq:confidential-p model)))
        (format *error-output*
-               "~&set-backend-ppq!: ~s is not a private/* model — Path B is not allowed under --confidential~%"
+               "~&set-backend-ppq!: ~s is not a private/* model — Path B is not allowed under --confidential-tinfoil~%"
                model)
        nil)
       (t
@@ -837,7 +837,7 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
   "Run BODY with the LLM client temporarily switched to Routstr.  URL names the
    node; a `tinfoil-*` MODEL on a node that carries Tinfoil is relayed blind to
    the attested enclave, but this macro does NOT turn on confidential mode —
-   that is --confidential's job, and it is a property of the session."
+   that is --confidential-tinfoil's job, and it is a property of the session."
   (let ((tok (gensym))
         (tf  (gensym)))
     `(let* ((,tf ,token-file)

@@ -21,7 +21,7 @@
                "seal/http"      ; pure-CL HTTP/TLS (on natrium) -- replaced dexador, which was
                                 ; the only way FFI entered this stack (cl+ssl, iolib, static-vectors)
                "cl-sev-snp"     ; AMD SEV-SNP / AWS Nitro attestation verification, pure CL --
-                                ; what makes :PPQ --confidential a local trust decision, not a promise
+                                ; what makes :PPQ --confidential-tinfoil a local trust decision, not a promise
                "cl-sev-snp/kds" ; ...plus the AMD KDS fetch for the ARK/ASK chain
                "babel"
                "quri"

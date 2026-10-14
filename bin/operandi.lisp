@@ -135,7 +135,7 @@
 ;; Apply the configured default model unless the command line names a backend
 ;; explicitly (--openrouter, with or without a model; a bare --openrouter also
 ;; reads the config, below). Doing both would announce the backend twice.
-(let ((m (and (not (member-if (lambda (a) (member a '("--openrouter" "--routstr" "--ppq") :test #'string=))
+(let ((m (and (not (member-if (lambda (a) (member a '("--openrouter" "--routstr" "--ppq" "--tinfoil") :test #'string=))
                                  (uiop:command-line-arguments)))
               (config-default-model))))
   (when m
@@ -194,6 +194,29 @@
                         ;; whatever backend was configured before — that is
                         ;; exactly the silent downgrade this flag exists to
                         ;; prevent.
+                        (unless ok (sb-ext:exit :code 2))
+                        (setf acc (if is-model (rest tail) tail)))
+                      (eng:apply-backend-defaults)))
+                   ((and acc (string= (first acc) "--tinfoil"))
+                    ;; Tinfoil's OWN enclave (inference.tinfoil.sh), sealed end
+                    ;; to end. There is only one path here, so there is no
+                    ;; --confidential to ask for: every request is EHBP-sealed
+                    ;; to a locally verified AMD SEV-SNP enclave, and a
+                    ;; plaintext answer is an error. A model is a bare Tinfoil
+                    ;; id (gpt-oss-120b, glm-5-3, ...); a bare flag takes the
+                    ;; library default.
+                    (let* ((tail (rest acc)) (next (first tail))
+                           ;; Tinfoil ids are bare (gpt-oss-120b), so shape
+                           ;; cannot tell a model from the task.  It is a model
+                           ;; when it is not a flag and something follows it —
+                           ;; `--tinfoil M "task"` vs `--tinfoil "task"`.  A
+                           ;; leading --flag is never a model, so a typo still
+                           ;; reaches the unknown-option branch below.
+                           (is-model (and next (not (uiop:string-prefix-p "--" next))
+                                          (rest tail))))
+                      (let ((ok (if is-model
+                                    (llm:set-backend-tinfoil! :model next)
+                                    (llm:set-backend-tinfoil!))))
                         (unless ok (sb-ext:exit :code 2))
                         (setf acc (if is-model (rest tail) tail)))
                       (eng:apply-backend-defaults)))
@@ -298,6 +321,13 @@
      (format t "      to an AMD-attested Tinfoil enclave verified locally against the pinned~%")
      (format t "      AMD ARK. No fallback — an unverifiable enclave or a plaintext answer is~%")
      (format t "      an error, not a downgrade. --confidential on any other backend fails.~%")
+     (format t "  operandi.lisp -- --tinfoil [MODEL] \"task\"~%")
+     (format t "      Tinfoil's OWN enclave (inference.tinfoil.sh), sealed end to end.~%")
+     (format t "      MODEL is a bare Tinfoil id (gpt-oss-120b, glm-5-3, kimi-k3, ...).~%")
+     (format t "      There is no plaintext mode here: every request is EHBP-sealed to an~%")
+     (format t "      AMD SEV-SNP enclave verified locally against the pinned AMD ARK, and a~%")
+     (format t "      response without an Ehbp-Response-Nonce is refused, not parsed.~%")
+     (format t "      Key in ~~/.operandi/tinfoil.token.~%")
      (format t "~%--openrouter reads token from ~~/.operandi/openrouter.token.~%")
      (format t "Sessions are saved under ~~/.operandi/sessions/; --resume continues one.~%")
      (format t "Default backend is a local llama.cpp on http://127.0.0.1:8081.~%"))

@@ -49,10 +49,11 @@
   (:use #:cl)
   (:local-nicknames (#:json #:json-simple) (#:http #:operandi.http))
   (:export #:*ppq-base* #:*ppq-private-base* #:*ppq-token-file* #:*attestation-ttl*
+           #:*tinfoil-base* #:*tinfoil-attestation-url* #:*tinfoil-token-file*
            #:ppq-error #:ppq-error-reason
            #:ppq-token #:ppq-model-p #:ppq-wire-model #:confidential-p
            #:verify-attested-key
-           #:sealed-post #:plain-post #:ppq-post #:ppq-chat
+           #:sealed-post #:plain-post #:ppq-post #:ppq-chat #:tinfoil-chat
            #:attestation-status))
 
 (in-package #:operandi.ppq)
@@ -71,6 +72,23 @@
                                                 (user-homedir-pathname))
   "Where the PPQ API key lives (mode 600).  PPQ mints these for free at
    POST https://api.ppq.ai/accounts/create; top up with Lightning.")
+
+(defparameter *tinfoil-base* "https://inference.tinfoil.sh"
+  "Base URL of Tinfoil's OWN inference endpoint.  Unlike PPQ's relay this is
+   the enclave's front door: it serves /.well-known/hpke-keys and
+   /v1/chat/completions, and its TLS certificate IS the attested enclave
+   certificate (SPKI sha256 == report_data[0:32]).")
+
+(defparameter *tinfoil-attestation-url* "https://atc.tinfoil.sh/attestation"
+  "Where Tinfoil's attestation bundle comes from.  inference.tinfoil.sh does
+   NOT serve /attestation (404); the bundle is built on demand by the
+   Attestation Transparency service and must be asked for with a POST naming
+   the enclave.  The GET ?domain= form is a trap: it silently ignores an
+   unknown domain and hands back the router-0 bundle instead.")
+
+(defparameter *tinfoil-token-file* (merge-pathnames ".operandi/tinfoil.token"
+                                                    (user-homedir-pathname))
+  "Where the Tinfoil API key lives (mode 600).")
 
 (defparameter *attestation-ttl* 300
   "Seconds an attestation result is reused.  The enclave's key is stable across
@@ -171,14 +189,39 @@
 (defun %get-json (url)
   (json:parse (babel:octets-to-string (%get-octets url) :encoding :utf-8)))
 
-(defun verify-attested-key (&key (base *ppq-private-base*) force)
+(defun %post-json (url body)
+  "POST BODY (a JSON string) to URL and parse the JSON answer.  Used for the
+   one attestation endpoint that is a POST (Tinfoil's ATC)."
+  (json:parse (http:post url :content body
+                             :headers '(("Content-Type" . "application/json"))
+                             :read-timeout 30)))
+
+(defun %attestation-bundle (base &key attestation-url)
+  "The attestation bundle for BASE.
+
+   Two shapes, because the two providers publish it differently:
+     * PPQ's relay serves the bundle itself at <base>/attestation (GET).
+     * Tinfoil's enclave does not serve it at all; the bundle is built on
+       demand by ATC, which must be POSTed the enclave URL.  ATTESTATION-URL
+       names that endpoint, and the enclave URL is BASE."
+  (if attestation-url
+      (%post-json attestation-url
+                  (with-output-to-string (s)
+                    (json:stringify (%ht "enclaveUrl" base) :stream s)))
+      (%get-json (format nil "~A/attestation" base))))
+
+(defun verify-attested-key (&key (base *ppq-private-base*) attestation-url force)
   "Fetch BASE's attestation bundle and HPKE key, verify the bundle against the
    pinned AMD ARK, and check that the HPKE key is the one bound into the
    report.  Returns (values HPKE-KEY CHECKS BUNDLE).
 
+   ATTESTATION-URL, when given, is where the bundle comes from instead of
+   <BASE>/attestation (Tinfoil's enclave serves no /attestation; ATC builds
+   one on demand from a POST).
+
    Every failure signals PPQ-ERROR.  There is no unverified path: a
    caller that cannot get a verified key does not get to send the request."
-  (let ((key (list base)))
+  (let ((key (list base attestation-url)))
     (when (and (not force) *attestation-cache*
                (equal key (getf *attestation-cache* :key))
                (< (- (get-universal-time) (getf *attestation-cache* :at)) *attestation-ttl*))
@@ -186,7 +229,7 @@
         (values (getf *attestation-cache* :hpke)
                 (getf *attestation-cache* :checks)
                 (getf *attestation-cache* :bundle))))
-    (let* ((bundle (handler-case (%get-json (format nil "~A/attestation" base))
+    (let* ((bundle (handler-case (%attestation-bundle base :attestation-url attestation-url)
                      (error (e) (refuse :attestation-fetch "~a" e))))
            (cfg-octets (handler-case (%get-octets (format nil "~A/.well-known/hpke-keys" base))
                          (error (e) (refuse :hpke-fetch "~a" e))))
@@ -215,11 +258,12 @@
                       :at (get-universal-time)))
           (values hpke checks bundle))))))
 
-(defun attestation-status (&key (base *ppq-private-base*) force)
+(defun attestation-status (&key (base *ppq-private-base*) attestation-url force)
   "Human-readable one-liner about BASE's attestation, for a banner or a check.
    Returns (values OK-P TEXT)."
   (handler-case
-      (multiple-value-bind (key checks bundle) (verify-attested-key :base base :force force)
+      (multiple-value-bind (key checks bundle)
+          (verify-attested-key :base base :attestation-url attestation-url :force force)
         (values t (format nil "ppq confidential: ~a verified, HPKE key ~a, measurement ~a"
                           (or (%get bundle "domain") base)
                           (subseq (%hex key) 0 16)
@@ -264,6 +308,7 @@
       (error () nil))))
 
 (defun sealed-post (url body headers &key (base *ppq-private-base*) (model nil)
+                                            attestation-url
                                             (read-timeout 240) (retries 2))
   "POST BODY (a JSON string) to URL with the request EHBP-sealed to BASE's
    attested HPKE key, and return the DECRYPTED response body as a string.
@@ -279,7 +324,8 @@
    unreadable noise."
   (let ((attempt 0))
     (loop
-      (multiple-value-bind (hpke checks) (verify-attested-key :base base)
+      (multiple-value-bind (hpke checks) (verify-attested-key :base base
+                                                              :attestation-url attestation-url)
         (declare (ignore checks))
         (let* ((payload (if model (%rewrite-model body model) body))
                (req (seal:ehbp-seal-request hpke (%octets payload)))
@@ -345,6 +391,7 @@
 
 (defun ppq-post (url body headers &key confidential (base *ppq-base*)
                                           (private-base *ppq-private-base*)
+                                          attestation-url
                                           (model nil) (read-timeout 240))
   "The one place the two PPQ modes diverge.  CONFIDENTIAL routes through
    SEALED-POST against PRIVATE-BASE (attested, Path A only); otherwise through
@@ -359,12 +406,14 @@
                        url
                        (format nil "~A/v1/chat/completions" private-base))
                    body headers
-                   :base private-base :model model :read-timeout read-timeout)
+                   :base private-base :attestation-url attestation-url
+                   :model model :read-timeout read-timeout)
       (plain-post url body headers :read-timeout read-timeout)))
 
 (defun ppq-chat (model prompt &key (system nil) (max-tokens 256) (temperature 0.0)
                                      confidential
                                      (base *ppq-base*) (private-base *ppq-private-base*)
+                                     attestation-url
                                      (read-timeout 240))
   "One-shot chat against MODEL.  Returns (values TEXT PARSED).
 
@@ -394,8 +443,45 @@
                              ("Authorization" . ,(concatenate 'string "Bearer " token)))
                            :confidential confidential
                            :base base :private-base private-base
+                           :attestation-url attestation-url
                            :model (and confidential wire)
                            :read-timeout read-timeout))
+           (parsed (json:parse text))
+           (choices (%get parsed "choices"))
+           (msg (and (vectorp choices) (plusp (length choices))
+                     (%get (aref choices 0) "message"))))
+      (values (and msg (%get msg "content")) parsed))))
+
+(defun tinfoil-chat (model prompt &key (system nil) (max-tokens 256) (temperature 0.0)
+                                        (base *tinfoil-base*)
+                                        (attestation-url *tinfoil-attestation-url*)
+                                        (token-file *tinfoil-token-file*)
+                                        (read-timeout 240))
+  "One-shot chat against Tinfoil's OWN enclave (inference.tinfoil.sh), sealed
+   end to end.  Returns (values TEXT PARSED).
+
+   This is the same transport as confidential PPQ — EHBP to a locally verified
+   AMD SEV-SNP enclave, no fallback — but pointed at the enclave instead of at
+   PPQ's relay, so the only party in the path is the measured enclave.  MODEL
+   is a bare Tinfoil id (gpt-oss-120b, glm-5-3, kimi-k3, …); there is no
+   `private/` prefix here because there is no second path to distinguish it
+   from.  The bundle comes from ATC (a POST), not from the enclave."
+  (let* ((msgs (if system
+                   (vector (%ht "role" "system" "content" system)
+                           (%ht "role" "user" "content" prompt))
+                   (vector (%ht "role" "user" "content" prompt))))
+         (body (with-output-to-string (s)
+                 (json:stringify (%ht
+                                  "model" model "messages" msgs
+                                  "max_tokens" max-tokens "temperature" temperature)
+                                 :stream s)))
+         (token (ppq-token token-file)))
+    (unless token (refuse :no-token "no Tinfoil API key at ~a" token-file))
+    (let* ((text (sealed-post (format nil "~A/v1/chat/completions" base) body
+                              `(("Content-Type" . "application/json")
+                                ("Authorization" . ,(concatenate 'string "Bearer " token)))
+                              :base base :attestation-url attestation-url
+                              :read-timeout read-timeout))
            (parsed (json:parse text))
            (choices (%get parsed "choices"))
            (msg (and (vectorp choices) (plusp (length choices))

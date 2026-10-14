@@ -1373,9 +1373,10 @@ input row and erased by the next repaint.  The echo goes through EMIT, which tak
   (format nil "operandi~@[ ~A ~A~]~@[ --effort ~A~] --resume ~A tui"
           (case llm:*llm-backend*
             (:ppq (if llm:*confidential* "--confidential --ppq" "--ppq"))
+            (:tinfoil "--tinfoil")
             ((:openrouter :routstr) "--openrouter")
             (t nil))
-          (and (member llm:*llm-backend* '(:openrouter :routstr :ppq)) llm:*llm-model*)
+          (and (member llm:*llm-backend* '(:openrouter :routstr :ppq :tinfoil)) llm:*llm-model*)
           (and llm:*llm-effort* (effort-label))
           (gethash :id sess)))
 

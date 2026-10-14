@@ -31,7 +31,7 @@
            #:image-part #:text-part #:user-content #:content-text #:content-images
            #:image-file-p
            #:set-backend-openrouter! #:set-backend-llama! #:set-backend-routstr!
-           #:set-backend-ppq!
+           #:set-backend-ppq! #:set-backend-tinfoil!
            #:with-llama #:with-openrouter #:with-routstr #:with-ppq
            #:openrouter-credits
            #:cloud-backend-p #:*sealed-post* #:post-chat
@@ -129,8 +129,9 @@
 (defun cloud-backend-p (&optional (backend *llm-backend*))
   "True for hosted backends that speak OpenRouter's request dialect
    (usage accounting, reasoning.effort): :OPENROUTER and :ROUTSTR — and
-   :PPQ, which is hosted and metered too (it just may seal the body)."
-  (member backend '(:openrouter :routstr :ppq)))
+   :PPQ and :TINFOIL, which are hosted and metered too (they just may seal
+   the body)."
+  (member backend '(:openrouter :routstr :ppq :tinfoil)))
 
 (defvar *confidential* nil
   "When true, the current backend must be able to prove it is talking to a
@@ -144,11 +145,12 @@
    have that be a checkable claim rather than a naming convention.")
 
 (defun confidential-backend-p (&optional (backend *llm-backend*))
-  "True when BACKEND can actually satisfy *CONFIDENTIAL*.  Only :PPQ can: it
-   is the one backend whose transport we can seal to a locally verified
-   enclave.  :OPENROUTER, :ROUTSTR and :LLAMA cannot, so --confidential with
-   any of them is a configuration error, not a silent downgrade."
-  (eq backend :ppq))
+  "True when BACKEND can actually satisfy *CONFIDENTIAL*.  :PPQ (Path A) and
+   :TINFOIL can: they are the backends whose transport we can seal to a
+   locally verified enclave.  :OPENROUTER, :ROUTSTR and :LLAMA cannot, so
+   --confidential with any of them is a configuration error, not a silent
+   downgrade."
+  (member backend '(:ppq :tinfoil)))
 
 (defun enable-confidential! ()
   "Turn on confidential mode for the current session (the --confidential flag).
@@ -177,8 +179,9 @@ enclave, plaintext upstream) is not allowed. Use --ppq private/<model>."
    loudly instead of quietly sending plaintext for the whole session."
   (when (and *confidential* (not (confidential-backend-p)))
     (error "confidential mode is not available on the ~(~a~) backend: only PPQ \
-can seal a request to a locally verified enclave. Use --confidential --ppq \
-private/<model>, or drop --confidential."
+(Path A) and Tinfoil can seal a request to a locally verified enclave. Use \
+--confidential --ppq private/<model>, or --tinfoil <model>, or drop \
+--confidential."
            *llm-backend*))
   t)
 
@@ -218,7 +221,11 @@ private/<model>, or drop --confidential."
         (setf (gethash "reasoning" body) (ht "effort" (string-downcase (symbol-name effort)))))))
     (:llama
      (setf (gethash "chat_template_kwargs" body)
-           (ht "enable_thinking" (and (member effort '(:low :medium :high)) t)))))
+           (ht "enable_thinking" (and (member effort '(:low :medium :high)) t))))
+    ;; :PPQ and :TINFOIL speak the enclave's plain OpenAI dialect: no
+    ;; reasoning field, no chat_template_kwargs.  An unknown field is a 400 we
+    ;; would have to debug through a sealed channel, so send nothing.
+    ((:ppq :tinfoil) body))
   body)
 
 (defparameter *llm-auth-token* nil
@@ -527,6 +534,41 @@ call with :want-stream nil"))
              *llm-model*      model
              *llm-read-timeout* 240
              *sealed-post*    nil)
+       t))))
+
+(defun set-backend-tinfoil! (&key (model "gpt-oss-120b")
+                                  (base operandi.ppq:*tinfoil-base*)
+                                  (attestation-url operandi.ppq:*tinfoil-attestation-url*)
+                                  (token-file operandi.ppq:*tinfoil-token-file*))
+  "Switch the LLM client to Tinfoil's OWN enclave (inference.tinfoil.sh).
+
+   There is no plaintext mode here and no --confidential to ask for: this
+   backend exists only as the sealed one.  Every request is EHBP-sealed to the
+   HPKE key of an AMD SEV-SNP enclave verified locally against the pinned AMD
+   ARK, and a response without an Ehbp-Response-Nonce is refused rather than
+   parsed.  MODEL is a bare Tinfoil id (gpt-oss-120b, glm-5-3, kimi-k3, …).
+
+   Returns T on success, NIL if the token file is missing or empty."
+  (let ((token (read-token-file token-file)))
+    (cond
+      ((or (null token) (zerop (length token)))
+       (format *error-output* "~&set-backend-tinfoil!: token file ~A missing or empty~%"
+               token-file)
+       nil)
+      (t
+       (setf *llm-backend*    :tinfoil
+             *llm-url*        (format nil "~A/v1/chat/completions" base)
+             *llm-auth-token* token
+             *llm-model*      model
+             *llm-read-timeout* 240
+             ;; Sealed always, and *CONFIDENTIAL* is set with it so that the
+             ;; plaintext guard in %LLM-POST holds even if the sealer were
+             ;; somehow cleared: on this backend there is no unsealed request.
+             *confidential*   t
+             *sealed-post*    (lambda (url body headers)
+                                (operandi.ppq:sealed-post
+                                 url body headers :base base
+                                 :attestation-url attestation-url)))
        t))))
 
 (defun set-backend-ppq! (&key (model "private/gpt-oss-120b")

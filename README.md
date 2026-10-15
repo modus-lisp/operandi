@@ -53,6 +53,7 @@ operandi [FLAGS] [COMMAND | "task description"]
 | *(none)* | interactive TUI |
 | `tui` / `shell` / `repl` | interactive TUI |
 | `ask <question>` | the question phase, non-interactively: rival hypotheses → a swarm settles them → an answer from the verdicts |
+| `ask-json` | the same, as data: a JSON request on stdin (`question`, optional `hypotheses`, `context`, `synthesize`, `worker_model`), the result as one `@@OPERANDI-JSON@@ {...}` line |
 | *anything else* | a one-shot task; the remaining arguments are joined into the prompt |
 
 **Flags** (any order, before the command):
@@ -281,10 +282,21 @@ See `inspect/acp/README.md` for the three validation layers.
 
 ## MCP server
 
-`mcp/server.js` spawns the CLI per task and exposes `operandi_run` /
-`operandi_fan` / `operandi_swarm` (plus `operandi_get_run`, `operandi_cancel_run`,
-`operandi_swarm_status`) over stdio. Point it at a different loader with
-`OPERANDI_ROOT` (default: the repo root above `mcp/`).
+`mcp/server.js` runs the fast launcher per task and exposes, over stdio:
+
+- `operandi_run`, `operandi_fan` and `operandi_swarm`, plus `operandi_get_run`,
+  `operandi_cancel_run` and `operandi_swarm_status`;
+- the question phase as data: `operandi_ask` (rival hypotheses → swarm
+  verdicts → answer), `operandi_investigate` (the swarm on the caller's
+  hypotheses) and `operandi_findings` (search the ledger, flagging records
+  whose code has moved).
+
+`OPERANDI_ROOT` points it at a different checkout (default: the repo root above
+`mcp/`). See `mcp/README.md`.
+
+The same question phase is on the command line as `bin/operandi ask-json <
+request.json`: a JSON request in, one `@@OPERANDI-JSON@@ {...}` line out
+(`operandi.subagent:ask-structured` from Lisp).
 
 ```
 cd mcp && npm install && node server.js

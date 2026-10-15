@@ -94,6 +94,42 @@
       (format t "~&interrupted.~%")
       (sb-ext:exit :code 130))))
 
+;;; The marker a harness looks for on stdout; keep in sync with mcp/server.js.
+(defparameter +json-result-marker+ "@@OPERANDI-JSON@@")
+
+(defun %emit-json-result (ht)
+  (format t "~&~A ~A~%" +json-result-marker+ (json:stringify ht))
+  (finish-output))
+
+(defun run-ask-json ()
+  "Read an ask request as JSON from stdin, run OPERANDI.SUBAGENT:ASK-STRUCTURED,
+   print the result as one marker line. Exits 1 on any error."
+  (handler-case
+      (let* ((req (json:parse (uiop:slurp-stream-string *standard-input*)))
+             (get (lambda (k) (let ((v (and (hash-table-p req) (gethash k req))))
+                                (if (eq v 'null) nil v))))
+             (question (funcall get "question"))
+             (hyps (funcall get "hypotheses"))
+             (synth (multiple-value-bind (v present)
+                        (and (hash-table-p req) (gethash "synthesize" req))
+                      (if present (and v (not (eq v 'null))) t))))
+        (unless (and (stringp question) (plusp (length question)))
+          (error "request needs a non-empty \"question\" string"))
+        (when (and hyps (not (and (vectorp hyps) (every #'stringp hyps))))
+          (error "\"hypotheses\" must be an array of strings"))
+        (%emit-json-result
+         (funcall (find-symbol "ASK-STRUCTURED" "OPERANDI.SUBAGENT")
+                  question
+                  :hypotheses (and hyps (plusp (length hyps)) (coerce hyps 'list))
+                  :context (funcall get "context")
+                  :synthesize synth
+                  :worker-model (funcall get "worker_model"))))
+    (error (e)
+      (%emit-json-result (let ((h (make-hash-table :test 'equal)))
+                           (setf (gethash "error" h) (princ-to-string e))
+                           h))
+      (sb-ext:exit :code 1 :abort t))))
+
 (defun preflight-or-die ()
   "Confirm the configured model/backend can actually serve a request BEFORE
    entering the loop, so a bad model slug / provider-allowlist miss / unreachable
@@ -277,6 +313,8 @@
     ((string= cmd "--help")
      (format t "~&usage:~%")
      (format t "  operandi.lisp -- \"task description\"~%")
+     (format t "  operandi.lisp -- ask \"question\"   (rival hypotheses -> swarm verdicts -> answer)~%")
+     (format t "  operandi.lisp -- ask-json < req.json   (the same as JSON, on one @@OPERANDI-JSON@@ line; for harnesses)~%")
      (format t "  operandi.lisp              (no args, or --tui: interactive REPL: streaming, tools, /commands)~%")
      (format t "  operandi.lisp -- --resume [ID] tui  (resume a saved session; latest if no ID)~%")
      (format t "  operandi.lisp -- --rc TARGET \"task\"   (mirror each turn to a Marmot chat: TARGET is an npub, nprofile or NIP-05 to start a new chat, or a chat name / group id for an existing one; also /rc in the TUI)~%")
@@ -306,6 +344,13 @@
     ((string-equal cmd "ask")
      (funcall (find-symbol "REPL" "OPERANDI.TUI")
               :once (format nil "/ask ~{~A~^ ~}" (rest args)) :greet nil))
+    ;; operandi ask-json < request.json — the question phase as DATA, for a
+    ;; harness (the MCP server). Request: {"question": "...", "hypotheses":
+    ;; [...]?, "context": "..."?, "synthesize": bool?, "worker_model": "..."?}.
+    ;; The result is ONE line on stdout, "@@OPERANDI-JSON@@ {...}", so a
+    ;; caller can find it among the progress lines; failures print the same
+    ;; line with {"error": "..."} and exit 1.
+    ((string-equal cmd "ask-json") (run-ask-json))
     (t (run-once (format nil "~{~A~^ ~}" args) tool-names))))
 
 ;; Exit cleanly once the command is done. Without this, an invocation that

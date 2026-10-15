@@ -53,6 +53,7 @@ operandi [FLAGS] [COMMAND | "task description"]
 | *(none)* | interactive TUI |
 | `tui` / `shell` / `repl` | interactive TUI |
 | `ask <question>` | the question phase, non-interactively: rival hypotheses → a swarm settles them → an answer from the verdicts |
+| `mcp` | list the external MCP servers: where each came from, whether it started, its tools |
 | `ask-json` | the same, as data: a JSON request on stdin (`question`, optional `hypotheses`, `context`, `synthesize`, `worker_model`), the result as one `@@OPERANDI-JSON@@ {...}` line |
 | *anything else* | a one-shot task; the remaining arguments are joined into the prompt |
 
@@ -64,8 +65,12 @@ operandi [FLAGS] [COMMAND | "task description"]
 | `--worker-model M` | model for sub-agents: a `vendor/name` slug, `llama`, or `inherit` |
 | `--effort off\|low\|medium\|high\|default` | reasoning effort (also `OPERANDI_EFFORT`) |
 | `--resume [ID]` | resume a saved session (latest if no ID); with a task, runs one more non-interactive turn |
-| `--tools A,B,C` | allow-list: exactly these tools |
-| `--no-tools X,Y` | the default tool set minus these |
+| `--tools A,B,C` | allow-list: exactly these tools (`mcp__rea__*` takes every tool with that prefix) |
+| `--no-tools X,Y` | the default tool set minus these (globs too) |
+| `--mcp-config FILE` | also read FILE's `mcpServers` (repeatable; after the default file) |
+| `--mcp NAME=CMD [ARGS…]` | an external stdio MCP server, quoted as one argument (repeatable) |
+| `--mcp NAME=https://URL` | an external Streamable HTTP MCP server |
+| `--no-default-mcp` | do not read `~/.operandi/mcp.json` |
 | `--tui` | force the interactive TUI |
 | `--help` | usage |
 
@@ -131,6 +136,7 @@ src/
   search.lisp         operandi.search   — web search (OpenRouter plugin / SearXNG / Brave)
   hooks.lisp          operandi.hooks    — pre/post-tool hooks (default: log to SQLite)
   tools.lisp          operandi.tools    — tool registry + the tool-sandbox limits
+  mcp.lisp            operandi.mcp      — MCP client: external servers' tools as operandi tools
   engine.lisp         operandi.engine   — the agent loop (retries, auto-compaction, cost)
   subagent.lisp       operandi.subagent — Task/Fan/Spawn/Investigate/SendMessage (depth-capped)
   cron.lisp           operandi.cron     — in-image scheduled-task runner (empty by default)
@@ -141,6 +147,7 @@ src/
 bin/operandi.lisp     standalone CLI          (fast launcher: bin/operandi)
 bin/operandi-acp.lisp ACP server entry point  (fast launcher: bin/operandi-acp)
 mcp/                  Node MCP server exposing operandi as dispatchable tools + a swarm harness
+                      (mcp/test/fixture-server.mjs: a test server for the MCP client)
 ```
 
 The default tool set is `Eval Read Write Edit Bash Grep Glob WebFetch
@@ -280,6 +287,70 @@ cd inspect/acp && npm install && npm test   # schema conformance (needs a model 
 The schema-conformance suite and the goose interop script are not part of fitness.
 See `inspect/acp/README.md` for the three validation layers.
 
+## External MCP servers (operandi as an MCP client)
+
+operandi can use the tools of any MCP server. Each one the server lists becomes
+an ordinary tool named `mcp__<server>__<tool>` in the agent's default set; a call
+is a `tools/call` on the server, and the result comes back labelled as external
+content (data, never instructions).
+
+**Where servers come from**, later winning per server name:
+
+1. the default file, `~/.operandi/mcp.json` (or `$OPERANDI_MCP_CONFIG`); skip it
+   with `--no-default-mcp`;
+2. each `--mcp-config FILE`, in order;
+3. each `--mcp NAME=SPEC` on the command line.
+
+The files use Claude Code's `.mcp.json` shape, so one file serves both:
+
+```json
+{
+  "mcpServers": {
+    "rea":  { "command": "npx", "args": ["-y", "rea-agents@latest", "mcp"],
+              "env": { "REA_GHIDRA_STARTUP_TIMEOUT_MS": "120000" } },
+    "docs": { "type": "http", "url": "https://example.com/mcp",
+              "headers": { "Authorization": "Bearer ${DOCS_TOKEN}" } }
+  }
+}
+```
+
+`${VAR}` and `${VAR:-default}` expand from the environment. Keys operandi adds:
+
+| key | meaning |
+|-----|---------|
+| `timeout` | seconds a call may take before it is cancelled (default 120) |
+| `startupTimeout` | seconds to start + initialise + list tools (default 60; `npx -y` may download first) |
+| `cwd` | working directory for a stdio server |
+| `tools` | allow-list of the server's own tool names (`"inspect_*"` matches a prefix) |
+| `workers` | `true` = `/ask` and Investigate workers may use every tool of this server. Otherwise they get only the tools the server marks `readOnlyHint`: workers are investigators, not fixers |
+| `disabled` | `true` = skip this entry |
+
+On the command line, `--mcp 'rea=npx -y rea-agents@latest mcp'` is a stdio server
+(split like a shell would) and `--mcp docs=https://example.com/mcp` is an HTTP
+one. `bin/operandi mcp` lists what started, from where, and with which tools.
+
+Things to know:
+
+- **A project's own `.mcp.json` is not read automatically.** A cloned
+  repository must not be able to make operandi launch a command. Pass it on
+  purpose: `--mcp-config .mcp.json`.
+- **Transports:** stdio, and Streamable HTTP (single JSON or SSE replies, a
+  session id). The old HTTP+SSE transport is not supported.
+- **Failures are not fatal.** A server that will not start, or dies, is
+  reported (with its log, `~/.operandi/mcp-logs/<name>.log`, where its stderr
+  goes) and its tools are left out. A config file or `--mcp` spec you named that
+  cannot be read *is* fatal (exit 2).
+- **Concurrency:** Fan and Investigate workers can call one server at once. A
+  stdio connection routes each response to its request by id, so calls overlap
+  instead of queuing.
+- **Lifetime:** servers start before the first turn and are stopped when
+  operandi exits. The ACP server (`bin/operandi-acp`) reads the default file too.
+- **Offered capabilities:** tools only. operandi answers `ping`, and declines a
+  server's requests for roots, sampling or elicitation.
+
+`inspect/mcp-test.lisp` checks all of this against `mcp/test/fixture-server.mjs`
+over both transports, with no model.
+
 ## MCP server
 
 `mcp/server.js` runs the fast launcher per task and exposes, over stdio:
@@ -342,6 +413,8 @@ sbcl --non-interactive --load inspect/robustness-test.lisp
 | Brave Search token | `BRAVE_API_KEY`, else `~/.operandi/brave-search.token` |
 | Agent audit log DB | `~/.operandi/operandi.db` |
 | Persistent agent notes | `~/.operandi/operandi-notes.md` |
+| External MCP servers | `~/.operandi/mcp.json` (or `$OPERANDI_MCP_CONFIG`) |
+| MCP server logs (stderr) | `~/.operandi/mcp-logs/` |
 | TUI session transcripts | `~/.operandi/sessions/` |
 | Compaction offload | `~/.operandi/offload/` |
 | Cron reports / state | `~/.operandi/reports/`, `~/.operandi/cron.log` |

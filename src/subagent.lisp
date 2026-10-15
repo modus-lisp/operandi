@@ -39,6 +39,7 @@
            #:parse-worker-model
            #:*ask-max-hypotheses*
            #:*ask-worker-tools*
+           #:ask-worker-tools
            #:install-thread-error-guard
            #:*swarm-deadline*
            #:run-investigate
@@ -834,6 +835,13 @@ start may outlive you: kill every background process before you report."
    to its scratch dir and runs it in a SEPARATE sbcl through Bash, where it
    can crash all it likes.")
 
+(defun ask-worker-tools ()
+  "*ASK-WORKER-TOOLS* plus the external MCP tools a worker may use: those a
+   server marks read-only, or every tool of a server configured \"workers\": true."
+  (append *ask-worker-tools*
+          (remove-if (lambda (n) (member n *ask-worker-tools* :test #'string=))
+                     tools:*extra-worker-tools*)))
+
 (defun parse-hypothesis-list (text)
   "The JSON array of strings in TEXT — tolerating a ```json fence or prose
    around it, which models add despite being told not to. NIL if none."
@@ -958,7 +966,7 @@ high confidence — that work is done."
         (run-investigate hyps
                          (format nil "Project: ~A~%The question being answered: ~A~@[~%~%~A~]"
                                  project question context)
-                         *ask-worker-tools* 1 worker-model)
+                         (ask-worker-tools) 1 worker-model)
       (declare (ignore text))
       (llm:usage-incf total batch)
       (let ((answer

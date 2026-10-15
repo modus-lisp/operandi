@@ -43,6 +43,11 @@
            #:*read-max-total-bytes*
            #:*tool-gate*
            #:define-tool
+           #:register-tool
+           #:unregister-tool
+           #:*extra-default-tools*
+           #:*extra-worker-tools*
+           #:expand-tool-names
            #:tool-by-name
            #:tools-as-openai-array
            #:invoke-tool
@@ -124,6 +129,52 @@
                                      (type-of e)))
                            (error (e)
                              (format nil "TOOL ERROR: ~A" e))))))))
+
+;;; Tools that are not known until run time — the ones an external MCP server
+;;; advertises (operandi.mcp) — are registered through a function rather than
+;;; DEFINE-TOOL, and join the default set through *EXTRA-DEFAULT-TOOLS*. The
+;;; read-only subset also joins what an /ask or Investigate worker may use,
+;;; through *EXTRA-WORKER-TOOLS*: workers are investigators, not fixers.
+
+(defvar *extra-default-tools* '()
+  "Names appended to DEFAULT-TOOLS: tools registered at run time.")
+
+(defvar *extra-worker-tools* '()
+  "Names an investigating worker may use on top of its fixed read-only set.")
+
+(defun register-tool (name description schema impl)
+  "Register a tool whose IMPL is a function of the parsed-arguments hash table
+   returning a string. Same error containment as DEFINE-TOOL."
+  (setf (gethash name *tools*)
+        (list :name name
+              :description description
+              :schema schema
+              :impl (lambda (args)
+                      (handler-case (funcall impl args)
+                        (storage-condition (e)
+                          (format nil "TOOL ERROR: exhausted stack/heap (~A)" (type-of e)))
+                        (error (e)
+                          (format nil "TOOL ERROR: ~A" e)))))))
+
+(defun unregister-tool (name)
+  (remhash name *tools*)
+  (setf *extra-default-tools* (remove name *extra-default-tools* :test #'string=)
+        *extra-worker-tools* (remove name *extra-worker-tools* :test #'string=)))
+
+(defun expand-tool-names (names)
+  "NAMES with each entry ending in * replaced by every registered tool whose
+   name starts with the part before it (\"mcp__rea__*\"), in sorted order.
+   Plain names pass through. Duplicates are dropped, order kept."
+  (let ((out '()))
+    (dolist (n names)
+      (if (and (plusp (length n)) (char= (char n (1- (length n))) #\*))
+          (let ((prefix (subseq n 0 (1- (length n)))))
+            (dolist (k (sort (loop for k being the hash-keys of *tools*
+                                   when (uiop:string-prefix-p prefix k) collect k)
+                             #'string<))
+              (pushnew k out :test #'string=)))
+          (pushnew n out :test #'string=)))
+    (nreverse out)))
 
 (defun tool-by-name (name)
   (gethash name *tools*))
@@ -784,9 +835,11 @@ large)."
   ;; Verdict is deliberately absent: it is the WORKER's reporting channel,
   ;; and Investigate adds it to the toolset of the workers it spawns. An
   ;; agent that was not given a hypothesis has nothing to return a verdict on.
-  '("Eval" "Read" "Write" "Edit" "Bash" "Grep" "Glob" "WebFetch"
-    "WebSearch" "Remember" "Findings" "Task" "Fan" "Spawn" "Investigate"
-    "SendMessage" "TodoWrite"))
+  (append
+   '("Eval" "Read" "Write" "Edit" "Bash" "Grep" "Glob" "WebFetch"
+     "WebSearch" "Remember" "Findings" "Task" "Fan" "Spawn" "Investigate"
+     "SendMessage" "TodoWrite")
+   (copy-list *extra-default-tools*)))
 
 (defun read-notes-if-any (file)
   (handler-case

@@ -53,9 +53,13 @@
 (in-package #:operandi-cli)
 
 (defun %csv (s) (and s (mapcar (lambda (x) (string-trim " " x)) (uiop:split-string s :separator ","))))
-(defun %tools-allow (csv) "The tool set for --tools: exactly the named tools." (%csv csv))
-(defun %tools-deny (csv)  "The tool set for --no-tools: the defaults minus the named tools."
-  (let ((deny (%csv csv)))
+(defun %tools-allow (csv)
+  "The tool set for --tools: exactly the named tools. A name ending in * takes
+   every registered tool with that prefix (mcp__rea__*)."
+  (tools:expand-tool-names (%csv csv)))
+(defun %tools-deny (csv)
+  "The tool set for --no-tools: the defaults minus the named tools (globs too)."
+  (let ((deny (tools:expand-tool-names (%csv csv))))
     (remove-if (lambda (n) (member n deny :test #'string-equal)) (tools:default-tools))))
 
 (defun display-run (prompt &optional (tool-names (tools:default-tools)))
@@ -183,7 +187,12 @@
 (let* ((raw (remove "--" (uiop:command-line-arguments) :test #'string=))
        (resume nil)
        (tui-p nil)
-       (tool-names (tools:default-tools))     ; available-tools allow-list (default = all)
+       (tool-names nil)        ; set after MCP servers start: --tools/--no-tools may name theirs
+       (tools-allow nil)       ; --tools CSV, resolved then
+       (tools-deny nil)        ; --no-tools CSV, resolved then
+       (mcp-default t)         ; read ~/.operandi/mcp.json (--no-default-mcp: don't)
+       (mcp-configs '())       ; --mcp-config FILE, in order
+       (mcp-specs '())         ; --mcp NAME=SPEC, in order
        ;; Strip leading flags (--openrouter [model], --resume [id], --tools/--no-tools) in any order.
        (args (let ((acc raw))
                (loop
@@ -260,9 +269,24 @@
                             (t                       (setf resume :latest acc tail)))))
                    ;; --tools A,B,C  -> ONLY those tools; --no-tools X,Y -> defaults minus X,Y.
                    ((and acc (string= (first acc) "--tools"))
-                    (setf tool-names (%tools-allow (second acc)) acc (cddr acc)))
+                    (setf tools-allow (second acc) acc (cddr acc)))
                    ((and acc (string= (first acc) "--no-tools"))
-                    (setf tool-names (%tools-deny (second acc)) acc (cddr acc)))
+                    (setf tools-deny (second acc) acc (cddr acc)))
+                   ;; External MCP servers: --mcp-config FILE (repeatable, after the
+                   ;; default ~/.operandi/mcp.json), --mcp NAME=SPEC (repeatable, last
+                   ;; word), --no-default-mcp (skip the default file).
+                   ((and acc (string= (first acc) "--mcp-config"))
+                    (unless (and (second acc) (plusp (length (second acc))))
+                      (format *error-output* "operandi: --mcp-config takes a file~%")
+                      (sb-ext:exit :code 2))
+                    (setf mcp-configs (append mcp-configs (list (second acc))) acc (cddr acc)))
+                   ((and acc (string= (first acc) "--mcp"))
+                    (unless (and (second acc) (find #\= (second acc)))
+                      (format *error-output* "operandi: --mcp takes NAME=COMMAND [ARGS…] or NAME=https://URL~%")
+                      (sb-ext:exit :code 2))
+                    (setf mcp-specs (append mcp-specs (list (second acc))) acc (cddr acc)))
+                   ((and acc (string= (first acc) "--no-default-mcp"))
+                    (setf mcp-default nil acc (rest acc)))
                    ((and acc (string= (first acc) "--tui"))
                     (setf tui-p t acc (rest acc)))
                    ;; --rc TARGET: mirror every turn to a Marmot chat (see operandi.rc:rc).
@@ -292,8 +316,9 @@
                acc))
        ;; --tui and no argument at all are the same thing: the interactive TUI.
        (cmd (if tui-p "tui" (first args))))
-  ;; Preflight the model on any path that will actually run a turn (not bare help).
-  (unless (equal cmd "--help")
+  ;; Preflight the model on any path that will actually run a turn (not bare
+  ;; help, not the `mcp` listing).
+  (unless (member cmd '("--help" "mcp") :test #'equal)
     ;; A confidential session on a backend that cannot seal is a configuration
     ;; error, and it must be fatal BEFORE the first turn — not a warning that
     ;; scrolls past while plaintext goes out.
@@ -302,7 +327,25 @@
         (format *error-output* "~&operandi: ~A~%" e)
         (sb-ext:exit :code 2)))
     (preflight-or-die))
+  ;; External MCP servers, before the tool set is resolved: their tools join it.
+  ;; A file or spec the operator named that cannot be read is fatal; a server
+  ;; that will not start is reported and skipped.
+  (unless (equal cmd "--help")
+    (handler-case
+        (operandi.mcp:start-from-options :use-default mcp-default
+                                         :config-files mcp-configs
+                                         :cli-specs mcp-specs)
+      (error (e)
+        (format *error-output* "~&operandi: ~A~%" e)
+        (sb-ext:exit :code 2))))
+  (setf tool-names (cond (tools-allow (%tools-allow tools-allow))
+                         (tools-deny (%tools-deny tools-deny))
+                         (t (tools:default-tools))))
   (cond
+    ;; operandi mcp — what is configured, what started, which tools it gave us
+    ((equal cmd "mcp")
+     (write-string (operandi.mcp:status-text))
+     (finish-output))
     ;; --resume alone or with an explicit tui command → resumed interactive TUI
     ((and resume (or (null cmd) (member cmd '("tui" "shell" "repl") :test #'string-equal)))
      (run-shell resume))
@@ -314,6 +357,11 @@
      (format t "~&usage:~%")
      (format t "  operandi.lisp -- \"task description\"~%")
      (format t "  operandi.lisp -- ask \"question\"   (rival hypotheses -> swarm verdicts -> answer)~%")
+     (format t "  operandi.lisp -- mcp   (list the external MCP servers, their state and tools)~%")
+     (format t "  operandi.lisp -- --mcp-config FILE \"task\"   (also read FILE's mcpServers; repeatable)~%")
+     (format t "  operandi.lisp -- --mcp NAME=COMMAND [ARGS…] \"task\"   (a stdio MCP server; repeatable)~%")
+     (format t "  operandi.lisp -- --mcp NAME=https://URL \"task\"   (a Streamable HTTP MCP server)~%")
+     (format t "  operandi.lisp -- --no-default-mcp \"task\"   (do not read ~~/.operandi/mcp.json)~%")
      (format t "  operandi.lisp -- ask-json < req.json   (the same as JSON, on one @@OPERANDI-JSON@@ line; for harnesses)~%")
      (format t "  operandi.lisp              (no args, or --tui: interactive REPL: streaming, tools, /commands)~%")
      (format t "  operandi.lisp -- --resume [ID] tui  (resume a saved session; latest if no ID)~%")

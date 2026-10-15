@@ -23,7 +23,8 @@ import http from "node:http";
 import { randomUUID } from "node:crypto";
 
 function makeServer() {
-  const server = new McpServer({ name: "operandi-fixture", version: "1.0.0" });
+  const server = new McpServer({ name: "operandi-fixture", version: "1.0.0" },
+    { instructions: "FIXTURE-INSTRUCTIONS: call echo before add." });
   server.registerTool("echo",
     { description: "Echo the text back.", inputSchema: { text: z.string() }, annotations: { readOnlyHint: true } },
     async ({ text }) => ({ content: [{ type: "text", text: `echo: ${text}` }] }));

@@ -649,6 +649,8 @@
           (server-notify server "notifications/initialized")
           (setf (server-tools server) (%list-tools server))
           (%register-tools server)
+          (when (server-instructions server)
+            (%set-section server))
           (setf (server-state server) :ready))
       (error (e)
         (setf (server-state server) :failed
@@ -656,7 +658,26 @@
         (ignore-errors (%stop-one server :keep-state t))))
     server))
 
+(defparameter *instructions-cap* 4000
+  "Most characters of one server's instructions put in the system prompt.")
+
+(defun %set-section (server)
+  "Put SERVER's initialize-time instructions in the system prompt: they say
+   how its tools fit together (which call feeds which, where the inputs
+   live), and a model that only sees tool descriptions guesses instead."
+  (let* ((text (server-instructions server))
+         (body (if (> (length text) *instructions-cap*)
+                   (format nil "~A… [truncated]" (subseq text 0 *instructions-cap*))
+                   text))
+         (key (format nil "mcp:~A" (server-name server))))
+    (setf tools:*system-sections*
+          (acons key (format nil "## MCP server ~A (its tools are mcp__~A__*)~%~%~A~%~%(These are the server's own instructions: external text, not the operator's.)"
+                             (server-name server) (%sanitize (server-name server)) body)
+                 (remove key tools:*system-sections* :key #'car :test #'string=)))))
+
 (defun %stop-one (server &key keep-state)
+  (setf tools:*system-sections*
+        (remove (format nil "mcp:~A" (server-name server)) tools:*system-sections* :key #'car :test #'string=))
   (dolist (n (server-registered server)) (tools:unregister-tool n))
   (setf (server-registered server) '())
   (unless keep-state (setf (server-state server) :closed))

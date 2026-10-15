@@ -21,7 +21,7 @@
 (defpackage #:operandi.mcp-test
   (:use #:cl)
   (:local-nicknames (#:mcp #:operandi.mcp) (#:tools #:operandi.tools)
-                    (#:sub #:operandi.subagent) (#:llm #:operandi.llm)
+                    (#:sub #:operandi.subagent) (#:llm #:operandi.llm) (#:eng #:operandi.engine)
                     (#:bt #:bordeaux-threads)))
 (in-package #:operandi.mcp-test)
 
@@ -164,6 +164,11 @@
            (search "operandi-fixture" (mcp:status-text))
            (search "ready" (mcp:status-text))))
     (live-common "stdio" "mcp__fx__")
+    (check "stdio: the server's instructions are in the system prompt, marked as external"
+      (let ((p (funcall (find-symbol "BUILD-SYSTEM-PROMPT" "OPERANDI.ENGINE"))))
+        (and (search "FIXTURE-INSTRUCTIONS: call echo before add." p)
+             (search "## MCP server fx" p)
+             (search "not the operator's" p))))
     (check "stdio: the server's stderr went to its log, not the protocol"
       (search "stdio server starting"
               (uiop:read-file-string (merge-pathnames ".operandi/mcp-logs/fx.log" (user-homedir-pathname))))))
@@ -228,6 +233,8 @@
         (unwind-protect
              (progn (live-stdio fx) (live-http fx))
           (mcp:stop-servers)
+          (check "stop-servers removes the servers' instructions from the system prompt"
+            (not (search "FIXTURE-INSTRUCTIONS" (funcall (find-symbol "BUILD-SYSTEM-PROMPT" "OPERANDI.ENGINE")))))
           (check "stop-servers unregisters every MCP tool"
             (and (null (tools:expand-tool-names '("mcp__*")))
                  (null tools:*extra-default-tools*) (null tools:*extra-worker-tools*))))

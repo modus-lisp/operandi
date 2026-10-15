@@ -47,6 +47,7 @@
            #:unregister-tool
            #:*extra-default-tools*
            #:*extra-worker-tools*
+           #:*system-sections*
            #:expand-tool-names
            #:tool-by-name
            #:tools-as-openai-array
@@ -141,6 +142,11 @@
 
 (defvar *extra-worker-tools* '()
   "Names an investigating worker may use on top of its fixed read-only set.")
+
+(defvar *system-sections* '()
+  "Alist (KEY . TEXT) of sections appended to every run's system prompt —
+   e.g. an MCP server's own instructions (operandi.mcp), which say how its
+   tools fit together and are otherwise never shown to the model.")
 
 (defun register-tool (name description schema impl)
   "Register a tool whose IMPL is a function of the parsed-arguments hash table

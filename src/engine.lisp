@@ -780,12 +780,14 @@ the conversation; the next message you produce should either call
 another tool or give a final answer.")
 
 (defun build-system-prompt ()
-  "Combine the base prompt with current notes file contents."
-  (let ((notes (operandi.tools:load-notes)))
-    (cond
-      ((zerop (length notes)) *base-system-prompt*)
-      (t (format nil "~A~%~%## Persistent notes (from previous runs)~%~%~A"
-                 *base-system-prompt* notes)))))
+  "Combine the base prompt with current notes file contents and any
+   registered extra sections (operandi.tools:*system-sections*)."
+  (let* ((notes (operandi.tools:load-notes))
+         (base (cond
+                 ((zerop (length notes)) *base-system-prompt*)
+                 (t (format nil "~A~%~%## Persistent notes (from previous runs)~%~%~A"
+                            *base-system-prompt* notes)))))
+    (format nil "~A~{~%~%~A~}" base (mapcar #'cdr (reverse operandi.tools:*system-sections*)))))
 
 (defparameter *default-system-prompt* nil
   "DEPRECATED — use BUILD-SYSTEM-PROMPT instead so notes load fresh

@@ -57,9 +57,21 @@
   (when *db* (s:disconnect *db*))
   (ensure-directories-exist path)
   (setf *db* (s:connect (namestring path)))
+  ;; Wait for a lock instead of failing at once. Without this, operandi
+  ;; processes STARTING TOGETHER (operandi_fan, a campaign driver, an
+  ;; xargs -P) collide on the WAL switch below, and SQLite's default -- no
+  ;; busy handler -- turns the collision into an immediate SQLITE_BUSY that
+  ;; kills the process before its first turn.
+  (s:execute-non-query *db* "PRAGMA busy_timeout = 30000")
   ;; WAL mode: better concurrency and safer crashes for a long-running
-  ;; reader+writer like the replay loop.
-  (s:execute-non-query *db* "PRAGMA journal_mode = WAL")
+  ;; reader+writer like the replay loop. Switching to it needs a moment of
+  ;; exclusive access, which a busy timeout does not always cover (the
+  ;; switch can return BUSY without invoking the handler), so retry.
+  (loop for attempt from 1
+        do (handler-case (progn (s:execute-non-query *db* "PRAGMA journal_mode = WAL") (return))
+             (s:sqlite-error (e)
+               (when (>= attempt 50) (error e))
+               (sleep (+ 0.05 (random 0.2))))))
   (s:execute-non-query *db* "PRAGMA synchronous = NORMAL")
   (s:execute-non-query *db* "PRAGMA foreign_keys = ON")
   (init-schema)

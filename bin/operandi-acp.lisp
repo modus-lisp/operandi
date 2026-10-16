@@ -10,7 +10,7 @@
 ;;; and handed to SERVE.
 ;;;
 ;;; Backend: OPERANDI_ACP_MODEL env var picks an OpenRouter model; else, if an
-;;; OpenRouter token exists it defaults to deepseek-v4-flash; else local llama.
+;;; OpenRouter token exists it defaults to deepseek-v4.1-flash; else local llama.
 
 (require :asdf)
 (unless (find-package :ql)
@@ -30,7 +30,7 @@
       (model (funcall (find-symbol "SET-BACKEND-OPENROUTER!" "OPERANDI.LLM") :model model))
       ((probe-file tok)
        (funcall (find-symbol "SET-BACKEND-OPENROUTER!" "OPERANDI.LLM")
-                :model "deepseek/deepseek-v4-flash"))))
+                :model "deepseek/deepseek-v4.1-flash"))))
   ;; External MCP servers from ~/.operandi/mcp.json (or $OPERANDI_MCP_CONFIG),
   ;; as the CLI reads them. Never fatal here: an editor session without one of
   ;; its servers is better than no session; the reason goes to stderr.

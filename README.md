@@ -21,8 +21,8 @@ file changes.
 ```
 bin/operandi tui                                  # interactive REPL
 bin/operandi "summarize what's in this directory" # one-shot task
-bin/operandi --openrouter deepseek/deepseek-v4-flash "task"
-bin/operandi --openrouter deepseek/deepseek-v4-flash --effort low tui
+bin/operandi --openrouter deepseek/deepseek-v4.1-flash "task"
+bin/operandi --openrouter deepseek/deepseek-v4.1-flash --effort low tui
 ```
 
 Bare `bin/operandi` (no arguments) also opens the TUI. The default backend is
@@ -262,7 +262,7 @@ via `session/request_permission`. Sessions persist and resume (`session/load`).
 ```
 
 `bin/operandi-acp` launches from a dumped core (~30 ms). Backend: set
-`OPERANDI_ACP_MODEL` (an OpenRouter model id), else it uses deepseek-v4-flash if
+`OPERANDI_ACP_MODEL` (an OpenRouter model id), else it uses deepseek-v4.1-flash if
 an OpenRouter token is present, else local llama.cpp. The mapping — operandi's
 streaming/hooks/plan/usage/session seams onto the ACP wire — lives in
 `src/acp.lisp`; `(operandi.acp:serve)` runs it over any stdin/stdout.
@@ -384,7 +384,7 @@ system.
 
 ```
 OPERANDI_NOSTR_NIP05=you@example.com \
-OPERANDI_NOSTR_MODEL=deepseek/deepseek-v4-flash \
+OPERANDI_NOSTR_MODEL=deepseek/deepseek-v4.1-flash \
   sbcl --non-interactive --load bin/operandi-nostr.lisp
 ```
 

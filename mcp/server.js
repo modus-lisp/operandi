@@ -27,7 +27,7 @@
 // Config (env):
 //   OPERANDI_ROOT      repo root holding bin/operandi
 //                      (default: the repo root above this mcp/ dir)
-//   OPERANDI_MODEL     default OpenRouter model (default deepseek/deepseek-v4-flash)
+//   OPERANDI_MODEL     default OpenRouter model (default deepseek/deepseek-v4.1-flash)
 //   OPERANDI_FAN_MAX   max parallel agents per operandi_fan call (default 8)
 //   OPERANDI_WAIT_MS   how long a call blocks before handing back a
 //                      job id (default 110000)
@@ -53,7 +53,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = process.env.OPERANDI_ROOT || path.resolve(__dirname, "..");
 const LAUNCHER = path.join(ROOT, "bin", "operandi");
 const SBCL = process.env.OPERANDI_SBCL || "sbcl";
-const DEFAULT_MODEL = process.env.OPERANDI_MODEL || "deepseek/deepseek-v4-flash";
+const DEFAULT_MODEL = process.env.OPERANDI_MODEL || "deepseek/deepseek-v4.1-flash";
 const WAIT_MS = Number(process.env.OPERANDI_WAIT_MS || 110000);
 const MAX_MS = Number(process.env.OPERANDI_MAX_MS || 600000);
 const FAN_MAX = Number(process.env.OPERANDI_FAN_MAX || 8); // max parallel agents per operandi_fan call
@@ -221,7 +221,7 @@ server.tool(
     "returns a job_id — poll it with operandi_get_run. Give it a concrete, self-contained task.",
   {
     task: z.string().describe("The task for operandi, e.g. 'What is 21+21? Answer with just the number.'"),
-    model: z.string().optional().describe(`OpenRouter model id (default ${DEFAULT_MODEL}). e.g. deepseek/deepseek-v4-flash for the cheapest.`),
+    model: z.string().optional().describe(`OpenRouter model id (default ${DEFAULT_MODEL}). e.g. deepseek/deepseek-v4.1-flash.`),
   },
   async ({ task, model }) => {
     const job = startJob(task, model || DEFAULT_MODEL);

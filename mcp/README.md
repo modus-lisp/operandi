@@ -12,8 +12,7 @@ returns the final answer plus cost/iteration metadata.
   Returns operandi's final answer + a `[N iters, X¢, prompt/comp tokens]` line.
   Waits up to `OPERANDI_WAIT_MS` (default 110s); if the task is still running
   then, it returns a `job_id` — poll it with `operandi_get_run`. `model`
-  overrides the OpenRouter model (default `deepseek/deepseek-v4-flash` — ds4f,
-  the cheap swarm workhorse).
+  overrides the OpenRouter model (default `deepseek/deepseek-v4.1-flash`).
 - **`operandi_fan { tasks: string[], model?: string }`** — run up to
   `OPERANDI_FAN_MAX` (default 8) tasks **in parallel**, each its own operandi
   agent, and return every result together. This is SWARM.md's **recon /
@@ -131,7 +130,7 @@ tasks stay reachable via `operandi_get_run`. A hard `OPERANDI_MAX_MS` (default
 | Var                | Default                 | Meaning                                              |
 |--------------------|-------------------------|------------------------------------------------------|
 | `OPERANDI_ROOT`    | dir above `mcp/`        | repo root holding `bin/operandi`                     |
-| `OPERANDI_MODEL`   | `deepseek/deepseek-v4-flash` | default OpenRouter model (ds4f)                             |
+| `OPERANDI_MODEL`   | `deepseek/deepseek-v4.1-flash` | default OpenRouter model                                  |
 | `OPERANDI_WAIT_MS` | `110000`                | how long `operandi_run` blocks before handing a job id |
 | `OPERANDI_MAX_MS`  | `600000`                | hard wall-clock kill for a single job                |
 | `OPERANDI_FAN_MAX`  | `8`                     | max parallel agents per `operandi_fan` call (also the `operandi_swarm` concurrency cap) |
@@ -151,7 +150,7 @@ The OpenRouter API key is read by operandi itself from
       "command": "node",
       "args": ["/path/to/operandi/mcp/server.js"],
       "env": {
-        "OPERANDI_MODEL": "deepseek/deepseek-v4-flash"
+        "OPERANDI_MODEL": "deepseek/deepseek-v4.1-flash"
       }
     }
   }

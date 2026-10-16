@@ -195,22 +195,67 @@
     (when (and cents (plusp cents) nip05 (string= (config-backend) "ppq"))
       (values cents nip05))))
 
+(defparameter *topup-lock-dir* (merge-pathnames ".operandi/topup.lock/" (user-homedir-pathname))
+  "Held (an atomic mkdir) by the ONE operandi process invoicing the operator.
+   The in-process single-flight in the engine covers threads; a campaign runs
+   many processes, and without this each would send its own invoice.")
+
+(defun %pid-alive-p (pid)
+  (and (integerp pid) (probe-file (format nil "/proc/~D/" pid))))
+
+(defun %try-topup-lock ()
+  "Take the cross-process top-up lock, clearing one left by a dead process."
+  (flet ((take ()
+           (handler-case
+               (progn (funcall (find-symbol "MKDIR" "SB-POSIX") (namestring *topup-lock-dir*) #o700)
+                      (with-open-file (o (merge-pathnames "pid" *topup-lock-dir*) :direction :output
+                                                                                :if-exists :supersede)
+                        (format o "~D~%" (funcall (find-symbol "GETPID" "SB-POSIX"))))
+                      t)
+             (error () nil))))
+    (or (take)
+        (let ((pid (ignore-errors (parse-integer (uiop:read-file-string (merge-pathnames "pid" *topup-lock-dir*))
+                                                 :junk-allowed t))))
+          (when (and pid (not (%pid-alive-p pid)))
+            (ignore-errors (uiop:delete-directory-tree *topup-lock-dir* :validate t))
+            (take))))))
+
+(defun %release-topup-lock ()
+  (ignore-errors (uiop:delete-directory-tree *topup-lock-dir* :validate t)))
+
+(defun %funded-p ()
+  (let ((b (ignore-errors (operandi.payments:ppq-balance))))
+    (and (hash-table-p b) (realp (gethash "balance" b)) (> (gethash "balance" b) 0.05))))
+
 (defun auto-topup ()
   "*PAYMENT-REQUIRED-HOOK*: invoice the operator over Nostr for
    auto_topup_cents and wait for payment, re-issuing an expired invoice (up to
-   3). True once paid. All output to stderr: under ACP/MCP stdout is protocol."
+   3). True once paid. ONE process invoices at a time (*TOPUP-LOCK-DIR*); the
+   others wait for it and retry. All output to stderr: under ACP/MCP stdout is
+   protocol."
   (multiple-value-bind (cents nip05) (auto-topup-plan)
     (when cents
       (let ((*standard-output* *error-output*))
-        (format t "~&[operandi] PPQ credit exhausted: asking ~A for ~D.~2,'0D USD over Nostr~%"
-                nip05 (floor cents 100) (mod cents 100))
-        (loop repeat 3
-              do (let ((paid (operandi.payments:request-ppq-payment
-                              cents :unit :cents :provider :nostr :nip05 nip05
-                              :memo "operandi is out of PPQ credit" :timeout 3600)))
-                   (when paid
-                     (format t "~&[operandi] paid -- continuing~%")
-                     (return t))))))))
+        #+sbcl (ignore-errors (require :sb-posix))
+        (loop until (%try-topup-lock)
+              do (format t "~&[operandi] another operandi is asking for credit; waiting~%")
+                 (loop repeat 720 while (probe-file *topup-lock-dir*) do (sleep 5))
+                 ;; whoever held it has paid (or given up): retry the request
+                 (return-from auto-topup t))
+        (unwind-protect
+             (if (%funded-p)
+                 t                                  ; paid while we waited for the lock
+                 (progn
+                   (format t "~&[operandi] PPQ credit exhausted: asking ~A for ~D.~2,'0D USD over Nostr~%"
+                           nip05 (floor cents 100) (mod cents 100))
+                   (loop repeat 3
+                         do (let ((paid (operandi.payments:request-ppq-payment
+                                         cents :unit :cents :provider :nostr :nip05 nip05
+                                         :memo "operandi is out of PPQ credit" :timeout 3600)))
+                              (when paid
+                                (format t "~&[operandi] paid -- continuing~%")
+                                (return t))))))
+          (%release-topup-lock))))))
 
 (defun use-model! (m)
   "MODEL M on the configured backend (llama is always the local server)."

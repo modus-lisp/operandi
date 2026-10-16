@@ -186,6 +186,16 @@
             (and (integerp v) (>= v 0) v))
         (error () nil)))))
 
+;; A caller-issued PPQ key (e.g. one per campaign run, so PPQ itself reports
+;; that run's spend): a FILE, mode 0600, never the key in the environment.
+;; The account (credit id, balance, top-ups) is still the machine's.
+(defparameter *ppq-token-override* (uiop:getenv "OPERANDI_PPQ_TOKEN_FILE"))
+(when (and *ppq-token-override* (plusp (length *ppq-token-override*)))
+  ;; both: operandi.ppq's is the one the LLM backend authenticates with,
+  ;; operandi.payments' the one top-ups and account creation use
+  (setf operandi.ppq:*ppq-token-file* (pathname *ppq-token-override*)
+        operandi.payments:*ppq-token-file* (pathname *ppq-token-override*)))
+
 (defun auto-topup-plan ()
   "(values cents nip05) when this machine may ask its operator for PPQ credit
    on its own: config backend ppq + auto_topup_cents + an operator NIP-05.
@@ -263,7 +273,10 @@
         ((string= (config-backend) "ppq")
          ;; no account yet, but allowed to ask for credit: make one now, so the
          ;; first inference's 402 can be paid instead of failing for want of a key
-         (when (and (not (operandi.payments:ppq-account-p)) (auto-topup-plan))
+         ;; (never under a caller-issued key: creating an account would write
+         ;; a different account's key into the caller's file)
+         (when (and (not *ppq-token-override*)
+                    (not (operandi.payments:ppq-account-p)) (auto-topup-plan))
            (handler-case
                (let ((cid (operandi.payments:ppq-create-account)))
                  (format *error-output* "~&[operandi] created a PPQ account (credit id ~A)~%" cid))

@@ -34,6 +34,7 @@
                     (#:sf    #:operandi.safefetch))
   (:export #:run
            #:preflight-model
+           #:*payment-required-hook* #:payment-required-p #:handle-payment-required
            #:*max-iterations*
            #:*max-empty-turns*
            #:*prompt-cache*
@@ -1107,6 +1108,46 @@ another tool or give a final answer.")
                     (t (format nil "HTTP ~A" code)))))
     (llm:ht "error" (llm:ht "message" msg "code" (or code 0)))))
 
+;;; ---------------------------- paying for it ----------------------------
+;;; A provider that answers 402 (no credit) is not broken, it wants paying.
+;;; When a front end installs *PAYMENT-REQUIRED-HOOK* (bin/operandi does, from
+;;; config auto_topup_cents), a 402 runs it -- blocking until the account is
+;;; funded -- and the request is retried. SINGLE-FLIGHT: Fan/Investigate
+;;; workers hit the same empty account at once; the first one obtains credit,
+;;; the rest wait on the lock and, seeing the generation move, just retry. One
+;;; invoice, not one per worker.
+
+(defvar *payment-required-hook* nil
+  "NIL, or a function of no arguments that obtains provider credit (blocking:
+   e.g. invoice the operator and wait) and returns true once it has.")
+(defvar *payment-lock* (bordeaux-threads:make-lock "operandi-payment"))
+(defvar *payment-generation* 0 "Bumped each time the hook succeeds.")
+
+(defun payment-required-p (parsed-or-reason)
+  "Does this error (a parsed error body, or a reason string) mean 'pay me'?"
+  (let ((text (if (stringp parsed-or-reason)
+                  parsed-or-reason
+                  (or (provider-error-text parsed-or-reason) ""))))
+    (or (search "(402)" text)
+        (search "Insufficient credits" text :test #'char-equal)
+        (search "insufficient balance" text :test #'char-equal)
+        (search "Payment Required" text :test #'char-equal))))
+
+(defun handle-payment-required ()
+  "Run the hook once for everyone who saw the 402 at the same time. True when
+   the caller should retry."
+  (when *payment-required-hook*
+    (let ((seen *payment-generation*))
+      (bordeaux-threads:with-lock-held (*payment-lock*)
+        (if (/= seen *payment-generation*)
+            t                                   ; paid while we waited
+            (let ((ok (handler-case (funcall *payment-required-hook*)
+                        (error (e)
+                          (format *error-output* "~&[operandi] top-up failed: ~A~%" e)
+                          nil))))
+              (when ok (incf *payment-generation*))
+              ok))))))
+
 (defun preflight-model (&key (timeout 12))
   "Startup preflight: confirm the CURRENT backend/model/token can actually serve a
    request, so a bad model slug / exhausted grant / provider-allowlist miss / a
@@ -1133,6 +1174,7 @@ another tool or give a final answer.")
    failures: HTTP errors, OpenRouter 200-with-error-body, or responses
    missing a usable message. Returns parsed body."
   (let ((attempt 0)
+        (topups 0)
         (sleep *chat-retry-sleep*))
     (loop
       (let* ((parsed (handler-case (do-chat messages tools-vec)
@@ -1156,6 +1198,9 @@ another tool or give a final answer.")
         (cond
           ;; Success path: we got a usable message.
           ((and parsed msg) (return parsed))
+          ;; 402: pay (once, single-flight) and retry -- not a transient retry
+          ((and err (payment-required-p parsed) (< topups 2) (handle-payment-required))
+           (incf topups))
           ;; Out of retries.
           ((>= attempt *chat-retries*)
            (when verbose

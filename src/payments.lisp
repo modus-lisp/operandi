@@ -189,8 +189,14 @@
          (format t "~&Sent to ~A over Nostr (accepted by ~{~A~^, ~}).~%" nip05 relays))))
     (unless wait (return-from request-ppq-payment inv))
     (format t "~&Waiting for payment (timeout ~Ds)...~%" timeout)
-    (let ((deadline (+ (get-universal-time) timeout)))
+    (let ((deadline (+ (get-universal-time) timeout))
+          (expires (let ((e (getf inv :expires-at))) (and (realp e) e))))
       (loop
+        ;; PPQ invoices live ~15 minutes: past expiry nothing can pay this one,
+        ;; so stop and let the caller issue another rather than wait out TIMEOUT
+        (when (and expires (> (- (get-universal-time) 2208988800) expires))
+          (format t "~&Invoice expired unpaid.~%")
+          (return nil))
         (let ((st (ppq-topup-status id)))
           (when (and (stringp (getf st :status))
                      (member (string-downcase (getf st :status))

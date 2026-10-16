@@ -141,6 +141,9 @@
    OPERANDI_NO_PREFLIGHT=1."
   (unless (uiop:getenv "OPERANDI_NO_PREFLIGHT")
     (multiple-value-bind (ok reason) (eng:preflight-model)
+      ;; out of credit, and allowed to ask for more: ask, then check again
+      (when (and (not ok) (eng:payment-required-p reason) (eng:handle-payment-required))
+        (multiple-value-setq (ok reason) (eng:preflight-model)))
       (unless ok
         (format *error-output* "~&operandi: cannot use model ~A on ~A:~%  ~A~%~%"
                 (or llm:*llm-model* "(default)")
@@ -174,10 +177,52 @@
   (let ((b (config-value "backend")))
     (if (and b (string-equal b "ppq")) "ppq" "openrouter")))
 
+(defun config-integer (key)
+  "KEY of the config as a non-negative integer, or NIL."
+  (let ((p (config-path)))
+    (when (probe-file p)
+      (handler-case
+          (let ((v (gethash key (json:parse (uiop:read-file-string p)))))
+            (and (integerp v) (>= v 0) v))
+        (error () nil)))))
+
+(defun auto-topup-plan ()
+  "(values cents nip05) when this machine may ask its operator for PPQ credit
+   on its own: config backend ppq + auto_topup_cents + an operator NIP-05.
+   NIL otherwise -- operandi never invoices anyone unless told it may."
+  (let ((cents (config-integer "auto_topup_cents"))
+        (nip05 (or (config-value "operator_nip05") (uiop:getenv "OPERANDI_NOSTR_NIP05"))))
+    (when (and cents (plusp cents) nip05 (string= (config-backend) "ppq"))
+      (values cents nip05))))
+
+(defun auto-topup ()
+  "*PAYMENT-REQUIRED-HOOK*: invoice the operator over Nostr for
+   auto_topup_cents and wait for payment, re-issuing an expired invoice (up to
+   3). True once paid. All output to stderr: under ACP/MCP stdout is protocol."
+  (multiple-value-bind (cents nip05) (auto-topup-plan)
+    (when cents
+      (let ((*standard-output* *error-output*))
+        (format t "~&[operandi] PPQ credit exhausted: asking ~A for ~D.~2,'0D USD over Nostr~%"
+                nip05 (floor cents 100) (mod cents 100))
+        (loop repeat 3
+              do (let ((paid (operandi.payments:request-ppq-payment
+                              cents :unit :cents :provider :nostr :nip05 nip05
+                              :memo "operandi is out of PPQ credit" :timeout 3600)))
+                   (when paid
+                     (format t "~&[operandi] paid -- continuing~%")
+                     (return t))))))))
+
 (defun use-model! (m)
   "MODEL M on the configured backend (llama is always the local server)."
   (cond ((string-equal m "llama") (llm:set-backend-llama!))
         ((string= (config-backend) "ppq")
+         ;; no account yet, but allowed to ask for credit: make one now, so the
+         ;; first inference's 402 can be paid instead of failing for want of a key
+         (when (and (not (operandi.payments:ppq-account-p)) (auto-topup-plan))
+           (handler-case
+               (let ((cid (operandi.payments:ppq-create-account)))
+                 (format *error-output* "~&[operandi] created a PPQ account (credit id ~A)~%" cid))
+             (error (e) (format *error-output* "~&[operandi] could not create a PPQ account: ~A~%" e))))
          (unless (llm:set-backend-ppq! :model m)
            (format *error-output* "operandi: the PPQ backend is configured but unusable (no ~~/.operandi/ppq.token?) -- try `operandi topup ppq ...`~%")))
         (t (llm:set-backend-openrouter! :model m)))
@@ -233,6 +278,10 @@
       (error (e)
         (format *error-output* "~&operandi topup: ~A~%" e)
         (sb-ext:exit :code 1)))))
+
+;; May this machine ask its operator for credit? (config auto_topup_cents)
+(when (auto-topup-plan)
+  (setf eng:*payment-required-hook* #'auto-topup))
 
 ;; Apply the configured default model unless the command line names a backend
 ;; explicitly (--openrouter, with or without a model; a bare --openrouter also

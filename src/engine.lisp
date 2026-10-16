@@ -902,10 +902,9 @@ another tool or give a final answer.")
     ;; explicit was chosen.
     (llm:apply-reasoning body (or llm:*llm-effort*
                                   (and *do-chat-disable-reasoning* :off)))
-    ;; Cost/token accounting.  OpenRouter and Routstr want {"usage":{"include":true}};
-    ;; the enclave's OpenAI dialect does not know the field and 400s on it, so
-    ;; :PPQ is excluded (it reports usage unprompted anyway).
-    (when (member llm:*llm-backend* '(:openrouter :routstr))
+    ;; Cost/token accounting: which backends are asked, and why hosted PPQ
+    ;; is (it routes to providers that report cost), is LLM:ASK-USAGE-COST-P.
+    (when (llm:ask-usage-cost-p)
       (setf (gethash "usage" body) (ht "include" t)))
     (when llm:*llm-model* (setf (gethash "model" body) llm:*llm-model*))
     body))

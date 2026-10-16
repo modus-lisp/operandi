@@ -7,8 +7,8 @@
 // answer plus cost/iteration metadata.
 //
 // Mechanism: each call shells out to operandi's fast launcher —
-//   bin/operandi [--openrouter <model>] "<task>"        (a task)
-//   bin/operandi [--openrouter <model>] ask-json < req  (the question phase)
+//   bin/operandi [--model <model>] "<task>"              (a task)
+//   bin/operandi [--model <model>] ask-json < req        (the question phase)
 // — which runs from a dumped core image (~20 ms to a ready agent). The core is
 // (re)built ONCE, before the first job, so parallel jobs never race to write
 // it. Tasks still take as long as the agent does, so every call is a JOB:
@@ -160,7 +160,9 @@ function startJob(task, model, cwd = ROOT) {
 function startCli(args, model, cwd = ROOT, { stdin = null, kind = "run" } = {}) {
   const id = randomUUID().slice(0, 8);
   const argv = [];
-  if (model) argv.push("--openrouter", model);
+  // --model, not --openrouter: the model on whichever backend this machine is
+  // configured for (~/.operandi/config.json "backend": "ppq" | "openrouter").
+  if (model) argv.push("--model", model);
   argv.push(...args);
 
   const job = { id, kind, status: "running", started: Date.now(), stdout: "", stderr: "", code: null, signal: null, child: null, waiters: [] };

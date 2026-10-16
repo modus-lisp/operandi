@@ -160,6 +160,29 @@
 (defun config-path ()
   (merge-pathnames ".operandi/config.json" (user-homedir-pathname)))
 
+(defun config-value (key)
+  "KEY of ~/.operandi/config.json, or NIL if absent/unreadable."
+  (let ((p (config-path)))
+    (when (probe-file p)
+      (handler-case
+          (let ((v (gethash key (json:parse (uiop:read-file-string p)))))
+            (and (stringp v) (plusp (length v)) v))
+        (error () nil)))))
+
+(defun config-backend ()
+  "\"ppq\" or \"openrouter\" (the default) from the config's `backend`."
+  (let ((b (config-value "backend")))
+    (if (and b (string-equal b "ppq")) "ppq" "openrouter")))
+
+(defun use-model! (m)
+  "MODEL M on the configured backend (llama is always the local server)."
+  (cond ((string-equal m "llama") (llm:set-backend-llama!))
+        ((string= (config-backend) "ppq")
+         (unless (llm:set-backend-ppq! :model m)
+           (format *error-output* "operandi: the PPQ backend is configured but unusable (no ~~/.operandi/ppq.token?) -- try `operandi topup ppq ...`~%")))
+        (t (llm:set-backend-openrouter! :model m)))
+  (eng:apply-backend-defaults))
+
 (defun config-default-model ()
   "The `model` key of ~/.operandi/config.json, or NIL if absent/unreadable.
    \"llama\" means the local llama.cpp backend."
@@ -172,17 +195,52 @@
           (format *error-output* "operandi: ignoring ~A: ~A~%" p e)
           nil)))))
 
+(defun run-topup (args)
+  "operandi topup ppq AMOUNT [cents|sats] [--to NIP05] [--no-wait]
+
+   Buy PPQ credit over Lightning. AMOUNT is an integer in base units: cents
+   (the default; 1500 = $15.00) or sats. With no PPQ key on this machine, an
+   account is created first (PPQ's /accounts/create needs no credentials). The
+   invoice goes to --to, else config `operator_nip05`, else
+   $OPERANDI_NOSTR_NIP05, as a Nostr DM -- someone else pays from their phone --
+   or, with none of those, is shown here as a QR code. Then waits for payment
+   (up to an hour) unless --no-wait, and prints the balance."
+  (let* ((to (let ((p (position "--to" args :test #'string=))) (and p (nth (1+ p) args))))
+         (no-wait (member "--no-wait" args :test #'string=))
+         (pos (remove-if (lambda (a) (or (uiop:string-prefix-p "--" a) (equal a to))) args))
+         (service (first pos))
+         (amount (and (second pos) (every #'digit-char-p (second pos)) (parse-integer (second pos))))
+         (unit (let ((u (string-downcase (or (third pos) "cents"))))
+                 (cond ((string= u "cents") :cents) ((string= u "sats") :sats))))
+         (nip05 (or to (config-value "operator_nip05") (uiop:getenv "OPERANDI_NOSTR_NIP05"))))
+    (unless (and (equal service "ppq") amount (plusp amount) unit)
+      (format *error-output* "usage: operandi topup ppq AMOUNT [cents|sats] [--to NIP05] [--no-wait]   (AMOUNT: an integer; 1500 cents = $15.00)~%")
+      (sb-ext:exit :code 2))
+    (handler-case
+        (progn
+          (unless (operandi.payments:ppq-account-p)
+            (multiple-value-bind (cid key) (operandi.payments:ppq-create-account)
+              (declare (ignore key))
+              (format t "~&No PPQ key here: created a PPQ account (credit id ~A); key in ~A~%"
+                      cid (namestring operandi.payments:*ppq-token-file*))))
+          (let ((paid (operandi.payments:request-ppq-payment
+                       amount :unit unit :provider (if nip05 :nostr :terminal) :nip05 nip05
+                       :wait (not no-wait) :timeout 3600)))
+            (when (and paid (not no-wait))
+              (let ((b (ignore-errors (operandi.payments:ppq-balance))))
+                (when b (format t "~&Balance: ~A~%" (json:stringify b)))))
+            (sb-ext:exit :code (if (or no-wait paid) 0 1))))
+      (error (e)
+        (format *error-output* "~&operandi topup: ~A~%" e)
+        (sb-ext:exit :code 1)))))
+
 ;; Apply the configured default model unless the command line names a backend
 ;; explicitly (--openrouter, with or without a model; a bare --openrouter also
 ;; reads the config, below). Doing both would announce the backend twice.
 (let ((m (and (not (member-if (lambda (a) (member a '("--openrouter" "--routstr" "--ppq") :test #'string=))
                                  (uiop:command-line-arguments)))
               (config-default-model))))
-  (when m
-    (if (string-equal m "llama")
-        (llm:set-backend-llama!)
-        (llm:set-backend-openrouter! :model m))
-    (eng:apply-backend-defaults)))
+  (when m (use-model! m)))
 
 (let* ((raw (remove "--" (uiop:command-line-arguments) :test #'string=))
        (resume nil)
@@ -249,6 +307,15 @@
                     ;; FAILS rather than downgrading to plaintext.
                     (setf acc (rest acc))
                     (llm:enable-confidential!))
+                   ;; --model M: M on the CONFIGURED backend (config.json `backend`),
+                   ;; so a harness need not know whether this machine pays
+                   ;; OpenRouter or PPQ.
+                   ((and acc (string= (first acc) "--model"))
+                    (unless (and (second acc) (plusp (length (second acc))))
+                      (format *error-output* "operandi: --model takes a model id~%")
+                      (sb-ext:exit :code 2))
+                    (use-model! (second acc))
+                    (setf acc (cddr acc)))
                    ((and acc (string= (first acc) "--worker-model"))
                     (multiple-value-bind (m ok)
                         (funcall (find-symbol "PARSE-WORKER-MODEL" "OPERANDI.SUBAGENT") (second acc))
@@ -318,7 +385,7 @@
        (cmd (if tui-p "tui" (first args))))
   ;; Preflight the model on any path that will actually run a turn (not bare
   ;; help, not the `mcp` listing).
-  (unless (member cmd '("--help" "mcp") :test #'equal)
+  (unless (member cmd '("--help" "mcp" "topup") :test #'equal)
     ;; A confidential session on a backend that cannot seal is a configuration
     ;; error, and it must be fatal BEFORE the first turn — not a warning that
     ;; scrolls past while plaintext goes out.
@@ -330,7 +397,7 @@
   ;; External MCP servers, before the tool set is resolved: their tools join it.
   ;; A file or spec the operator named that cannot be read is fatal; a server
   ;; that will not start is reported and skipped.
-  (unless (equal cmd "--help")
+  (unless (member cmd '("--help" "topup") :test #'equal)
     (handler-case
         (operandi.mcp:start-from-options :use-default mcp-default
                                          :config-files mcp-configs
@@ -343,6 +410,8 @@
                          (t (tools:default-tools))))
   (cond
     ;; operandi mcp — what is configured, what started, which tools it gave us
+    ;; operandi topup ppq AMOUNT [cents|sats] [--to NIP05] [--no-wait]
+    ((equal cmd "topup") (run-topup (rest args)))
     ((equal cmd "mcp")
      (write-string (operandi.mcp:status-text))
      (finish-output))
@@ -358,6 +427,8 @@
      (format t "  operandi.lisp -- \"task description\"~%")
      (format t "  operandi.lisp -- ask \"question\"   (rival hypotheses -> swarm verdicts -> answer)~%")
      (format t "  operandi.lisp -- mcp   (list the external MCP servers, their state and tools)~%")
+     (format t "  operandi.lisp -- topup ppq AMOUNT [cents|sats] [--to NIP05] [--no-wait]   (buy PPQ credit over Lightning, AMOUNT in base units; the invoice is DMed to NIP05 / config operator_nip05)~%")
+     (format t "  operandi.lisp -- --model M \"task\"   (model M on the configured backend: config.json \"backend\": \"ppq\" or \"openrouter\")~%")
      (format t "  operandi.lisp -- --mcp-config FILE \"task\"   (also read FILE's mcpServers; repeatable)~%")
      (format t "  operandi.lisp -- --mcp NAME=COMMAND [ARGS…] \"task\"   (a stdio MCP server; repeatable)~%")
      (format t "  operandi.lisp -- --mcp NAME=https://URL \"task\"   (a Streamable HTTP MCP server)~%")

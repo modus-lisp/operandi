@@ -197,6 +197,54 @@
       (and (search "[thinking] Extracting both parts." txt)
            (search "[assistant]" txt))))
 
+  ;; --- the scratchpad must survive COMPACTION, not just the screen ---
+  ;; Compaction is the mechanism that discards the middle of a conversation, and
+  ;; on a tool-calling turn the trace is often the only place the model states
+  ;; its intent.  If the summarizer never sees it, the fix above restores the
+  ;; trace to the display and still loses it at the one boundary that matters.
+  (check "the summarizer sees the scratchpad, labelled [thinking]"
+    (let ((txt (eng::render-turn-for-summary
+                (llm:ht "role" "assistant" "content" ""
+                        "reasoning_content" "Extracting both parts."))))
+      (and (search "[thinking] Extracting both parts." txt)
+           (search "[assistant]" txt))))
+
+  (check "the summarizer's copy of the scratchpad is clipped"
+    (let* ((long (make-string 20000 :initial-element #\x))
+           (txt (eng::render-turn-for-summary
+                 (llm:ht "role" "assistant" "content" ""
+                         "reasoning_content" long))))
+      (and (< (length txt) 20000)
+           (search "[truncated]" txt))))
+
+  (check "the summarizer sees no [thinking] line when the model emitted none"
+    (let ((txt (eng::render-turn-for-summary
+                (llm:ht "role" "assistant" "content" "just an answer"))))
+      (null (search "[thinking]" txt))))
+
+  (check "the compaction prompt tells the summarizer what [thinking] is"
+    (and (search "[thinking]" eng::*compaction-prompt*)
+         (search "scratchpad" eng::*compaction-prompt*)))
+
+  ;; chunk-turns sizes summarizer chunks.  ESTIMATE-TOKENS ignores the
+  ;; scratchpad (it is stripped before the request goes out), so sizing by it
+  ;; would under-count exactly the text the summarizer is now shown.
+  (check "chunk-turns counts the scratchpad the summarizer will be shown"
+    (let* ((m (llm:ht "role" "assistant" "content" ""
+                      "reasoning_content" (make-string 40000 :initial-element #\x)))
+           (by-estimate (eng::estimate-tokens (list m)))
+           (by-summary  (ceiling (eng::summary-chars m) eng::*chars-per-token*)))
+      (> by-summary by-estimate)))
+
+  (check "chunk-turns splits a span that only overflows once the trace is counted"
+    ;; 3 messages, each small by ESTIMATE-TOKENS but large once rendered.
+    (let* ((msgs (loop repeat 3
+                       collect (llm:ht "role" "assistant" "content" ""
+                                       "reasoning_content"
+                                       (make-string 40000 :initial-element #\x))))
+           (chunks (eng::chunk-turns msgs 2000)))
+      (> (length chunks) 1)))
+
   (format t "~&~%~D passed, ~D failed~%" *pass* *fail*)
   (zerop *fail*))
 

@@ -147,6 +147,20 @@
            (idx (operandi.engine::safe-tail-start ms 3)))
       (not (string= (gethash "role" (nth idx ms)) "tool"))))
 
+  ;; The summarizer is shown the reasoning trace, so the text it receives is
+  ;; bigger than ESTIMATE-TOKENS says.  A span of trace-heavy messages must
+  ;; still be split into chunks that fit the summarizer's window.
+  (check "a trace-heavy span is chunked by what the summarizer is shown"
+    (let* ((msgs (loop repeat 6
+                       collect (llm:ht "role" "assistant" "content" ""
+                                       "reasoning_content" (big 40000))))
+           (chunks (eng::chunk-turns msgs 2000)))
+      (and (> (length chunks) 1)
+           ;; every chunk fits, measured the way the summarizer sees it
+           (every (lambda (c)
+                    (<= (reduce #'+ c :key #'eng::summary-chars) (* 2000 eng::*chars-per-token*)))
+                  chunks))))
+
   (format t "~&~%~D passed, ~D failed~%" *pass* *fail*)
   (zerop *fail*))
 

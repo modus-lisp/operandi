@@ -195,7 +195,13 @@
 
 (defun msg-chars (m)
   "Character weight of one message: content + tool_call arguments + a small
-   per-message overhead. Images count a fixed *IMAGE-TOKENS* each."
+   per-message overhead. Images count a fixed *IMAGE-TOKENS* each.
+
+   Deliberately does NOT count reasoning_content.  The scratchpad is kept in
+   the history for display but stripped by STRIP-REASONING before the request
+   is built, so it never occupies the provider's context window — counting it
+   would compact early for text that is never sent.  The consequence is that
+   history size and estimated tokens diverge; that is intended, not a bug."
   (let ((chars 4))
     (let ((c (gethash "content" m)))
       (incf chars (length (llm:content-text c)))
@@ -232,6 +238,11 @@ continue a task in a fresh context window with nothing else to go on. Below
 is a span of its conversation: assistant messages, tool calls, tool results,
 and any user messages. It may also contain an earlier compaction brief —
 if so, carry everything from it forward, merged with what came after.
+
+A line beginning \"[thinking]\" is the model's own scratchpad, not its answer
+to the user. It is where the model states WHY it is about to call a tool, so
+mine it for intent and decisions — but never quote it as something the agent
+said to the user, and never carry it forward as a user message.
 
 Write a CONTINUATION BRIEF with exactly these sections, in this order. It
 replaces the span entirely; anything you leave out is gone. Use the agent's
@@ -290,12 +301,20 @@ completed). Do not shorten for brevity — nothing may be lost.")
    quotes code, and on OpenRouter a reasoning model's thinking counts
    against this too; 4096 cut section 3 off mid-snippet.")
 
+(defparameter *summary-reasoning-chars* 4000
+  "How much of one message's reasoning trace the summarizer sees. The trace is
+   where a reasoning model states its intent around a tool call, so dropping it
+   entirely loses the WHY of the span; but it is also the longest and least
+   fact-dense part of a message, so it is clipped well below the content cap.")
+
 (defun render-turn-for-summary (m)
-  "One message as the summarizer sees it: role, text, and each tool call as
-   name(args) — the call is what tells the reader which file was touched."
+  "One message as the summarizer sees it: role, text, the model's reasoning
+   trace, and each tool call as name(args) — the call is what tells the reader
+   which file was touched, and the trace is what tells it why."
   (let* ((role (gethash "role" m))
          (raw  (gethash "content" m))
          (content (llm:content-text raw))
+         (reasoning (or (gethash "reasoning_content" m) (gethash "reasoning" m)))
          (tcs (gethash "tool_calls" m)))
     (with-output-to-string (s)
       (format s "[~A] ~A~%" role
@@ -304,6 +323,18 @@ completed). Do not shorten for brevity — nothing may be lost.")
               (if (> (length content) 24000)
                   (concatenate 'string (subseq content 0 24000) "...[truncated]")
                   content))
+      ;; The scratchpad, labelled so the summarizer does not read it as the
+      ;; agent's answer.  On a tool-calling turn it is often the ONLY place the
+      ;; model says what it is about to do — and compaction is exactly the
+      ;; mechanism that discards the middle, so leaving it out here would drop
+      ;; the intent at the one boundary where it is most expensive to lose.
+      (when (and (stringp reasoning) (plusp (length reasoning)))
+        (format s "[thinking] ~A~%"
+                (if (> (length reasoning) *summary-reasoning-chars*)
+                    (concatenate 'string
+                                 (subseq reasoning 0 *summary-reasoning-chars*)
+                                 "...[truncated]")
+                    reasoning)))
       (when (and tcs (or (vectorp tcs) (listp tcs)))
         (map nil (lambda (tc)
                    (let ((fn (and (hash-table-p tc) (gethash "function" tc))))
@@ -311,14 +342,30 @@ completed). Do not shorten for brevity — nothing may be lost.")
                        (format s "    -> ~A(~A)~%" (gethash "name" fn) (gethash "arguments" fn)))))
              (if (listp tcs) (coerce tcs 'vector) tcs))))))
 
+(defun summary-chars (m)
+  "Character weight of one message AS THE SUMMARIZER SEES IT — i.e. including
+   the reasoning trace that RENDER-TURN-FOR-SUMMARY emits.  ESTIMATE-TOKENS
+   deliberately ignores the scratchpad (it is stripped before the request goes
+   out), so it cannot be used to size a summarizer chunk: the rendered text is
+   bigger than the estimate, and a chunk that fits by the estimate can overflow
+   the summarizer's window."
+  (if (stringp m)
+      (length m)
+      (let ((r (or (gethash "reasoning_content" m) (gethash "reasoning" m))))
+        (+ (msg-chars m)
+           (if (and (stringp r) (plusp (length r)))
+               (min (length r) *summary-reasoning-chars*)
+               0)))))
+
 (defun chunk-turns (turns max-tokens)
   "Split TURNS into consecutive chunks each estimated at or under MAX-TOKENS
    (a single oversized message is a chunk by itself). The summarizer has the
    same window as the agent, so a middle that overflowed the budget can't be
-   sent to it in one piece."
+   sent to it in one piece.  Sized by SUMMARY-CHARS, not ESTIMATE-TOKENS, so
+   the reasoning trace the summarizer is shown is counted."
   (let ((chunks '()) (cur '()) (cur-tok 0))
     (dolist (m turns)
-      (let ((tok (estimate-tokens (list m))))
+      (let ((tok (ceiling (summary-chars m) *chars-per-token*)))
         (when (and cur (> (+ cur-tok tok) max-tokens))
           (push (nreverse cur) chunks)
           (setf cur '() cur-tok 0))

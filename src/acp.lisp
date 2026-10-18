@@ -61,7 +61,13 @@
   "With no router: FIFO of output lines, drained by the handler oracle.")
 (defvar *rpc-seq* 0 "Per session actor: outbound request counter.")
 (defvar *sid* nil "Current sessionId during a prompt turn.")
-(defvar *msg-id* nil)
+(defvar *msg-id* nil
+  "messageId for the current turn's ANSWER chunks (agent_message_chunk).")
+(defvar *thought-id* nil
+  "messageId for the current turn's REASONING chunks (agent_thought_chunk).
+   Distinct from *MSG-ID* on purpose: the schema says a change in messageId
+   means a new message has started, so sharing one id across a thought chunk
+   and an answer chunk would tell the client they are the same message.")
 (defvar *msg-seq* 0)
 (defvar *pending* (make-hash-table :test 'equal)
   "Router: outbound request id -> the actor waiting for the client's reply.")
@@ -230,7 +236,7 @@
   (check-cancel)
   (when (and tok (plusp (length tok)))
     (update! (obj "sessionUpdate" "agent_thought_chunk"
-                  "messageId" *msg-id* "content" (text-block tok)))))
+                  "messageId" *thought-id* "content" (text-block tok)))))
 
 (defun acp-pre-hook (name args)
   (check-cancel)
@@ -355,6 +361,7 @@
          (messages (if hist (append hist (list (user-msg prompt-text))) nil))
          (*sid* sid)
          (*msg-id* (format nil "msg_~D" (incf *msg-seq*)))
+         (*thought-id* (format nil "thought_~D" (incf *msg-seq*)))
          (*tool-id* nil)
          (*standard-output* *log*)                          ; keep the protocol channel clean
          (hooks:*pre-tool-hooks*  (cons #'acp-pre-hook hooks:*pre-tool-hooks*))
@@ -491,6 +498,7 @@
   (declare (ignore router))
   (let ((*sessions* (make-hash-table :test 'equal))
         (*rpc-seq* 0) (*msg-seq* 0) (*tool-seq* 0) (*tool-id* nil) (*sid* nil)
+        (*msg-id* nil) (*thought-id* nil)
         (store:*exec-via* (lambda (sql params) (to-router (list :store sql params))))
         (*standard-output* *log*)
         (sid nil))
@@ -556,6 +564,7 @@
         *sessions* (make-hash-table :test 'equal)
         *pending* (make-hash-table :test 'equal)
         *rpc-seq* 0 *msg-seq* 0 *tool-seq* 0 *outq* nil
+        *msg-id* nil *thought-id* nil *tool-id* nil *sid* nil
         *router* (actor:self))
   (unwind-protect
       (let ((*standard-output* *log*))

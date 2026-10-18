@@ -122,6 +122,13 @@
                       (equal "Let me look at the file first."
                              (m@ (first thoughts) "content" "text"))
                       (not (search "Let me look" (m@ (first chunks) "content" "text")))))
+          (check "thought chunks carry their own messageId, distinct from the answer's"
+                 ;; the schema: a change in messageId means a new message started,
+                 ;; so sharing one id would tell the client the scratchpad and the
+                 ;; answer are the same message.
+                 (let ((tid (m@ (first thoughts) "messageId"))
+                       (aid (m@ (first chunks) "messageId")))
+                   (and tid aid (not (equal tid aid)))))
           (check "tool_call announced with kind read"
                  (and tcalls (equal "read" (m@ (first tcalls) "kind"))))
           (check "tool_call has a locations path"

@@ -325,19 +325,30 @@ carries Tinfoil, or drop --confidential-tinfoil."
    counting one call. Also captures prefix-cache hits — providers report
    them differently: OpenAI/OpenRouter as usage.prompt_tokens_details.
    cached_tokens, Anthropic as usage.cache_read_input_tokens. Returns DST;
-   a NIL DST is a no-op."
+   a NIL DST is a no-op.
+
+   When the provider reports tokens but NO cost (PPQ's sealed Path A enclave
+   does exactly this), price the turn from PPQ's catalogue instead of folding
+   a 0 — otherwise a confidential run shows 0.000¢ forever."
   (when (and dst parsed (hash-table-p parsed))
     (incf (usage-calls dst))
     (let ((u (gethash "usage" parsed)))
       (when (hash-table-p u)
         (flet ((num (k &optional (h u)) (let ((v (and (hash-table-p h) (gethash k h))))
                                           (if (realp v) v 0))))
-          (incf (usage-prompt-tokens dst) (num "prompt_tokens"))
-          (incf (usage-completion-tokens dst) (num "completion_tokens"))
-          (incf (usage-cost-usd dst) (coerce (num "cost") 'double-float))
-          (incf (usage-cached-tokens dst)
-                (+ (num "cached_tokens" (gethash "prompt_tokens_details" u))
-                   (num "cache_read_input_tokens")))))))
+          (let* ((pt (num "prompt_tokens"))
+                 (ct (num "completion_tokens"))
+                 (cached (+ (num "cached_tokens" (gethash "prompt_tokens_details" u))
+                            (num "cache_read_input_tokens")))
+                 (cost (coerce (num "cost") 'double-float)))
+            (incf (usage-prompt-tokens dst) pt)
+            (incf (usage-completion-tokens dst) ct)
+            (incf (usage-cached-tokens dst) cached)
+            (when (and (zerop cost) (eq *llm-backend* :ppq) *llm-model*)
+              (setf cost (or (operandi.ppq:ppq-price-usd *llm-model* pt ct
+                                                         :cached-tokens cached)
+                             0d0)))
+            (incf (usage-cost-usd dst) cost))))))
   dst)
 
 (defun usage-incf (dst src)
@@ -490,10 +501,10 @@ call with :want-stream nil"))
                            (t *llm-effort*)))
     (when *llm-model*
       (setf (gethash "model" body-ht) *llm-model*))
-    ;; OpenRouter only reports real USD cost when asked; harmless to llama.
-    ;; Not sent to confidential :PPQ — the enclave's OpenAI dialect is not
-    ;; OpenRouter's, and an unknown field is a 400 we would have to debug.
-    (when (member *llm-backend* '(:openrouter :routstr))
+    ;; OpenRouter, Routstr and PPQ only report real USD cost when asked;
+    ;; harmless to llama.  :TINFOIL is excluded — its enclave dialect rejects
+    ;; the unknown field with a 400.
+    (when (member *llm-backend* '(:openrouter :routstr :ppq))
       (setf (gethash "usage" body-ht) (ht "include" t)))
     (loop for (k v) on extra by #'cddr
           do (setf (gethash (string-downcase (string k)) body-ht) v))

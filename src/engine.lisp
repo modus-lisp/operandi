@@ -1034,10 +1034,14 @@ another tool or give a final answer.")
     ;; explicit was chosen.
     (llm:apply-reasoning body (or llm:*llm-effort*
                                   (and *do-chat-disable-reasoning* :off)))
-    ;; Cost/token accounting.  OpenRouter and Routstr want {"usage":{"include":true}};
-    ;; the enclave's OpenAI dialect does not know the field and 400s on it, so
-    ;; :PPQ is excluded (it reports usage unprompted anyway).
-    (when (member llm:*llm-backend* '(:openrouter :routstr))
+    ;; Cost/token accounting.  OpenRouter, Routstr and PPQ all want
+    ;; {"usage":{"include":true}}: without it they report TOKENS but no `cost`,
+    ;; so every turn folds a cost of 0 and the session shows 0.000¢.  (The old
+    ;; comment here claimed the enclave 400s on the field — it does not; the
+    ;; sealed vLLM path accepts it and simply returns no cost, which is the
+    ;; bug.)  :TINFOIL is the one backend that rejects the field, so it is
+    ;; excluded.
+    (when (member llm:*llm-backend* '(:openrouter :routstr :ppq))
       (setf (gethash "usage" body) (ht "include" t)))
     (when llm:*llm-model* (setf (gethash "model" body) llm:*llm-model*))
     body))

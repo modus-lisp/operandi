@@ -152,6 +152,69 @@
                (> (llm:usage-cost-usd usage) 0.0d0)
                (>= (llm:usage-calls usage) 1))))))
 
+  ;; The 0.000¢ regression: PPQ (like OpenRouter/Routstr) reports TOKENS
+  ;; unprompted but `cost` ONLY when the request asks with
+  ;; {"usage":{"include":true}}.  The engine used to exclude :PPQ from that
+  ;; request, so every turn folded a cost of 0.  Assert the field is present
+  ;; for the backends that need it, and absent for :TINFOIL (whose enclave
+  ;; dialect rejects the unknown field).
+  (check "the request asks for cost on :ppq (the 0.000¢ fix)"
+    (let ((llm:*llm-backend* :ppq) (llm:*llm-model* "deepseek/deepseek-v4.1-flash"))
+      (let ((body (eng::build-chat-body
+                   (vector (llm:ht "role" "user" "content" "hi")) nil 5 0.0 nil)))
+        (let ((u (gethash "usage" body)))
+          (and (hash-table-p u) (eq t (gethash "include" u)))))))
+
+  (check "the request asks for cost on :openrouter and :routstr too"
+    (every (lambda (b)
+             (let ((llm:*llm-backend* b) (llm:*llm-model* "m"))
+               (let ((u (gethash "usage" (eng::build-chat-body
+                                          (vector (llm:ht "role" "user" "content" "hi"))
+                                          nil 5 0.0 nil))))
+                 (and (hash-table-p u) (eq t (gethash "include" u))))))
+           '(:openrouter :routstr)))
+
+  (check "the request does NOT send usage.include to :tinfoil"
+    (let ((llm:*llm-backend* :tinfoil) (llm:*llm-model* "gpt-oss-120b"))
+      (null (gethash "usage" (eng::build-chat-body
+                              (vector (llm:ht "role" "user" "content" "hi"))
+                              nil 5 0.0 nil)))))
+
+  ;; The sealed Path A enclave reports tokens but NO cost, so a confidential
+  ;; run would still show 0.000¢.  fold-usage prices such a turn from PPQ's
+  ;; catalogue instead of folding a 0.
+  (check "a costless :ppq turn is priced from the catalogue, not folded as 0"
+    (let ((llm:*llm-backend* :ppq) (llm:*llm-model* "private/gpt-oss-120b")
+          (operandi.ppq:*ppq-pricing* '(("private/gpt-oss-120b"
+                                         :in 1.0d0 :out 2.0d0 :cache-read 0.1d0)))
+          (operandi.ppq::*ppq-pricing-fetched-p* t)
+          (u (llm:make-usage)))
+      (llm:fold-usage u (llm:ht "usage" (llm:ht "prompt_tokens" 1000
+                                                "completion_tokens" 500)))
+      ;; 1000 * $1/1M + 500 * $2/1M = 0.001 + 0.001 = 0.002
+      (and (> (llm:usage-cost-usd u) 0.0d0)
+           (< (abs (- (llm:usage-cost-usd u) 0.002d0)) 1d-9))))
+
+  (check "a provider-reported cost is NOT overridden by the catalogue"
+    (let ((llm:*llm-backend* :ppq) (llm:*llm-model* "private/gpt-oss-120b")
+          (operandi.ppq:*ppq-pricing* '(("private/gpt-oss-120b"
+                                         :in 1.0d0 :out 2.0d0 :cache-read 0.1d0)))
+          (operandi.ppq::*ppq-pricing-fetched-p* t)
+          (u (llm:make-usage)))
+      (llm:fold-usage u (llm:ht "usage" (llm:ht "prompt_tokens" 1000
+                                                "completion_tokens" 500
+                                                "cost" 0.5d0)))
+      (< (abs (- (llm:usage-cost-usd u) 0.5d0)) 1d-9)))
+
+  (check "an unknown model with no reported cost folds 0, not an error"
+    (let ((llm:*llm-backend* :ppq) (llm:*llm-model* "no/such-model")
+          (operandi.ppq:*ppq-pricing* nil)
+          (operandi.ppq::*ppq-pricing-fetched-p* t)
+          (u (llm:make-usage)))
+      (llm:fold-usage u (llm:ht "usage" (llm:ht "prompt_tokens" 10
+                                                "completion_tokens" 5)))
+      (zerop (llm:usage-cost-usd u))))
+
   (format t "~&~%~D passed, ~D failed~%" *pass* *fail*)
   (zerop *fail*))
 

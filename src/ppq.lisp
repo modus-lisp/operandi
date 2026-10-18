@@ -52,6 +52,7 @@
            #:*tinfoil-base* #:*tinfoil-attestation-url* #:*tinfoil-token-file*
            #:ppq-error #:ppq-error-reason
            #:ppq-token #:ppq-model-p #:ppq-wire-model #:confidential-p
+           #:ppq-price-usd #:*ppq-pricing*
            #:*routstr-tinfoil-prefix* #:routstr-confidential-p #:routstr-wire-model
            #:verify-attested-key
            #:sealed-post #:plain-post #:ppq-post #:ppq-chat #:tinfoil-chat
@@ -175,6 +176,61 @@
    the model NAME, so the choice of path is explicit at the call site instead
    of a lookup table we would have to keep in sync with PPQ's catalogue."
   (ppq-model-p model))
+
+;;; ---- pricing fallback ------------------------------------------------------
+;;; PPQ reports `usage.cost` when the request asks with {"usage":{"include":true}}
+;;; — but ONLY on the plaintext path.  The sealed Path A enclave (a vLLM behind
+;;; Tinfoil) returns tokens and no cost at all, so a confidential run would show
+;;; 0.000¢ forever.  For that case we price the turn ourselves from PPQ's public
+;;; catalogue (GET /v1/models, no auth), which carries per-1M-token rates for
+;;; every model including the private/* ones.  The table is fetched once and
+;;; cached; a lookup miss returns NIL and the caller keeps the provider's 0.
+
+(defvar *ppq-pricing* nil
+  "Alist of (MODEL-ID . PLIST) from PPQ's catalogue, or NIL if never fetched.
+   PLIST keys: :in :out :cache-read :cache-write (USD per 1M tokens).")
+
+(defvar *ppq-pricing-fetched-p* nil
+  "True once a fetch has been attempted, so a failure is not retried per turn.")
+
+(defun %ppq-pricing-fetch ()
+  "Fetch and cache PPQ's model catalogue pricing.  Best-effort: any failure
+   leaves *PPQ-PRICING* NIL and the caller falls back to the provider's cost."
+  (unless *ppq-pricing-fetched-p*
+    (setf *ppq-pricing-fetched-p* t)
+    (handler-case
+        (let* ((parsed (%get-json (format nil "~A/v1/models" *ppq-base*)))
+               (data (and (hash-table-p parsed) (%get parsed "data")))
+               (acc '()))
+          (when (vectorp data)
+            (loop for m across data
+                  when (hash-table-p m)
+                    do (let ((id (%get m "id")) (p (%get m "pricing")))
+                         (when (and (stringp id) (hash-table-p p))
+                           (flet ((rate (k) (let ((v (%get p k)))
+                                              (and (realp v) (coerce v 'double-float)))))
+                             (push (cons id (list :in (rate "input_per_1M_tokens")
+                                                  :out (rate "output_per_1M_tokens")
+                                                  :cache-read (rate "cache_read_per_1M_tokens")
+                                                  :cache-write (rate "cache_write_per_1M_tokens")))
+                                   acc))))))
+          (setf *ppq-pricing* acc))
+      (error () nil)))
+  *ppq-pricing*)
+
+(defun ppq-price-usd (model prompt-tokens completion-tokens &key cached-tokens)
+  "USD for a turn on MODEL, priced from PPQ's catalogue, or NIL when MODEL is
+   unknown or the catalogue could not be fetched.  CACHED-TOKENS are billed at
+   the cache-read rate and the rest of the prompt at the input rate."
+  (let* ((entry (and (stringp model) (cdr (assoc model (%ppq-pricing-fetch) :test #'string=))))
+         (in (getf entry :in))
+         (out (getf entry :out)))
+    (when (and in out)
+      (let* ((cached (or cached-tokens 0))
+             (fresh (max 0 (- (or prompt-tokens 0) cached)))
+             (cr (or (getf entry :cache-read) in)))
+        (/ (+ (* fresh in) (* cached cr) (* (or completion-tokens 0) out))
+           1000000.0d0)))))
 
 ;;; ---- Routstr's Tinfoil models ----------------------------------------------
 ;;;

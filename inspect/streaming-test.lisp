@@ -38,6 +38,8 @@
       (llm:ht "choices" (vector (llm:ht "delta" (llm:ht "tool_calls" (vector tc))))))))
 (defun finish-delta (fr) (llm:ht "choices" (vector (llm:ht "delta" (llm:ht) "finish_reason" fr))))
 (defun usage-delta (pt) (llm:ht "usage" (llm:ht "prompt_tokens" pt "completion_tokens" 3)))
+(defun reasoning-delta (s &key (key "reasoning_content"))
+  (llm:ht "choices" (vector (llm:ht "delta" (llm:ht key s)))))
 
 (defun fold-all (events)
   (let ((st (eng::make-sse-state)))
@@ -132,6 +134,68 @@
       (let ((m (eng::extract-message
                 (fold-all (list (content-delta "real answer") (error-evt "late warn" 0))))))
         (and (hash-table-p m) (string= (gethash "content" m) "real answer")))))
+
+  ;; --- reasoning (the scratchpad) ---
+  ;; A reasoning model emits delta.reasoning_content BEFORE any content, and on
+  ;; a tool-calling turn it may emit nothing else. Dropping it is why the
+  ;; commentary around tool use never appeared in the TUI.
+  (check "reasoning deltas assemble onto the message (reasoning_content)"
+    (let ((m (msg-of (fold-all (list (reasoning-delta "I should ")
+                                     (reasoning-delta "list the files.")
+                                     (finish-delta "tool_calls"))))))
+      (string= (gethash "reasoning_content" m) "I should list the files.")))
+
+  (check "reasoning deltas assemble from the OpenRouter 'reasoning' key too"
+    (let ((m (msg-of (fold-all (list (reasoning-delta "think" :key "reasoning"))))))
+      (string= (gethash "reasoning_content" m) "think")))
+
+  (check "*on-reasoning* fires live for each reasoning delta"
+    (let ((acc (make-string-output-stream)))
+      (let ((eng:*on-reasoning* (lambda (s) (write-string s acc))))
+        (fold-all (list (reasoning-delta "ab") (reasoning-delta "cd"))))
+      (string= (get-output-stream-string acc) "abcd")))
+
+  (check "reasoning does NOT fire *on-token* (it is not the answer)"
+    (let ((acc (make-string-output-stream)))
+      (let ((eng:*on-token* (lambda (s) (write-string s acc))))
+        (fold-all (list (reasoning-delta "scratchpad"))))
+      (zerop (length (get-output-stream-string acc)))))
+
+  (check "a tool-call turn with ONLY reasoning still carries the trace"
+    ;; the exact shape that produced the reported bug: no content at all
+    (let* ((m (msg-of (fold-all (list (reasoning-delta "Extracting both parts.")
+                                      (tool-delta 0 :id "c1" :name "Bash" :args "{}")
+                                      (finish-delta "tool_calls")))))
+           (tcs (gethash "tool_calls" m)))
+      (and (string= (gethash "content" m) "")
+           (string= (gethash "reasoning_content" m) "Extracting both parts.")
+           (= (length tcs) 1))))
+
+  (check "no reasoning key on the message when the model emitted none"
+    (let ((m (msg-of (fold-all (list (content-delta "hi") (finish-delta "stop"))))))
+      (null (gethash "reasoning_content" m))))
+
+  (check "strip-reasoning removes the scratchpad before it is sent back"
+    (let* ((msgs (vector (llm:ht "role" "assistant" "content" ""
+                                 "reasoning_content" "scratch"
+                                 "tool_calls" (vector (llm:ht "id" "c1")))
+                         (llm:ht "role" "user" "content" "hi")))
+           (out (eng::strip-reasoning msgs)))
+      (and (null (gethash "reasoning_content" (aref out 0)))
+           (string= (gethash "content" (aref out 0)) "")
+           (gethash "tool_calls" (aref out 0))          ; everything else kept
+           (string= (gethash "content" (aref out 1)) "hi"))))
+
+  (check "strip-reasoning is identity (same object) when there is nothing to strip"
+    (let ((msgs (vector (llm:ht "role" "user" "content" "hi"))))
+      (eq msgs (eng::strip-reasoning msgs))))
+
+  (check "render-turns shows the scratchpad as [thinking]"
+    (let ((txt (eng::render-turns
+                (list (llm:ht "role" "assistant" "content" ""
+                              "reasoning_content" "Extracting both parts.")))))
+      (and (search "[thinking] Extracting both parts." txt)
+           (search "[assistant]" txt))))
 
   (format t "~&~%~D passed, ~D failed~%" *pass* *fail*)
   (zerop *fail*))

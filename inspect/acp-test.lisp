@@ -93,6 +93,10 @@
           ;; stream two assistant chunks
           (funcall eng:*on-token* "Hello ")
           (funcall eng:*on-token* "world")
+          ;; ...and a reasoning trace, which must go out as agent_thought_chunk
+          ;; (a DIFFERENT update kind) so the client can render it collapsed
+          ;; instead of splicing the scratchpad into the answer.
+          (funcall eng:*on-reasoning* "Let me look at the file first.")
           ;; one tool call through the hook chain (as invoke-tool would)
           (operandi.hooks:run-pre-hooks "Read" (llm:ht "file_path" "/proj/x.lisp"))
           (operandi.hooks:run-post-hooks "Read" (llm:ht "file_path" "/proj/x.lisp") "the file body" nil 5)
@@ -104,6 +108,7 @@
         (acp::run-prompt-turn *sid* 42 "hi there")
         (let* ((msgs (drain))
                (chunks (updates msgs "agent_message_chunk"))
+               (thoughts (updates msgs "agent_thought_chunk"))
                (tcalls (updates msgs "tool_call"))
                (tupd   (updates msgs "tool_call_update"))
                (usage  (updates msgs "usage_update"))
@@ -112,6 +117,11 @@
                  (equal "Hello world"
                         (apply #'concatenate 'string
                                (mapcar (lambda (u) (m@ u "content" "text")) chunks))))
+          (check "reasoning goes out as agent_thought_chunk, not a message chunk"
+                 (and thoughts
+                      (equal "Let me look at the file first."
+                             (m@ (first thoughts) "content" "text"))
+                      (not (search "Let me look" (m@ (first chunks) "content" "text")))))
           (check "tool_call announced with kind read"
                  (and tcalls (equal "read" (m@ (first tcalls) "kind"))))
           (check "tool_call has a locations path"

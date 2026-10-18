@@ -39,6 +39,7 @@
            #:*prompt-cache*
            #:*stream*
            #:*on-token*
+           #:*on-reasoning*
            #:*subagent-usage*
            #:*subagents*
            #:*live-messages* #:*on-progress* #:*steer-fn* #:message-tool-calls #:tool-result-msg
@@ -420,9 +421,15 @@ completed). Do not shorten for brevity — nothing may be lost.")
   (with-output-to-string (s)
     (dolist (m turns)
       (let ((role (gethash "role" m)) (c (gethash "content" m))
-            (tcs (gethash "tool_calls" m)))
+            (tcs (gethash "tool_calls" m))
+            (r (or (gethash "reasoning_content" m) (gethash "reasoning" m))))
         (format s "[~A] ~A~%" role
                 (llm:content-text c))
+        ;; The scratchpad is where a reasoning model's commentary around a
+        ;; tool call lives; without it an offloaded span reads as a run of
+        ;; bare tool calls with no stated intent.
+        (when (and (stringp r) (plusp (length r)))
+          (format s "[thinking] ~A~%" r))
         (when (and tcs (or (vectorp tcs) (listp tcs)))
           (map nil (lambda (tc)
                      (let ((fn (and (hash-table-p tc) (gethash "function" tc))))
@@ -868,18 +875,57 @@ another tool or give a final answer.")
    passed to it as they arrive (the run loop binds it to a live printer
    when verbose). NIL = accumulate silently.")
 
+(defvar *on-reasoning* nil
+  "When bound to a function of one string arg, streamed REASONING tokens
+   (delta.reasoning_content / delta.reasoning) are passed to it as they
+   arrive.  Separate from *ON-TOKEN* on purpose: reasoning is the model's
+   scratchpad, not its answer, so a front-end can render it differently
+   (dimmed, collapsed) or drop it — but it must be able to SEE it, because
+   on a reasoning model the trace is where the commentary around a tool
+   call actually lives.  NIL = accumulate silently.")
+
 (defun chat-headers ()
   (if llm:*llm-auth-token*
       `(("Content-Type" . "application/json")
         ("Authorization" . ,(concatenate 'string "Bearer " llm:*llm-auth-token*)))
       '(("Content-Type" . "application/json"))))
 
+(defun strip-reasoning (messages)
+  "Non-destructively return MESSAGES with any reasoning_content / reasoning
+   key removed from each message.  The scratchpad is kept in the history for
+   DISPLAY, but it is not part of the OpenAI chat protocol: sending it back
+   is at best ignored and at worst a 400 (and on some providers it is billed
+   as input).  Returns MESSAGES itself when there is nothing to strip, so the
+   common path allocates nothing."
+  (let ((any nil))
+    (map nil (lambda (m)
+               (when (and (hash-table-p m)
+                          (or (gethash "reasoning_content" m) (gethash "reasoning" m)))
+                 (setf any t)))
+         messages)
+    (if (not any)
+        messages
+        (map 'vector
+             (lambda (m)
+               (if (and (hash-table-p m)
+                        (or (gethash "reasoning_content" m) (gethash "reasoning" m)))
+                   (let ((c (make-hash-table :test 'equal)))
+                     (maphash (lambda (k v)
+                                (unless (member k '("reasoning_content" "reasoning")
+                                                :test #'string=)
+                                  (setf (gethash k c) v)))
+                              m)
+                     c)
+                   m))
+             messages))))
+
 (defun build-chat-body (messages tools-vec max-tokens temperature stream)
   "The request body shared by the blocking and streaming paths."
-  (let* ((msgs (if (and *prompt-cache* (eq llm:*llm-backend* :openrouter)
+  (let* ((msgs (strip-reasoning
+                (if (and *prompt-cache* (eq llm:*llm-backend* :openrouter)
                         (anthropic-model-p llm:*llm-model*))
                    (cache-control-system messages)
-                   (coerce messages 'vector)))
+                   (coerce messages 'vector))))
          (body (ht "messages" msgs
                    "max_tokens" max-tokens "temperature" temperature)))
     ;; An EMPTY tools array is not the same as no tools: vLLM (which is what
@@ -910,13 +956,24 @@ another tool or give a final answer.")
 (defun do-chat-blocking (messages tools-vec &key (max-tokens *do-chat-max-tokens*)
                                                  (temperature 0.0))
   "One blocking chat completion. Returns the parsed top-level hash table."
-  (let ((resp (llm:post-chat llm:*llm-url*
-                            (with-output-to-string (s)
-                              (json:stringify (build-chat-body messages tools-vec
-                                                               max-tokens temperature nil)
-                                              :stream s))
-                            (chat-headers))))
-    (json:parse resp)))
+  (let* ((resp (llm:post-chat llm:*llm-url*
+                              (with-output-to-string (s)
+                                (json:stringify (build-chat-body messages tools-vec
+                                                                 max-tokens temperature nil)
+                                                :stream s))
+                              (chat-headers)))
+         (parsed (json:parse resp)))
+    ;; No SSE to stream, but the scratchpad still exists — hand it to
+    ;; *ON-REASONING* in one piece so a front-end shows it the same way it
+    ;; shows a streamed trace.
+    (when *on-reasoning*
+      (let* ((choices (gethash "choices" parsed))
+             (msg (and (vectorp choices) (plusp (length choices))
+                       (gethash "message" (aref choices 0))))
+             (r (and msg (or (gethash "reasoning_content" msg)
+                             (gethash "reasoning" msg)))))
+        (when (and (stringp r) (plusp (length r))) (funcall *on-reasoning* r))))
+    parsed))
 
 (defun parse-sse-line (line)
   "A single SSE line -> the parsed JSON hash for a 'data:' event, :done for
@@ -933,6 +990,7 @@ another tool or give a final answer.")
 ;; the blocking-path response shape.
 (defstruct sse-state
   (content (make-string-output-stream))
+  (reasoning (make-string-output-stream))  ; the model's scratchpad, if any
   (tcs (make-hash-table))                ; index -> (list id name args-stream)
   finish usage error)
 
@@ -954,6 +1012,15 @@ another tool or give a final answer.")
          (fr (and (hash-table-p choice) (gethash "finish_reason" choice))))
     (when (stringp fr) (setf (sse-state-finish state) fr))
     (when (hash-table-p delta)
+      ;; Reasoning first: a reasoning model emits its scratchpad before any
+      ;; content, and on a tool-calling turn it may emit NOTHING but the
+      ;; scratchpad and the call.  Dropping it (as this used to) is why the
+      ;; commentary around tool use never appeared.
+      (let ((r (or (gethash "reasoning_content" delta)
+                   (gethash "reasoning" delta))))
+        (when (and (stringp r) (plusp (length r)))
+          (write-string r (sse-state-reasoning state))
+          (when *on-reasoning* (funcall *on-reasoning* r))))
       (let ((c (gethash "content" delta)))
         (when (and (stringp c) (plusp (length c)))
           (write-string c (sse-state-content state))
@@ -981,6 +1048,7 @@ another tool or give a final answer.")
    response-has-error-body-p / do-chat-with-retries instead of masquerading as a
    blank but 'successful' turn."
   (let* ((content (get-output-stream-string (sse-state-content state)))
+         (reasoning (get-output-stream-string (sse-state-reasoning state)))
          (tcs (sse-state-tcs state))
          (has-tcs (plusp (hash-table-count tcs))))
     ;; Provider error with nothing usable → surface the error body.
@@ -989,6 +1057,11 @@ another tool or give a final answer.")
         (when (sse-state-usage state) (setf (gethash "usage" parsed) (sse-state-usage state)))
         (return-from sse-finalize parsed)))
     (let ((msg (ht "role" "assistant" "content" content)))
+      ;; Keep the scratchpad on the message so a front-end (and the offload
+      ;; renderer) can show it.  It is NOT sent back to the provider — see
+      ;; STRIP-REASONING in BUILD-CHAT-BODY.
+      (when (plusp (length reasoning))
+        (setf (gethash "reasoning_content" msg) reasoning))
       (when has-tcs
         (setf (gethash "tool_calls" msg)
               (coerce (loop for i in (sort (loop for k being the hash-keys of tcs collect k) #'<)
@@ -1215,6 +1288,11 @@ another tool or give a final answer.")
     (let ((tcs (gethash "tool_calls" msg)))
       (when (and tcs (or (listp tcs) (vectorp tcs)))
         (setf (gethash "tool_calls" h) tcs)))
+    ;; Carry the scratchpad along for display.  It is stripped again on the
+    ;; way out (STRIP-REASONING), so it never reaches the provider.
+    (let ((r (or (gethash "reasoning_content" msg) (gethash "reasoning" msg))))
+      (when (and (stringp r) (plusp (length r)))
+        (setf (gethash "reasoning_content" h) r)))
     h))
 
 (defun tool-result-msg (tool-call-id content)

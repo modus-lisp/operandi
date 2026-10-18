@@ -100,8 +100,14 @@
             (llm:usage-summary (session-usage s)))
     (dolist (m (gethash :history s))
       (let ((role (gethash "role" m)) (c (gethash "content" m))
-            (tcs (gethash "tool_calls" m)))
+            (tcs (gethash "tool_calls" m))
+            (r (or (gethash "reasoning_content" m) (gethash "reasoning" m))))
         (unless (string= role "system")
+          ;; The scratchpad first, as a blockquote: on a tool-calling turn it is
+          ;; often the only place the model says what it is about to do, so a
+          ;; transcript without it reads as a run of unexplained tool calls.
+          (when (and (stringp r) (plusp (length r)))
+            (format o "> _thinking:_ ~A~%~%" (%clip r 4000)))
           (format o "**~A:** ~A~%~%" role (%clip (llm:content-text c) 6000))
           (when (and tcs (or (vectorp tcs) (listp tcs)))
             (map nil (lambda (tc)

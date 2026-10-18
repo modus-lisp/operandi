@@ -223,6 +223,15 @@
     (update! (obj "sessionUpdate" "agent_message_chunk"
                   "messageId" *msg-id* "content" (text-block tok)))))
 
+(defun acp-on-reasoning (tok)
+  "The model's scratchpad, as ACP's agent_thought_chunk — the client decides
+   whether to show it (Zed renders it collapsed).  Without this a reasoning
+   model's commentary around a tool call is invisible to the client."
+  (check-cancel)
+  (when (and tok (plusp (length tok)))
+    (update! (obj "sessionUpdate" "agent_thought_chunk"
+                  "messageId" *msg-id* "content" (text-block tok)))))
+
 (defun acp-pre-hook (name args)
   (check-cancel)
   (when *sid*
@@ -353,6 +362,7 @@
          (tools:*tool-gate* (lambda (name args) (acp-gate sid name args)))
          (eng:*stream* t)
          (eng:*on-token* #'acp-on-token)
+         (eng:*on-reasoning* #'acp-on-reasoning)
          (stop "end_turn"))
     (supdate sid :active t)
     (unwind-protect

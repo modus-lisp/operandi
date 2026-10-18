@@ -58,15 +58,50 @@
   (let ((deny (%csv csv)))
     (remove-if (lambda (n) (member n deny :test #'string-equal)) (tools:default-tools))))
 
+(defun %stderr-dim-p ()
+  "T when stderr is a terminal, so the reasoning trace can be dimmed there
+   without leaving escape codes in a redirected log."
+  (let ((f (find-symbol "FD-TTY-P" "OPERANDI.TUI")))
+    (and f (ignore-errors (funcall f 2 *error-output*)))))
+
 (defun display-run (prompt &optional (tool-names (tools:default-tools)))
   "Run PROMPT streaming tokens live to stdout, then print metrics. The
    final answer is reprinted only if it differs from what already streamed
    (a synthetic '[max-iterations…]' result, or blocking mode).  TOOL-NAMES is the
-   available-tools allow-list handed to the agent."
+   available-tools allow-list handed to the agent.
+
+   The model's reasoning trace goes to STDERR, dimmed: it is the scratchpad,
+   not the answer, and on a tool-calling turn it is often the ONLY place the
+   model says what it is about to do.  Keeping it off stdout means a piped
+   `operandi \"task\" > answer.txt` still gets just the answer."
   (let* ((buf (make-string-output-stream))
-         (eng:*on-token* (lambda (s) (write-string s buf) (write-string s) (force-output))))
+         (dim (%stderr-dim-p))
+         (think-open nil)
+         (think-line (make-string-output-stream))
+         (eng:*on-token* (lambda (s) (write-string s buf) (write-string s) (force-output)))
+         (eng:*on-reasoning*
+           (lambda (s)
+             ;; Reasoning arrives in token-sized fragments; buffer to the next
+             ;; newline so the trace reads as lines, not one line per token.
+             (unless think-open
+               (format *error-output* "~&~@[~C[2m~]✻ thinking~@[~C[0m~]~%"
+                       (and dim #\Escape) (and dim #\Escape))
+               (setf think-open t))
+             (loop with start = 0
+                   for nl = (position #\Newline s :start start)
+                   do (write-string s think-line :start start :end (or nl (length s)))
+                      (cond (nl (format *error-output* "~@[~C[2m~]│ ~A~@[~C[0m~]~%"
+                                        (and dim #\Escape)
+                                        (get-output-stream-string think-line)
+                                        (and dim #\Escape))
+                                (setf start (1+ nl)))
+                            (t (return)))))))
     (multiple-value-bind (text history iters usage) (eng:run prompt :tool-names tool-names)
       (declare (ignore history))
+      (when think-open
+        (let ((tail (get-output-stream-string think-line)))
+          (when (plusp (length tail))
+            (format *error-output* "~@[~C[2m~]│ ~A~@[~C[0m~]~%" (and dim #\Escape) tail (and dim #\Escape)))))
       (let ((streamed (string-right-trim '(#\Space #\Newline) (get-output-stream-string buf))))
         (unless (string= (string-right-trim '(#\Space #\Newline) (or text "")) streamed)
           (format t "~&~A" text)))

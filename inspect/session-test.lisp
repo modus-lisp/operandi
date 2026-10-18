@@ -52,6 +52,7 @@
         (list (mk "role" "system" "content" "SYS")
               (mk "role" "user" "content" "run echo hi")
               (mk "role" "assistant" "content" "ok"
+                  "reasoning_content" "I should run echo hi to see what it prints."
                   "tool_calls" (vector (mk "id" "call_1" "type" "function"
                                            "function" (mk "name" "Bash"
                                                           "arguments" "{\"command\":\"echo hi\"}"))))
@@ -60,6 +61,13 @@
         (gethash :turns s) 2 (gethash :cost s) 0.0123d0 (gethash :calls s) 3
         (gethash :prompt-tok s) 500 (gethash :completion-tok s) 20)
   (check "persist-session writes files" (session::persist-session s))
+  ;; The .md transcript is what a human reads back; the scratchpad has to be
+  ;; in it, or a tool-calling turn reads as an unexplained tool call.
+  (let ((md (merge-pathnames (format nil "~A.md" (gethash :id s)) session::*sessions-dir*)))
+    (check "transcript shows the model's thinking"
+           (let ((txt (uiop:read-file-string md)))
+             (and (search "thinking" txt)
+                  (search "I should run echo hi" txt)))))
   (let* ((id (gethash :id s))
          (r (session::make-session))
          (got (session::resume-session! r id)))
@@ -76,6 +84,9 @@
              (tc (and tcs (> (length tcs) 0) (elt tcs 0)))
              (fn (and tc (gethash "function" tc))))
         (check "assistant content preserved" (equal "ok" (gethash "content" asst)))
+        (check "reasoning_content survives the round trip"
+               (equal "I should run echo hi to see what it prints."
+                      (gethash "reasoning_content" asst)))
         (check "tool_calls preserved"        (and fn (equal "Bash" (gethash "name" fn))))
         (check "tool args preserved"         (and fn (search "echo hi" (gethash "arguments" fn))))
         (check "tool_call_id linkage intact"

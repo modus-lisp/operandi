@@ -106,6 +106,10 @@
   assistant segment with a bullet (set at turn start and after each tool).")
 (defvar *streamed* nil "String stream capturing what actually streamed this
   turn, so we can tell if the final answer still needs printing.")
+(defvar *think-line* nil "Adjustable string: the current line of the model's
+  streamed reasoning (the scratchpad), up to the next newline.")
+(defvar *think-open* nil "T while a reasoning block is being printed, so the
+  header is emitted once and the block is closed before anything else.")
 
 (defparameter *ui-out*
   (lambda (s) (write-string s) (force-output))
@@ -349,6 +353,7 @@
 
 (defun tui-pre-hook (name args)
   (md-flush)
+  (think-close)
   ;; Text streamed before a tool call is narration, not the answer: start
   ;; *STREAMED* over so it only ever holds the text since the last tool call.
   (when *streamed* (get-output-stream-string *streamed*))
@@ -378,12 +383,52 @@
 (defun on-token (tok)
   "OPERANDI.ENGINE:*ON-TOKEN* callback: stream TOK live and capture it."
   (when (and tok (plusp (length tok)))
+    (think-close)
     (when *need-bullet*
       (fresh)
       (emit (paint "⏺ " :br-cyan))
       (setf *need-bullet* nil))
     (write-string tok *streamed*)
     (md-feed tok)))
+
+;;; ------------------------------ thinking ----------------------------
+;;; A reasoning model's scratchpad (delta.reasoning_content) is where the
+;;; commentary around a tool call actually lives: on a tool-calling turn the
+;;; model often emits NO content at all, only the trace and the call.  It is
+;;; shown dimmed and indented, under a "thinking" header, so it reads as
+;;; scratchpad rather than as the answer.
+
+(defun think-open ()
+  (unless *think-open*
+    (fresh)
+    (emit (paint "  ✻ thinking" :gray))
+    (emit (string #\Newline))
+    (setf *think-open* t)))
+
+(defun think-close ()
+  "Close an open reasoning block (no-op when none is open)."
+  (when *think-open*
+    (when (and *think-line* (plusp (fill-pointer *think-line*)))
+      (emit (paint (format nil "  │ ~A" (subseq *think-line* 0)) :gray))
+      (emit (string #\Newline))
+      (setf (fill-pointer *think-line*) 0))
+    (setf *think-open* nil)))
+
+(defun on-reasoning (tok)
+  "OPERANDI.ENGINE:*ON-REASONING* callback: print the scratchpad dimmed,
+   one line at a time, prefixed so it is visually distinct from the answer."
+  (when (and tok (plusp (length tok)))
+    (think-open)
+    (unless *think-line* (setf *think-line* (md-new-buf)))
+    (loop with start = 0
+          for nl = (position #\Newline tok :start start)
+          do (loop for i from start below (or nl (length tok))
+                   do (vector-push-extend (char tok i) *think-line*))
+             (cond (nl (emit (paint (format nil "  │ ~A" (subseq *think-line* 0)) :gray))
+                       (emit (string #\Newline))
+                       (setf (fill-pointer *think-line*) 0)
+                       (setf start (1+ nl)))
+                   (t (return))))))
 
 ;;; ------------------------------ session -----------------------------
 ;;; Session state + persistence live in operandi.session (shared with the ACP
@@ -646,6 +691,8 @@
          (*need-bullet* t)
          (*md-line* (md-new-buf))
          (*md-fence* nil)
+         (*think-line* (md-new-buf))
+         (*think-open* nil)
          (*streamed* (make-string-output-stream))
          ;; add our renderers alongside whatever hooks are already installed
          ;; (e.g. the SQLite logger); scoped to this turn.
@@ -653,6 +700,7 @@
          (hooks:*post-tool-hooks* (cons #'tui-post-hook hooks:*post-tool-hooks*))
          (eng:*stream* t)
          (eng:*on-token* #'on-token)
+         (eng:*on-reasoning* #'on-reasoning)
          ;; durable state DURING the turn: a long tool loop that dies
          ;; otherwise leaves no session file at all
          (eng:*on-progress* (lambda (live)
@@ -683,6 +731,7 @@
           ;; If nothing streamed (non-streaming turn, or a salvaged/synthetic
           ;; answer), or the final text diverged from the stream, print it.
           (md-flush)
+          (think-close)
           (let ((streamed (string-right-trim '(#\Space #\Newline)
                                              (get-output-stream-string *streamed*)))
                 (final (string-right-trim '(#\Space #\Newline) (or text ""))))

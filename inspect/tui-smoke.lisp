@@ -77,11 +77,14 @@
 (format t "~&== streaming bullet logic ==~%")
 (let ((out (capture (lambda ()
                       (let ((tui::*at-bol* t) (tui::*need-bullet* t)
+                            (tui::*md-line* (tui::md-new-buf))
                             (tui::*streamed* (make-string-output-stream)))
                         (tui::on-token "Hel") (tui::on-token "lo")
                         ;; a tool interrupts -> next text opens a new segment
                         (tui::tui-pre-hook "Read" (llm:ht "file_path" "x.lisp"))
-                        (tui::on-token "world"))))))
+                        (tui::on-token "world")
+                        ;; md-feed is line-buffered; the turn flushes at the end
+                        (tui::md-flush))))))
   (check "streamed text present" (and (search "Hello" out) (search "world" out)))
   (check "bullet before segments" (search "⏺" out)))
 
@@ -89,21 +92,55 @@
 (check "Read -> file_path" (string= "a.lisp" (tui::tool-arg-summary "Read" (llm:ht "file_path" "a.lisp" "limit" 10))))
 (check "WebFetch -> url"   (search "example" (tui::tool-arg-summary "WebFetch" (llm:ht "url" "https://example.com"))))
 
+(format t "~&== reasoning (thinking) rendering ==~%")
+(let ((out (capture (lambda ()
+                      (let ((tui::*at-bol* t) (tui::*need-bullet* t)
+                            (tui::*md-line* (tui::md-new-buf))
+                            (tui::*think-line* (tui::md-new-buf))
+                            (tui::*think-open* nil)
+                            (tui::*streamed* (make-string-output-stream)))
+                        (tui::on-reasoning "Extracting both ")
+                        (tui::on-reasoning "parts.\nThen I will list them.")
+                        ;; a tool call closes the block
+                        (tui::tui-pre-hook "Bash" (llm:ht "command" "ls"))
+                        (tui::on-token "Done.")
+                        (tui::md-flush))))))
+  (check "thinking header shown"     (search "thinking" out))
+  (check "thinking text shown"       (search "Extracting both parts." out))
+  (check "thinking is line-prefixed" (search "│" out))
+  (check "answer still streams"      (search "Done." out)))
+
 ;;; ---- best-effort live turn (needs a backend) ----
+;;; PPQ first: it is the backend that actually serves here, and its
+;;; deepseek-v4.1-flash is a reasoning model, so this is the one place the
+;;; whole path — SSE fold -> *ON-REASONING* -> dimmed thinking block — is
+;;; exercised against a real provider.  OpenRouter is the fallback.
 (format t "~&== live turn (best effort) ==~%")
 (handler-case
     (progn
-      (when (probe-file (merge-pathnames ".operandi/openrouter.token" (user-homedir-pathname)))
-        (llm:set-backend-openrouter! :model "deepseek/deepseek-v4-flash"))
+      (cond
+        ((probe-file (merge-pathnames ".operandi/ppq.token" (user-homedir-pathname)))
+         (llm:set-backend-ppq! :model "deepseek/deepseek-v4.1-flash"))
+        ((probe-file (merge-pathnames ".operandi/openrouter.token" (user-homedir-pathname)))
+         (llm:set-backend-openrouter! :model "deepseek/deepseek-v4-flash")))
       (let* ((sess (session::make-session))
+             ;; NOT "run exactly: echo X" — a trivial instruction is answered
+             ;; with a bare tool call and no trace at all, which would make the
+             ;; thinking check below fail for a reason that has nothing to do
+             ;; with the renderer.  Ask for a decision and the trace appears.
              (out (capture (lambda ()
-                             (tui::run-turn sess "Use the Bash tool to run exactly: echo operandi-lives . Then tell me the single word it printed.")))))
+                             (tui::run-turn sess "List the files in the current directory using the Bash tool, then say which one you would read first to understand the project and why.")))))
         (format t "~A~%" out)
-        (if (search "operandi-lives" out)
+        (if (search "⏺ Bash" out)
             (format t "  ok   live turn ran a tool and answered~%")
             (format t "  warn live turn produced no expected marker (backend/model dependent)~%"))
         (check "live turn recorded a turn" (= 1 (session::session-turns sess)))
-        (check "live turn threaded history" (and (session::session-history sess) t))))
+        (check "live turn threaded history" (and (session::session-history sess) t))
+        ;; The point of this whole change: the model's scratchpad reached the
+        ;; screen.  Warn (don't fail) when the model chose not to emit one.
+        (if (search "thinking" out)
+            (check "live turn rendered the model's thinking" (search "│" out))
+            (format t "  warn live turn: model emitted no reasoning trace this run~%"))))
   (error (e) (format t "  warn live turn skipped: ~A~%" e)))
 
 (format t "~&~%tui-smoke: ~A failure~:P~%" *fails*)

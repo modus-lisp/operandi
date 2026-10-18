@@ -166,7 +166,8 @@
       ;; *ON-TOKEN* nil: a subagent's tokens don't stream into the parent's
       ;; live display (they'd interleave); the parent sees only its result.
       (let ((*subagent-depth* depth)
-            (eng:*on-token* nil))
+            (eng:*on-token* nil)
+            (eng:*on-reasoning* nil))
         (declare (special *subagent-depth*))
         (call-with-worker-model
          *worker-model*

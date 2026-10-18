@@ -331,7 +331,7 @@ sbcl --non-interactive --load inspect/robustness-test.lisp
 | Agent audit log DB | `~/.operandi/operandi.db` |
 | Persistent agent notes | `~/.operandi/operandi-notes.md` |
 | TUI session transcripts | `~/.operandi/sessions/` |
-| Compaction offload | `~/.operandi/offload/` |
+| Compaction offload | `~/.operandi/offload/` (`turns-<YYYYMMDD-HHMMSS>-<NNNN>.txt`) |
 | Cron reports / state | `~/.operandi/reports/`, `~/.operandi/cron.log` |
 
 Tool-sandbox limits (rebindable specials in `operandi.tools`):

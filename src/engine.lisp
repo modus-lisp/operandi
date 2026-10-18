@@ -460,7 +460,42 @@ completed). Do not shorten for brevity — nothing may be lost.")
    reversible — nothing is destroyed; the agent can Read the file to recover
    any detail the summary dropped (Fable's point: lossy compaction is an
    irreversibility mistake; offloading saves the same tokens, reversibly).")
-(defvar *offload-counter* 0)
+(defvar *offload-counter* 0
+  "Monotonic index in an offload filename. Seeded from the files already in
+   *OFFLOAD-DIR* (see %SEED-OFFLOAD-COUNTER) so a resumed run continues the
+   numbering instead of restarting at 1 and overwriting the previous run's
+   files.")
+
+(defvar *offload-counter-seeded-dir* nil
+  "The *OFFLOAD-DIR* the counter was last seeded from. Re-seeding is keyed on
+   this rather than a one-shot flag so rebinding *OFFLOAD-DIR* (a test, a
+   per-run scratch dir) still gets a correct starting index.")
+
+(defun %offload-timestamp ()
+  "A sortable local-time stamp for an offload filename: YYYYMMDD-HHMMSS."
+  (multiple-value-bind (s mi h d mo y) (decode-universal-time (get-universal-time))
+    (format nil "~4,'0D~2,'0D~2,'0D-~2,'0D~2,'0D~2,'0D" y mo d h mi s)))
+
+(defun %offload-index (pathname)
+  "The trailing integer of an offload filename (turns-<stamp>-<N>.txt), or NIL.
+   Tolerates the older turns-<N>.txt names too."
+  (let ((name (pathname-name pathname)))
+    (when (stringp name)
+      (let ((pos (position #\- name :from-end t)))
+        (when pos
+          (ignore-errors (parse-integer name :start (1+ pos) :junk-allowed t)))))))
+
+(defun %seed-offload-counter ()
+  "Raise *OFFLOAD-COUNTER* past the highest index already in *OFFLOAD-DIR*, so
+   a resumed run appends rather than overwrites. Scans a given directory once."
+  (unless (equal *offload-counter-seeded-dir* *offload-dir*)
+    (setf *offload-counter-seeded-dir* *offload-dir*)
+    (ignore-errors
+     (dolist (p (directory (merge-pathnames "turns-*.txt" *offload-dir*)))
+       (let ((i (%offload-index p)))
+         (when (and i (> i *offload-counter*))
+           (setf *offload-counter* i))))))
+  *offload-counter*)
 
 (defun render-turns (turns)
   "Render TURNS (message hash-tables) to plain text, FULL content — this is
@@ -486,12 +521,19 @@ completed). Do not shorten for brevity — nothing may be lost.")
                (if (listp tcs) (coerce tcs 'vector) tcs)))))))
 
 (defun offload-write (turns)
-  "Write TURNS to a fresh file under *OFFLOAD-DIR*; return its path, or NIL."
+  "Write TURNS to a fresh file under *OFFLOAD-DIR*; return its path, or NIL.
+   The name is turns-<YYYYMMDD-HHMMSS>-<NNNN>.txt: the stamp keeps a resumed
+   run from colliding with the previous run's files, and the zero-padded index
+   keeps the directory in write order (a plain timestamp ties within a second,
+   and an unpadded index would sort -10 before -2)."
   (handler-case
       (progn
         (ensure-directories-exist *offload-dir*)
-        (let ((path (merge-pathnames (format nil "turns-~D.txt" (incf *offload-counter*))
-                                     *offload-dir*)))
+        (%seed-offload-counter)
+        (let ((path (merge-pathnames
+                     (format nil "turns-~A-~4,'0D.txt" (%offload-timestamp)
+                             (incf *offload-counter*))
+                     *offload-dir*)))
           (with-open-file (s path :direction :output :if-exists :supersede
                                   :if-does-not-exist :create)
             (write-string (render-turns turns) s))

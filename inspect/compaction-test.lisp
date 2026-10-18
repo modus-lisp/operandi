@@ -107,6 +107,9 @@
   (check "tier-2 LLM summary when trim insufficient"
     (let ((eng:*context-token-budget* 400)
           (eng:*compact-keep-last* 2)
+          ;; tier-2 OFFLOADS; keep it out of the real ~/.operandi/offload/
+          (eng:*offload-dir* (namestring (merge-pathnames "operandi-offload-summary-test/"
+                                                          (uiop:temporary-directory))))
           (*summ-called* nil))
       (setf (symbol-function 'operandi.engine::summarize-turns)
             (lambda (turns) (declare (ignore turns)) (setf *summ-called* t) "SUMMARY"))
@@ -135,7 +138,9 @@
 
   ;; head (system + first user) is always preserved verbatim
   (check "head preserved through compaction"
-    (let ((eng:*context-token-budget* 400) (eng:*compact-keep-last* 2))
+    (let ((eng:*context-token-budget* 400) (eng:*compact-keep-last* 2)
+          (eng:*offload-dir* (namestring (merge-pathnames "operandi-offload-head-test/"
+                                                          (uiop:temporary-directory)))))
       (setf (symbol-function 'operandi.engine::summarize-turns)
             (lambda (turns) (declare (ignore turns)) "SUMMARY"))
       (let* ((ms (convo)) (out (eng::compact-messages ms)))
@@ -160,6 +165,74 @@
            (every (lambda (c)
                     (<= (reduce #'+ c :key #'eng::summary-chars) (* 2000 eng::*chars-per-token*)))
                   chunks))))
+
+  ;; the offload filename carries a timestamp AND an index, so a resumed run
+  ;; neither collides with the previous run's files nor loses write order.
+  (check "offload filename is turns-<stamp>-<NNNN>.txt"
+    (let* ((dir (namestring (merge-pathnames "operandi-offload-name-test/"
+                                             (uiop:temporary-directory))))
+           (eng:*context-token-budget* 400)
+           (eng:*compact-keep-last* 2)
+           (eng:*offload-dir* dir)
+           (eng::*offload-counter* 0)
+           (eng::*offload-counter-seeded-dir* nil))
+      (uiop:delete-directory-tree (pathname dir) :validate t :if-does-not-exist :ignore)
+      (setf (symbol-function 'operandi.engine::summarize-turns)
+            (lambda (turns) (declare (ignore turns)) "SUMMARY"))
+      (eng::compact-messages (convo :pairs 4 :toolsize 4000))
+      (let ((name (pathname-name (first (directory (merge-pathnames "*.txt" (pathname dir)))))))
+        (and (stringp name)
+             (multiple-value-bind (m r) (cl-ppcre:scan-to-strings
+                                         "^turns-\\d{8}-\\d{6}-\\d{4}$" name)
+               (declare (ignore m))
+               (and r t))))))
+
+  ;; a resumed run continues the numbering: pre-existing files raise the
+  ;; counter, so the new file does not overwrite turns-...-1.txt.
+  (check "offload counter resumes past existing files"
+    (let* ((dir (namestring (merge-pathnames "operandi-offload-resume-test/"
+                                             (uiop:temporary-directory))))
+           (eng:*context-token-budget* 400)
+           (eng:*compact-keep-last* 2)
+           (eng:*offload-dir* dir)
+           (eng::*offload-counter* 0)
+           (eng::*offload-counter-seeded-dir* nil))
+      (uiop:delete-directory-tree (pathname dir) :validate t :if-does-not-exist :ignore)
+      (ensure-directories-exist dir)
+      ;; a previous run left off at 7 (old-style name) and 12 (new-style name)
+      (with-open-file (s (merge-pathnames "turns-7.txt" (pathname dir))
+                         :direction :output :if-exists :supersede)
+        (write-string "old" s))
+      (with-open-file (s (merge-pathnames "turns-20240101-000000-12.txt" (pathname dir))
+                         :direction :output :if-exists :supersede)
+        (write-string "old" s))
+      (setf (symbol-function 'operandi.engine::summarize-turns)
+            (lambda (turns) (declare (ignore turns)) "SUMMARY"))
+      (eng::compact-messages (convo :pairs 4 :toolsize 4000))
+      (let ((files (mapcar #'pathname-name
+                           (directory (merge-pathnames "*.txt" (pathname dir))))))
+        (and (= 3 (length files))                       ; nothing overwritten
+             (some (lambda (n) (cl-ppcre:scan "-0013$" n)) files)))))  ; continued at 13
+
+  ;; the zero-padded index keeps the names in write order as plain strings
+  (check "offload names sort in write order"
+    (let* ((dir (namestring (merge-pathnames "operandi-offload-sort-test/"
+                                             (uiop:temporary-directory))))
+           (eng:*context-token-budget* 400)
+           (eng:*compact-keep-last* 2)
+           (eng:*offload-dir* dir)
+           (eng::*offload-counter* 0)
+           (eng::*offload-counter-seeded-dir* nil))
+      (uiop:delete-directory-tree (pathname dir) :validate t :if-does-not-exist :ignore)
+      (setf (symbol-function 'operandi.engine::summarize-turns)
+            (lambda (turns) (declare (ignore turns)) "SUMMARY"))
+      (dotimes (i 12) (eng::compact-messages (convo :pairs 4 :toolsize 4000)))
+      (let ((names (sort (mapcar #'pathname-name
+                                 (directory (merge-pathnames "*.txt" (pathname dir))))
+                         #'string<)))
+        (and (= 12 (length names))
+             (equal names (sort (copy-list names) #'string<))  ; already sorted
+             (cl-ppcre:scan "-0012$" (car (last names)))))))
 
   (format t "~&~%~D passed, ~D failed~%" *pass* *fail*)
   (zerop *fail*))

@@ -26,8 +26,68 @@ bin/operandi --openrouter deepseek/deepseek-v4-flash --effort low tui
 ```
 
 Bare `bin/operandi` (no arguments) also opens the TUI. The default backend is
-a local llama.cpp on `http://127.0.0.1:8081`; `--openrouter` switches to
+a local llama.cpp on `http://localhost:9931`; `--openrouter` switches to
 OpenRouter (token at `~/.operandi/openrouter.token`).
+
+`--llama ADDR` names that backend explicitly and points it at another server.
+ADDR is the server's address, not a model — a llama.cpp server usually has
+exactly one model loaded, so there is nothing to name:
+
+```
+bin/operandi --llama :9931 "task"                   # localhost:9931
+bin/operandi --llama localhost:9931 "task"          # same thing, spelled out
+bin/operandi --llama http://box:9931 "task"         # another host
+bin/operandi --llama http://box:9931/v1/chat/completions "task"
+bin/operandi --llama :9931 -m qwen3-32b "task"      # multi-model server
+```
+
+It is `[proto://][host][:port][/path]`; a missing scheme means `http`, a
+missing host means `localhost`, and a missing path means `/v1/chat/completions`.
+At least one component is required — a bare `--llama` is an error, not a
+request for the default. **A port must be colon-prefixed**: `:9931`, not
+`9931`. A bare number is rejected rather than guessed at, because a forgotten
+colon is far more likely than a hostname that is all digits. For the rare
+multi-model server (llama.cpp's router mode, or a proxy in front of several),
+`-m MODEL` names the model to send.
+
+Without `-m`, operandi asks the server: it reads `GET <base>/v1/models` and
+picks from what comes back — the only model if there is one, otherwise the
+largest, preferring one the server already has loaded (naming an unloaded
+model makes the router load it, a multi-gigabyte side effect nobody asked
+for). A server that does not implement `/v1/models` is not an error: the
+request then carries no model field at all, which is exactly right for a
+single-model llama.cpp server.
+
+### Running a specific model on a specific port
+
+operandi does not start the server — it is a client. Start llama.cpp yourself
+with the model and port you want, then point operandi at it:
+
+```
+llama-server -m /path/to/model.gguf --host 127.0.0.1 --port 9931 \
+             --alias my-model --jinja -c 65536 -ngl 99
+bin/operandi --llama :9931 "task"         # or: --llama :9931 -m my-model
+```
+
+`--alias` is the name the server reports in `/v1/models` and accepts as the
+`model` field, so it is what `-m` should say. `-c` is the context size and
+`-ngl` the number of layers to offload to the GPU (`99` = all of them). The
+default port is 8080; this repo's default is 9931, which is why `--llama :9931`
+is the usual spelling. Any localhost port works — the sandbox allows loopback
+outbound generally, so a server on 8080 or 12345 is reachable without touching
+`bin/sandbox.sb`. `--host 0.0.0.0` exposes the server to the LAN, which the
+sandbox does *not* reach.
+
+llama.cpp's **router** mode serves several models from one port, loading them
+on demand, and is what the `--llama :9931` default here talks to:
+
+```
+llama-server --models-preset ~/models.ini --host 127.0.0.1 --port 9931
+```
+
+With a router, `--llama :9931` with no `-m` asks the server which model to use
+(see above); `-m <id>` names one outright. Naming an unloaded model makes the
+router load it, which takes as long as loading a multi-gigabyte file does.
 
 ### From source (no core)
 
@@ -59,6 +119,8 @@ operandi [FLAGS] [COMMAND | "task description"]
 
 | Flag | Meaning |
 |------|---------|
+| `--llama ADDR` | use the local llama.cpp server at `ADDR` = `[proto://][host][:port][/path]` (e.g. `:9931`, `http://box:9931`); at least one component required, and a port must be colon-prefixed |
+| `-m MODEL` | model id to send; only for a multi-model llama.cpp server (without it, the model is asked of the server — see above) |
 | `--openrouter [MODEL]` | use OpenRouter; `MODEL` is a `vendor/name` slug. Bare `--openrouter` uses the configured model (see below) |
 | `--worker-model M` | model for sub-agents: a `vendor/name` slug, `llama`, or `inherit` |
 | `--effort off\|low\|medium\|high\|default` | reasoning effort (also `OPERANDI_EFFORT`) |
@@ -172,9 +234,9 @@ What the sandbox allows:
   cache `~/.cache/common-lisp`, `/tmp`, and the per-user temp/cache dirs.
 - **Reads** of the OS, `/usr`, `/opt`, your git config, and the rest of the
   home directory's metadata. Other files in `~` are not readable.
-- **Network**: any public host, plus `localhost:8081` (llama.cpp) and
-  `localhost:8080` (SearXNG). Other localhost ports are blocked, and the
-  agent may bind a local dev server on localhost.
+- **Network**: any public host, plus any port on `localhost` — so a llama.cpp
+  server on 9931, SearXNG on 8080, or a dev server on any other loopback port
+  is reachable. The agent may also bind a local dev server on localhost.
 - **No AppleScript** to other apps. The clipboard is readable for Ctrl-V.
 
 Things to know:

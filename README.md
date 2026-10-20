@@ -100,6 +100,9 @@ sbcl --non-interactive --load bin/operandi.lisp -- "your task here"
 sbcl --non-interactive --load bin/operandi.lisp -- tui
 ```
 
+`bin/operandi --help` prints the same list of flags, commands and environment
+variables as the tables below, from the running binary.
+
 ## CLI
 
 ```
@@ -122,13 +125,18 @@ operandi [FLAGS] [COMMAND | "task description"]
 | `--llama ADDR` | use the local llama.cpp server at `ADDR` = `[proto://][host][:port][/path]` (e.g. `:9931`, `http://box:9931`); at least one component required, and a port must be colon-prefixed |
 | `-m MODEL` | model id to send; only for a multi-model llama.cpp server (without it, the model is asked of the server — see above) |
 | `--openrouter [MODEL]` | use OpenRouter; `MODEL` is a `vendor/name` slug. Bare `--openrouter` uses the configured model (see below) |
+| `--routstr [NODE-URL] [MODEL]` | use Routstr (Lightning-paid nodes); `NODE-URL` picks the node |
+| `--ppq [MODEL]` | use PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/Lightning |
+| `--tinfoil [MODEL]` | use Tinfoil's own enclave, sealed end to end (no plaintext mode) |
+| `--confidential-tinfoil` | require every request to be EHBP-sealed to a locally verified Tinfoil enclave; fails rather than downgrading |
+| `--rc TARGET` | mirror each turn to a Marmot chat (npub/nprofile/NIP-05 starts one; a chat name or group id joins one) |
 | `--worker-model M` | model for sub-agents: a `vendor/name` slug, `llama`, or `inherit` |
 | `--effort off\|low\|medium\|high\|default` | reasoning effort (also `OPERANDI_EFFORT`) |
 | `--resume [ID]` | resume a saved session (latest if no ID); with a task, runs one more non-interactive turn |
 | `--tools A,B,C` | allow-list: exactly these tools |
 | `--no-tools X,Y` | the default tool set minus these |
 | `--tui` | force the interactive TUI |
-| `--help` | usage |
+| `--help`, `-h` | usage |
 
 An unknown `--flag` is rejected (exit 2) rather than sent to the agent as task
 text. Before any path that runs a turn, the model is preflighted — a bad slug
@@ -145,6 +153,23 @@ Environment variables are read when the image loads. On the fast path that
 means the core build, so `OPERANDI_EFFORT` / `OPERANDI_CONTEXT_BUDGET` set at
 run time are ignored unless the core was built with them — prefer the flags or
 the `/effort` command.
+
+| Variable | Meaning |
+|----------|---------|
+| `OPERANDI_MAX_TOKENS` | per-turn output cap (default 16384) |
+| `OPERANDI_CONTEXT_BUDGET` | compaction threshold in tokens |
+| `OPERANDI_CONTEXT_HEADROOM` | fraction of the budget kept free (default 0.2) |
+| `OPERANDI_MAX_ITERS` | hard cap on the agentic loop (default 500) |
+| `OPERANDI_EFFORT` | same as `--effort` |
+| `OPERANDI_WORKER_MODEL` | same as `--worker-model` |
+| `OPERANDI_SEARCH` | web-search backend: `openrouter`, `searxng`, `brave`, `auto` |
+| `OPERANDI_SWARM_DEADLINE` | seconds a Fan/Investigate batch may run (default 900) |
+| `OPERANDI_NO_PREFLIGHT=1` | skip the model preflight |
+| `OPERANDI_FANCY_TUI=1` | opt in to the scroll-region TUI |
+| `OPERANDI_SBCL` | the `sbcl` binary the launcher uses |
+
+`bin/operandi-acp` and `bin/operandi-nostr.lisp` have their own variables
+(`OPERANDI_ACP_MODEL`, `OPERANDI_NOSTR_*`); see their sections below.
 
 ### Configuration
 

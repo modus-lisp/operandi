@@ -2,16 +2,23 @@
 ;;;
 ;;; CLI for standalone operandi.
 ;;;
-;;; Usage:
-;;;   sbcl --non-interactive --load bin/operandi.lisp -- "your task here"
-;;;   sbcl --non-interactive --load bin/operandi.lisp -- shell
-;;;   sbcl --non-interactive --load bin/operandi.lisp -- --openrouter [MODEL] "task"
+;;; Usage (bin/operandi is the launcher; it dumps a core image and runs this
+;;; file from it, so the sbcl invocation below is the slow path, not the way
+;;; you normally start operandi):
+;;;
+;;;   bin/operandi [FLAGS] [COMMAND | "task"]
+;;;   bin/operandi --help
+;;;
+;;;   sbcl --non-interactive --load bin/operandi.lisp -- [FLAGS] [COMMAND | "task"]
 ;;;
 ;;; The single-task form runs the agent loop once on the given prompt
 ;;; and prints the final answer. The shell form is an interactive REPL:
 ;;; each input line becomes a fresh agent run; type 'exit' to quit.
 ;;; Conversation history is NOT carried across shell prompts — each task
 ;;; is isolated.
+;;;
+;;; --help prints the full list of flags, commands and environment
+;;; variables; keep %USAGE below in step with the parser.
 ;;;
 ;;; This entry point loads ONLY operandi and its own store, so the Eval
 ;;; tool reaches operandi.store plus the CL standard library. A host
@@ -166,6 +173,97 @@
         (error (e)
           (format *error-output* "operandi: ignoring ~A: ~A~%" p e)
           nil)))))
+
+(defun %usage ()
+  "The --help text.  Written for the LAUNCHER (bin/operandi), which is how
+   operandi is actually run; the source form is mentioned once at the end
+   rather than prefixed onto every line.  Every flag the parser accepts is
+   listed here — a flag that works but is undocumented is a flag nobody
+   finds."
+  (format t "~&usage: operandi [FLAGS] [COMMAND | \"task\"]~%")
+  (format t "~%commands~%")
+  (format t "  (none), tui, shell, repl   interactive TUI~%")
+  (format t "  \"task description\"         run one task, print the answer, exit~%")
+  (format t "  ask \"question\"             the question phase: rival hypotheses, a swarm~%")
+  (format t "                             settles them, an answer from the verdicts~%")
+  (format t "  --resume [ID] [tui]        resume a saved session (latest if no ID)~%")
+  (format t "  --resume [ID] \"task\"       continue that session with one more turn~%")
+  (format t "~%backend — default: local llama.cpp at ~A~%" llm:*llama-url*)
+  (format t "  --llama ADDR [-m MODEL]    the local llama.cpp server. ADDR is the server's~%")
+  (format t "                             address, not a model: [proto://][host][:port][/path],~%")
+  (format t "                             e.g. :9931, localhost:9931, http://box:9931. At least~%")
+  (format t "                             one component is required, and a port must be~%")
+  (format t "                             colon-prefixed. -m MODEL names the model, for a~%")
+  (format t "                             multi-model server only; without it the model is~%")
+  (format t "                             asked of the server (the only one, else the largest,~%")
+  (format t "                             preferring one already loaded).~%")
+  (format t "  --openrouter [MODEL]       OpenRouter; MODEL is a vendor/name slug. Bare~%")
+  (format t "                             --openrouter uses the configured model. Token in~%")
+  (format t "                             ~~/.operandi/openrouter.token.~%")
+  (format t "  --routstr [NODE-URL] [MODEL]~%")
+  (format t "                             Routstr: independent Lightning-paid nodes. NODE-URL~%")
+  (format t "                             (https://...) picks the node; default token in~%")
+  (format t "                             ~~/.operandi/routstr.token.~%")
+  (format t "  --ppq [MODEL]              PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/~%")
+  (format t "                             Lightning. Any PPQ id (gpt-6.1-sol, ...); requests~%")
+  (format t "                             go out in the clear. Key in ~~/.operandi/ppq.token.~%")
+  (format t "  --tinfoil [MODEL]          Tinfoil's own enclave (inference.tinfoil.sh), sealed~%")
+  (format t "                             end to end — there is no plaintext mode. MODEL is a~%")
+  (format t "                             bare Tinfoil id (gpt-oss-120b, ...). Key in~%")
+  (format t "                             ~~/.operandi/tinfoil.token.~%")
+  (format t "  --confidential-tinfoil     Require every request to be EHBP-sealed to a Tinfoil~%")
+  (format t "                             enclave whose key is bound into an attestation report~%")
+  (format t "                             verified locally against the pinned AMD ARK. A claim~%")
+  (format t "                             about the SEAL, not the whole exchange. Fails rather~%")
+  (format t "                             than downgrading. Valid with --ppq private/MODEL,~%")
+  (format t "                             --tinfoil, and --routstr tinfoil-MODEL; on any other~%")
+  (format t "                             backend it is a configuration error.~%")
+  (format t "~%session~%")
+  (format t "  --rc TARGET                mirror each turn to a Marmot chat: an npub, nprofile~%")
+  (format t "                             or NIP-05 starts a new chat, a chat name or group id~%")
+  (format t "                             joins an existing one. Also /rc in the TUI.~%")
+  (format t "  --tui                      force the interactive TUI~%")
+  (format t "                             (in the TUI, /help lists the /commands: /model,~%")
+  (format t "                             /effort, /workers, /sessions, /resume, /cost,~%")
+  (format t "                             /search, /paste, /swarm, /rc, /system, /tools,~%")
+  (format t "                             /clear, /ask, /quit)~%")
+  (format t "~%agent~%")
+  (format t "  --worker-model M           model for sub-agents: a vendor/name slug, llama, or~%")
+  (format t "                             inherit (the orchestrator's model)~%")
+  (format t "  --effort LEVEL             reasoning effort: off, low, medium, high, default~%")
+  (format t "  --tools A,B,C              allow-list: exactly these tools~%")
+  (format t "  --no-tools X,Y             the default tool set minus these~%")
+  (format t "  --help, -h                 this text~%")
+  (format t "  --confidential             REMOVED — renamed to --confidential-tinfoil; the~%")
+  (format t "                             old name overclaimed, so it errors rather than~%")
+  (format t "                             being accepted silently~%")
+  (format t "~%An unknown --flag is rejected (exit 2) rather than sent to the agent as task~%")
+  (format t "text. Before any path that runs a turn the model is preflighted, so a bad slug~%")
+  (format t "or an unreachable server fails here instead of blank-per-turn.~%")
+  (format t "~%env (read when the image loads — on the fast path that means the core build,~%")
+  (format t "so set these before the first run, or prefer the flags and /commands)~%")
+  (format t "  OPERANDI_MAX_TOKENS        per-turn output cap (default 16384)~%")
+  (format t "  OPERANDI_CONTEXT_BUDGET    compaction threshold in tokens~%")
+  (format t "  OPERANDI_CONTEXT_HEADROOM  fraction of the budget kept free (default 0.2)~%")
+  (format t "  OPERANDI_MAX_ITERS         hard cap on the agentic loop (default 500)~%")
+  (format t "  OPERANDI_EFFORT            same as --effort~%")
+  (format t "  OPERANDI_WORKER_MODEL      same as --worker-model~%")
+  (format t "  OPERANDI_SEARCH            web-search backend: openrouter, searxng, brave, auto~%")
+  (format t "  OPERANDI_SWARM_DEADLINE    seconds a Fan/Investigate batch may run (default 900)~%")
+  (format t "  OPERANDI_NO_PREFLIGHT=1    skip the model preflight~%")
+  (format t "  OPERANDI_FANCY_TUI=1       opt in to the scroll-region TUI~%")
+  (format t "  OPERANDI_SBCL              the sbcl binary the launcher uses~%")
+  (format t "~%files~%")
+  (format t "  ~~/.operandi/config.json    default model: {\"model\": \"vendor/name\"} or \"llama\"~%")
+  (format t "  ~~/.operandi/operandi.db    saved sessions; --resume continues one~%")
+  (format t "  ~~/.operandi/offload/       raw conversation displaced by compaction~%")
+  (format t "~%entry points~%")
+  (format t "  bin/operandi               this CLI (dumps a core image for a ~~20ms start)~%")
+  (format t "  bin/operandi-acp           ACP server over stdio, for editors (Zed, Buzz)~%")
+  (format t "  bin/operandi-nostr.lisp    Nostr DM front end~%")
+  (format t "  bin/operandi-sandbox-macos the same CLI under the macOS sandbox profile~%")
+  (format t "~%From source, without the launcher:~%")
+  (format t "  sbcl --non-interactive --load bin/operandi.lisp -- [FLAGS] [COMMAND | \"task\"]~%"))
 
 ;; Apply the configured default model unless the command line names a backend
 ;; explicitly (--openrouter, with or without a model; a bare --openrouter also
@@ -426,7 +524,11 @@
                    (t (return))))
                acc))
        ;; --tui and no argument at all are the same thing: the interactive TUI.
-       (cmd (if tui-p "tui" (first args))))
+       ;; -h is --help: it is short enough to slip past the unknown-option
+       ;; check below, so without this it would be handed to the agent as a
+       ;; one-word task.
+       (cmd (let ((c (if tui-p "tui" (first args))))
+              (if (and c (string= c "-h")) "--help" c))))
   ;; Resolve the local server's model in ONE place, for EVERY path that reaches
   ;; it — bare `operandi`, `--llama`, a "llama" config, the TUI.  A single-model
   ;; llama.cpp server needs no model field, but its ROUTER mode 400s a request
@@ -434,7 +536,10 @@
   ;; backend IS the local server: without this, a bare launch sent no model at
   ;; all and died at preflight.  -m and a config-resolved model win; we ask the
   ;; server only when nothing named one.
-  (when (eq llm:*llm-backend* :llama)
+  ;; Not for --help: asking the server is a round-trip, and a usage request
+  ;; should not depend on a server being up — nor print a model line above the
+  ;; usage text.
+  (when (and (eq llm:*llm-backend* :llama) (not (equal cmd "--help")))
     (let ((reason (and llm:*llm-model* "named with -m")))
       (when (null llm:*llm-model*)
         (multiple-value-setq (llm:*llm-model* reason)
@@ -464,68 +569,7 @@
     (resume (run-resumed-task resume (format nil "~{~A~^ ~}" args)))
     ;; Bare `operandi` (no task, no command) → the interactive TUI.
     ((null cmd) (run-shell))
-    ((string= cmd "--help")
-     (format t "~&usage:~%")
-     (format t "  operandi.lisp -- \"task description\"~%")
-     (format t "  operandi.lisp              (no args, or --tui: interactive REPL: streaming, tools, /commands)~%")
-     (format t "  operandi.lisp -- --resume [ID] tui  (resume a saved session; latest if no ID)~%")
-     (format t "  operandi.lisp -- --rc TARGET \"task\"   (mirror each turn to a Marmot chat: TARGET is an npub, nprofile or NIP-05 to start a new chat, or a chat name / group id for an existing one; also /rc in the TUI)~%")
-     (format t "  operandi.lisp -- --llama ADDR [-m MODEL] \"task\"~%")
-     (format t "      The local llama.cpp server (the default backend). ADDR is the~%")
-     (format t "      server's address, not a model — a llama.cpp server usually has~%")
-     (format t "      one model loaded: [proto://][host][:port][/path], e.g. :9931,~%")
-     (format t "      localhost:9931, http://box:9931. At least one component is~%")
-     (format t "      required, and a port must be colon-prefixed; the default~%")
-     (format t "      address is ~A.~%" llm:*llama-url*)
-     (format t "      -m MODEL names the model, for a multi-model server only;~%")
-     (format t "      without it the model is asked of the server (largest, or the~%")
-     (format t "      one already loaded).~%")
-     (format t "  operandi.lisp -- --openrouter [MODEL] \"task\"~%")
-     (format t "  operandi.lisp -- --effort off|low|medium|high \"task\"   (reasoning; also OPERANDI_EFFORT)~%")
-     (format t "  operandi.lisp -- --openrouter STRONG --worker-model CHEAP tui   (orchestrator and subagents on different models)~%")
-     (format t "  operandi.lisp -- --tools Read,Write,Edit,Bash,Grep \"task\"   (allow-list)~%")
-     (format t "  operandi.lisp -- --no-tools Fan,Task,Spawn \"task\"           (defaults minus these)~%")
-     (format t "  bin/operandi-acp                 (ACP server over stdio for editors: Zed, Buzz; see README)~%")
-     (format t "~%env: OPERANDI_MAX_TOKENS (per-turn output cap, default 16384),~%")
-     (format t "     OPERANDI_CONTEXT_BUDGET (compaction threshold), OPERANDI_MAX_ITERS.~%")
-     (format t "  --confidential-tinfoil  (flag; formerly --confidential)~%")
-     (format t "      Require that every request be EHBP-sealed to a Tinfoil enclave whose~%")
-     (format t "      key is bound into an attestation report verified locally against the~%")
-     (format t "      pinned AMD ARK. It is a claim about the SEAL, not about the whole~%")
-     (format t "      exchange — hence the narrow name. It fails rather than downgrading:~%")
-     (format t "      an unverifiable enclave or a plaintext answer is an error. Valid with~%")
-     (format t "      --ppq private/MODEL, --tinfoil, and --routstr tinfoil-MODEL; on any~%")
-     (format t "      other backend it is a configuration error.~%")
-     (format t "  operandi.lisp -- --routstr [NODE-URL] [MODEL] \"task\"~%")
-     (format t "      Routstr: a network of independent Lightning-paid nodes. NODE-URL~%")
-     (format t "      (https://...) picks the node; default ~~/.operandi/routstr.token.~%")
-     (format t "  operandi.lisp -- --confidential-tinfoil --routstr tinfoil-MODEL \"task\"~%")
-     (format t "      MODEL must be a tinfoil-* id on a node that carries Tinfoil. The node~%")
-     (format t "      is a BLIND RELAY: we seal to the Tinfoil router's HPKE key (verified~%")
-     (format t "      locally against the pinned AMD ARK) and the node cannot open the body —~%")
-     (format t "      sealing to the model container's key instead makes it answer 422. It~%")
-     (format t "      can drop the request or see the model and timing; it cannot read the~%")
-     (format t "      body or forge the reply. Any other Routstr model is refused under~%")
-     (format t "      --confidential-tinfoil — the node terminates those itself.~%")
-     (format t "  operandi.lisp -- --ppq [MODEL] \"task\"~%")
-     (format t "      PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/Lightning. MODEL is~%")
-     (format t "      any PPQ id (gpt-6.1-sol, claude-sonnet-5.5, ...); requests go out in~%")
-     (format t "      the clear, like OpenRouter. Key in ~~/.operandi/ppq.token.~%")
-     (format t "  operandi.lisp -- --confidential-tinfoil --ppq private/MODEL \"task\"~%")
-     (format t "      Path A only: MODEL must be private/*, and every request is EHBP-sealed~%")
-     (format t "      to an AMD-attested Tinfoil enclave verified locally against the pinned~%")
-     (format t "      AMD ARK. No fallback — an unverifiable enclave or a plaintext answer is~%")
-     (format t "      an error, not a downgrade. --confidential-tinfoil on any other backend fails.~%")
-     (format t "  operandi.lisp -- --tinfoil [MODEL] \"task\"~%")
-     (format t "      Tinfoil's OWN enclave (inference.tinfoil.sh), sealed end to end.~%")
-     (format t "      MODEL is a bare Tinfoil id (gpt-oss-120b, glm-5-3, kimi-k3, ...).~%")
-     (format t "      There is no plaintext mode here: every request is EHBP-sealed to an~%")
-     (format t "      AMD SEV-SNP enclave verified locally against the pinned AMD ARK, and a~%")
-     (format t "      response without an Ehbp-Response-Nonce is refused, not parsed.~%")
-     (format t "      Key in ~~/.operandi/tinfoil.token.~%")
-     (format t "~%--openrouter reads token from ~~/.operandi/openrouter.token.~%")
-     (format t "Sessions are saved under ~~/.operandi/sessions/; --resume continues one.~%")
-     (format t "Default backend is a local llama.cpp on ~A.~%" llm:*llama-url*))
+    ((string= cmd "--help") (%usage))
     ((member cmd '("tui" "shell" "repl") :test #'string-equal) (run-shell))
     ;; operandi ask "why does X happen?" — the question phase, non-interactively
     ((string-equal cmd "ask")

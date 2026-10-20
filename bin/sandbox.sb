@@ -108,7 +108,7 @@
 ;; that would take a pf rule outside the sandbox.
 (allow network-outbound (remote tcp "*:*"))
 (deny  network-outbound (remote tcp "localhost:*"))
-(allow network-outbound (remote tcp "localhost:8081"))
+(allow network-outbound (remote tcp "localhost:9931"))
 ;; Loopback clients (the test relay, dev servers the agent talks to). Pairs with
 ;; the network-bind/inbound rule below; without it connect() is EPERM even to a
 ;; listener this same process created.

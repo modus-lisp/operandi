@@ -67,9 +67,112 @@
 
 ;;; ---- cases ---------------------------------------------------------
 
+;;; ---- llama.cpp model discovery --------------------------------------
+;;; --llama with no -m asks the server which model to use.  The picker is
+;;; pure, so it is checked here against the shapes llama.cpp's router
+;;; actually returns (status.value "loaded"/"unloaded", meta.size bytes).
+
+(defun llama-model (id &key loaded size n-params top-size)
+  (let ((m (llm:ht "id" id)))
+    (when loaded (setf (gethash "status" m) (llm:ht "value" "loaded")))
+    (when top-size (setf (gethash "size" m) top-size))
+    (when (or size n-params)
+      (let ((meta (llm:ht)))
+        (when size (setf (gethash "size" meta) size))
+        (when n-params (setf (gethash "n_params" meta) n-params))
+        (setf (gethash "meta" m) meta)))
+    m))
+
+(defun run-llama-picks ()
+  (format t "~&llama.cpp model discovery~%")
+
+  (check "one model is taken as-is, no size needed"
+    (multiple-value-bind (id reason)
+        (llm::llama-pick-model (list (llama-model "solo")))
+      (and (string= id "solo") (search "only model" reason))))
+
+  (check "an empty list yields no model, not an error"
+    (multiple-value-bind (id reason) (llm::llama-pick-model nil)
+      (and (null id) (stringp reason))))
+
+  (check "entries without a usable id are ignored"
+    (multiple-value-bind (id reason)
+        (llm::llama-pick-model (list (llm:ht "id" "") (llm:ht "id" 7)
+                                     (llama-model "real")))
+      (and (string= id "real") (search "only model" reason))))
+
+  (check "several models: the largest wins"
+    (multiple-value-bind (id reason)
+        (llm::llama-pick-model (list (llama-model "small" :size 1000)
+                                     (llama-model "big" :size 9000)
+                                     (llama-model "mid" :size 5000)))
+      (and (string= id "big") (search "largest" reason))))
+
+  (check "the one already loaded wins over a larger unloaded one"
+    (multiple-value-bind (id reason)
+        (llm::llama-pick-model (list (llama-model "loaded" :loaded t :size 1000)
+                                     (llama-model "huge" :size 9000)))
+      (and (string= id "loaded") (search "already loaded" reason))))
+
+  (check "with several loaded, size decides (no arbitrary preference)"
+    (multiple-value-bind (id reason)
+        (llm::llama-pick-model (list (llama-model "a" :loaded t :size 1000)
+                                     (llama-model "b" :loaded t :size 9000)))
+      (and (string= id "b") (search "largest" reason))))
+
+  (check "no sizes reported: falls back to the first, not an error"
+    (multiple-value-bind (id reason)
+        (llm::llama-pick-model (list (llama-model "first") (llama-model "second")))
+      (and (string= id "first") (stringp reason))))
+
+  (check "n_params is a usable size when meta.size is absent"
+    (multiple-value-bind (id reason)
+        (llm::llama-pick-model (list (llama-model "few" :n-params 1000)
+                                     (llama-model "many" :n-params 9000)))
+      (and (string= id "many") (search "largest" reason))))
+
+  (check "a top-level size is read too (some servers report it there)"
+    (multiple-value-bind (id reason)
+        (llm::llama-pick-model (list (llama-model "small" :top-size 1000)
+                                     (llama-model "big" :top-size 9000)))
+      (and (string= id "big") (search "largest" reason))))
+
+  (check "a model with no size loses to one that has a size"
+    (multiple-value-bind (id reason)
+        (llm::llama-pick-model (list (llama-model "unsized")
+                                     (llama-model "sized" :size 1)))
+      (and (string= id "sized") (search "largest" reason))))
+
+  (check "the models URL is the sibling of the chat URL"
+    (and (string= "http://localhost:9931/v1/models"
+                  (llm::llama-models-url "http://localhost:9931/v1/chat/completions"))
+         (string= "http://box:9931/proxy/v1/models"
+                  (llm::llama-models-url "http://box:9931/proxy/v1/chat/completions"))))
+
+  (check "a colon-prefixed port becomes a chat URL; a path is kept"
+    (and (string= "http://localhost:9931/v1/chat/completions"
+                  (llm::llama-chat-url ":9931"))
+         (string= "http://localhost:9931/v1/chat/completions"
+                  (llm::llama-chat-url "localhost:9931"))
+         (string= "http://box:9931/v1/chat/completions"
+                  (llm::llama-chat-url "http://box:9931"))
+         (string= "http://box:9931/custom"
+                  (llm::llama-chat-url "http://box:9931/custom"))))
+
+  (check "a bare --llama is an error, not the default address"
+    (handler-case (progn (llm::llama-chat-url "") nil)
+      (error () t)))
+
+  (check "a port must be colon-prefixed — a bare number is an error"
+    (and (handler-case (progn (llm::llama-chat-url "9931") nil)
+           (error () t))
+         (handler-case (progn (llm::llama-chat-url "localhost:") nil)
+           (error () t)))))
+
 (defun run ()
   (setf *pass* 0 *fail* 0)
   (format t "~&operandi engine empty-turn oracle~%")
+  (run-llama-picks)
 
   ;; A normal single answer passes straight through.
   (check "normal answer returns verbatim"

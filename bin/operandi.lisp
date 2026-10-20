@@ -170,23 +170,93 @@
 ;; Apply the configured default model unless the command line names a backend
 ;; explicitly (--openrouter, with or without a model; a bare --openrouter also
 ;; reads the config, below). Doing both would announce the backend twice.
-(let ((m (and (not (member-if (lambda (a) (member a '("--openrouter" "--routstr" "--ppq" "--tinfoil") :test #'string=))
+(let ((m (and (not (member-if (lambda (a) (member a '("--llama" "--openrouter" "--routstr" "--ppq" "--tinfoil") :test #'string=))
                                  (uiop:command-line-arguments)))
               (config-default-model))))
   (when m
     (if (string-equal m "llama")
-        (llm:set-backend-llama!)
+        ;; :ASK NIL — the model is resolved once, after parsing, for every path
+        ;; that reaches the local server.  Asking here too would be a second
+        ;; round-trip and would make the report below claim the model was
+        ;; "named with -m" when the server chose it.
+        (llm:set-backend-llama! :ask nil)
         (llm:set-backend-openrouter! :model m))
     (eng:apply-backend-defaults)))
 
 (let* ((raw (remove "--" (uiop:command-line-arguments) :test #'string=))
        (resume nil)
        (tui-p nil)
+       ;; -m MODEL, remembered so it survives a --llama that comes after it
+       ;; (set-backend-llama! otherwise clears the model).
+       (llama-model nil)
+       ;; Whether --llama was given.  The model is resolved in ONE place after
+       ;; parsing (below), for every path that reaches the local server; this
+       ;; only decides whether to report the outcome when there is no model to
+       ;; report — an explicit --llama deserves an answer, a bare launch does
+       ;; not.
+       (llama-explicit nil)
        (tool-names (tools:default-tools))     ; available-tools allow-list (default = all)
        ;; Strip leading flags (--openrouter [model], --resume [id], --tools/--no-tools) in any order.
        (args (let ((acc raw))
                (loop
                  (cond
+                   ((and acc (string= (first acc) "--llama"))
+                    ;; The local llama.cpp server — the default backend, so this
+                    ;; flag exists to name it explicitly (overriding the config's
+                    ;; model) and to point at a server elsewhere.  The argument
+                    ;; is the server's ADDRESS, not a model: it is
+                    ;; [proto://][host][:port][/path] — ":9931",
+                    ;; "localhost:9931", "http://box:9931", or a full endpoint —
+                    ;; and at least one component is REQUIRED, so the arity is
+                    ;; never ambiguous: a bare --llama is an error, not a
+                    ;; request for the default.  A port must be colon-prefixed;
+                    ;; a bare number is rejected rather than guessed at.
+                    ;;
+                    ;; The model is not named here.  A single-model server needs
+                    ;; no model field at all, but llama.cpp's ROUTER mode 400s a
+                    ;; request that omits one — so when -m did not name a model
+                    ;; we ASK the server (GET /v1/models) and take what it
+                    ;; serves: the only model, or the largest of several.  -m
+                    ;; overrides that.
+                    (let* ((tail (rest acc)) (next (first tail)))
+                      (unless (and next (not (uiop:string-prefix-p "--" next)))
+                        (format *error-output*
+                                "operandi: --llama needs an address: [proto://][host][:port][/path] (e.g. --llama :9931)~%")
+                        (sb-ext:exit :code 2))
+                      (let ((url (handler-case (llm:llama-chat-url next)
+                                   (error (e)
+                                     (format *error-output* "operandi: ~A~%" e)
+                                     (sb-ext:exit :code 2)))))
+                        ;; Point at the server and stop there.  The MODEL is
+                        ;; resolved once, after parsing, for every path that
+                        ;; reaches the local server (see below) — resolving it
+                        ;; here too would ask the server twice and could print
+                        ;; a model other than the one actually sent.
+                        (handler-case
+                            (llm:set-backend-llama! :url url :model llama-model :ask nil)
+                          (error (e)
+                            (format *error-output* "operandi: ~A~%" e)
+                            (sb-ext:exit :code 2)))
+                        (setf llama-explicit t))
+                      (setf acc (rest tail)))
+                    (eng:apply-backend-defaults))
+                   ;; -m MODEL: the model id to send.  Only meaningful on a
+                   ;; multi-model llama.cpp server (router mode, or a proxy in
+                   ;; front of several); a single-model server ignores it, and
+                   ;; without it the request carries no model field at all.
+                   ;; It is remembered in LLAMA-MODEL so it survives a --llama
+                   ;; in either order, and it only touches *LLM-MODEL* when the
+                   ;; llama backend is the one selected — so `--openrouter X -m Y`
+                   ;; does not silently retarget the OpenRouter request.
+                   ((and acc (string= (first acc) "-m"))
+                    (let ((next (second acc)))
+                      (unless (and next (not (uiop:string-prefix-p "--" next)))
+                        (format *error-output* "operandi: -m needs a model id~%")
+                        (sb-ext:exit :code 2))
+                      (setf llama-model next)
+                      (when (eq llm:*llm-backend* :llama)
+                        (setf llm:*llm-model* next))
+                      (setf acc (cddr acc))))
                    ((and acc (string= (first acc) "--openrouter"))
                     (let* ((tail (rest acc)) (next (first tail))
                            ;; OpenRouter model IDs look like 'vendor/model' — a
@@ -357,6 +427,25 @@
                acc))
        ;; --tui and no argument at all are the same thing: the interactive TUI.
        (cmd (if tui-p "tui" (first args))))
+  ;; Resolve the local server's model in ONE place, for EVERY path that reaches
+  ;; it — bare `operandi`, `--llama`, a "llama" config, the TUI.  A single-model
+  ;; llama.cpp server needs no model field, but its ROUTER mode 400s a request
+  ;; that omits one ("model name is missing from the request"), and the default
+  ;; backend IS the local server: without this, a bare launch sent no model at
+  ;; all and died at preflight.  -m and a config-resolved model win; we ask the
+  ;; server only when nothing named one.
+  (when (eq llm:*llm-backend* :llama)
+    (let ((reason (and llm:*llm-model* "named with -m")))
+      (when (null llm:*llm-model*)
+        (multiple-value-setq (llm:*llm-model* reason)
+          (llm:llama-ask-model llm:*llm-url*)))
+      ;; An explicit --llama deserves an answer either way; a bare launch only
+      ;; speaks up when it found something worth naming.
+      (when (or llm:*llm-model* llama-explicit)
+        (if llm:*llm-model*
+            (format t "~&operandi: llama ~A — model ~A (~A)~%"
+                    llm:*llm-url* llm:*llm-model* reason)
+            (format t "~&operandi: llama ~A — ~A~%" llm:*llm-url* reason)))))
   ;; Preflight the model on any path that will actually run a turn (not bare help).
   (unless (equal cmd "--help")
     ;; A confidential session on a backend that cannot seal is a configuration
@@ -381,6 +470,16 @@
      (format t "  operandi.lisp              (no args, or --tui: interactive REPL: streaming, tools, /commands)~%")
      (format t "  operandi.lisp -- --resume [ID] tui  (resume a saved session; latest if no ID)~%")
      (format t "  operandi.lisp -- --rc TARGET \"task\"   (mirror each turn to a Marmot chat: TARGET is an npub, nprofile or NIP-05 to start a new chat, or a chat name / group id for an existing one; also /rc in the TUI)~%")
+     (format t "  operandi.lisp -- --llama ADDR [-m MODEL] \"task\"~%")
+     (format t "      The local llama.cpp server (the default backend). ADDR is the~%")
+     (format t "      server's address, not a model — a llama.cpp server usually has~%")
+     (format t "      one model loaded: [proto://][host][:port][/path], e.g. :9931,~%")
+     (format t "      localhost:9931, http://box:9931. At least one component is~%")
+     (format t "      required, and a port must be colon-prefixed; the default~%")
+     (format t "      address is ~A.~%" llm:*llama-url*)
+     (format t "      -m MODEL names the model, for a multi-model server only;~%")
+     (format t "      without it the model is asked of the server (largest, or the~%")
+     (format t "      one already loaded).~%")
      (format t "  operandi.lisp -- --openrouter [MODEL] \"task\"~%")
      (format t "  operandi.lisp -- --effort off|low|medium|high \"task\"   (reasoning; also OPERANDI_EFFORT)~%")
      (format t "  operandi.lisp -- --openrouter STRONG --worker-model CHEAP tui   (orchestrator and subagents on different models)~%")
@@ -426,7 +525,7 @@
      (format t "      Key in ~~/.operandi/tinfoil.token.~%")
      (format t "~%--openrouter reads token from ~~/.operandi/openrouter.token.~%")
      (format t "Sessions are saved under ~~/.operandi/sessions/; --resume continues one.~%")
-     (format t "Default backend is a local llama.cpp on http://127.0.0.1:8081.~%"))
+     (format t "Default backend is a local llama.cpp on ~A.~%" llm:*llama-url*))
     ((member cmd '("tui" "shell" "repl") :test #'string-equal) (run-shell))
     ;; operandi ask "why does X happen?" — the question phase, non-interactively
     ((string-equal cmd "ask")

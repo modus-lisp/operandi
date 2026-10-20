@@ -101,7 +101,10 @@ sbcl --non-interactive --load bin/operandi.lisp -- tui
 ```
 
 `bin/operandi --help` prints the same list of flags, commands and environment
-variables as the tables below, from the running binary.
+variables as the tables below, from the running binary. It is sectioned and
+coloured on a tty (plain when piped, or with `NO_COLOR` set), and
+`--help TOPIC` prints one section in full: `commands`, `backends`, `session`,
+`agent`, `env`, `files`, `diagnostics`, or `all`.
 
 ## CLI
 
@@ -136,7 +139,7 @@ operandi [FLAGS] [COMMAND | "task description"]
 | `--tools A,B,C` | allow-list: exactly these tools |
 | `--no-tools X,Y` | the default tool set minus these |
 | `--tui` | force the interactive TUI |
-| `--help`, `-h` | usage |
+| `--help`, `-h` `[TOPIC]` | usage; `TOPIC` is one of `commands`, `backends`, `session`, `agent`, `env`, `files`, `diagnostics`, `all` |
 
 An unknown `--flag` is rejected (exit 2) rather than sent to the agent as task
 text. Before any path that runs a turn, the model is preflighted — a bad slug

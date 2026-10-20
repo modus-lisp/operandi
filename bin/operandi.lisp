@@ -174,96 +174,207 @@
           (format *error-output* "operandi: ignoring ~A: ~A~%" p e)
           nil)))))
 
-(defun %usage ()
-  "The --help text.  Written for the LAUNCHER (bin/operandi), which is how
-   operandi is actually run; the source form is mentioned once at the end
-   rather than prefixed onto every line.  Every flag the parser accepts is
-   listed here — a flag that works but is undocumented is a flag nobody
-   finds."
-  (format t "~&usage: operandi [FLAGS] [COMMAND | \"task\"]~%")
-  (format t "~%commands~%")
-  (format t "  (none), tui, shell, repl   interactive TUI~%")
-  (format t "  \"task description\"         run one task, print the answer, exit~%")
-  (format t "  ask \"question\"             the question phase: rival hypotheses, a swarm~%")
-  (format t "                             settles them, an answer from the verdicts~%")
-  (format t "  --resume [ID] [tui]        resume a saved session (latest if no ID)~%")
-  (format t "  --resume [ID] \"task\"       continue that session with one more turn~%")
-  (format t "~%backend — default: local llama.cpp at ~A~%" llm:*llama-url*)
-  (format t "  --llama ADDR [-m MODEL]    the local llama.cpp server. ADDR is the server's~%")
-  (format t "                             address, not a model: [proto://][host][:port][/path],~%")
-  (format t "                             e.g. :9931, localhost:9931, http://box:9931. At least~%")
-  (format t "                             one component is required, and a port must be~%")
-  (format t "                             colon-prefixed. -m MODEL names the model, for a~%")
-  (format t "                             multi-model server only; without it the model is~%")
-  (format t "                             asked of the server (the only one, else the largest,~%")
-  (format t "                             preferring one already loaded).~%")
-  (format t "  --openrouter [MODEL]       OpenRouter; MODEL is a vendor/name slug. Bare~%")
-  (format t "                             --openrouter uses the configured model. Token in~%")
-  (format t "                             ~~/.operandi/openrouter.token.~%")
-  (format t "  --routstr [NODE-URL] [MODEL]~%")
-  (format t "                             Routstr: independent Lightning-paid nodes. NODE-URL~%")
-  (format t "                             (https://...) picks the node; default token in~%")
-  (format t "                             ~~/.operandi/routstr.token.~%")
-  (format t "  --ppq [MODEL]              PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/~%")
-  (format t "                             Lightning. Any PPQ id (gpt-6.1-sol, ...); requests~%")
-  (format t "                             go out in the clear. Key in ~~/.operandi/ppq.token.~%")
-  (format t "  --tinfoil [MODEL]          Tinfoil's own enclave (inference.tinfoil.sh), sealed~%")
-  (format t "                             end to end — there is no plaintext mode. MODEL is a~%")
-  (format t "                             bare Tinfoil id (gpt-oss-120b, ...). Key in~%")
-  (format t "                             ~~/.operandi/tinfoil.token.~%")
-  (format t "  --confidential-tinfoil     Require every request to be EHBP-sealed to a Tinfoil~%")
-  (format t "                             enclave whose key is bound into an attestation report~%")
-  (format t "                             verified locally against the pinned AMD ARK. A claim~%")
-  (format t "                             about the SEAL, not the whole exchange. Fails rather~%")
-  (format t "                             than downgrading. Valid with --ppq private/MODEL,~%")
-  (format t "                             --tinfoil, and --routstr tinfoil-MODEL; on any other~%")
-  (format t "                             backend it is a configuration error.~%")
-  (format t "~%session~%")
-  (format t "  --rc TARGET                mirror each turn to a Marmot chat: an npub, nprofile~%")
-  (format t "                             or NIP-05 starts a new chat, a chat name or group id~%")
-  (format t "                             joins an existing one. Also /rc in the TUI.~%")
-  (format t "  --tui                      force the interactive TUI~%")
-  (format t "                             (in the TUI, /help lists the /commands: /model,~%")
-  (format t "                             /effort, /workers, /sessions, /resume, /cost,~%")
-  (format t "                             /search, /paste, /swarm, /rc, /system, /tools,~%")
-  (format t "                             /clear, /ask, /quit)~%")
-  (format t "~%agent~%")
-  (format t "  --worker-model M           model for sub-agents: a vendor/name slug, llama, or~%")
-  (format t "                             inherit (the orchestrator's model)~%")
-  (format t "  --effort LEVEL             reasoning effort: off, low, medium, high, default~%")
-  (format t "  --tools A,B,C              allow-list: exactly these tools~%")
-  (format t "  --no-tools X,Y             the default tool set minus these~%")
-  (format t "  --help, -h                 this text~%")
-  (format t "  --confidential             REMOVED — renamed to --confidential-tinfoil; the~%")
-  (format t "                             old name overclaimed, so it errors rather than~%")
-  (format t "                             being accepted silently~%")
-  (format t "~%An unknown --flag is rejected (exit 2) rather than sent to the agent as task~%")
-  (format t "text. Before any path that runs a turn the model is preflighted, so a bad slug~%")
-  (format t "or an unreachable server fails here instead of blank-per-turn.~%")
-  (format t "~%env (read when the image loads — on the fast path that means the core build,~%")
-  (format t "so set these before the first run, or prefer the flags and /commands)~%")
-  (format t "  OPERANDI_MAX_TOKENS        per-turn output cap (default 16384)~%")
-  (format t "  OPERANDI_CONTEXT_BUDGET    compaction threshold in tokens~%")
-  (format t "  OPERANDI_CONTEXT_HEADROOM  fraction of the budget kept free (default 0.2)~%")
-  (format t "  OPERANDI_MAX_ITERS         hard cap on the agentic loop (default 500)~%")
-  (format t "  OPERANDI_EFFORT            same as --effort~%")
-  (format t "  OPERANDI_WORKER_MODEL      same as --worker-model~%")
-  (format t "  OPERANDI_SEARCH            web-search backend: openrouter, searxng, brave, auto~%")
-  (format t "  OPERANDI_SWARM_DEADLINE    seconds a Fan/Investigate batch may run (default 900)~%")
-  (format t "  OPERANDI_NO_PREFLIGHT=1    skip the model preflight~%")
-  (format t "  OPERANDI_FANCY_TUI=1       opt in to the scroll-region TUI~%")
-  (format t "  OPERANDI_SBCL              the sbcl binary the launcher uses~%")
-  (format t "~%files~%")
-  (format t "  ~~/.operandi/config.json    default model: {\"model\": \"vendor/name\"} or \"llama\"~%")
-  (format t "  ~~/.operandi/operandi.db    saved sessions; --resume continues one~%")
-  (format t "  ~~/.operandi/offload/       raw conversation displaced by compaction~%")
-  (format t "~%entry points~%")
-  (format t "  bin/operandi               this CLI (dumps a core image for a ~~20ms start)~%")
-  (format t "  bin/operandi-acp           ACP server over stdio, for editors (Zed, Buzz)~%")
-  (format t "  bin/operandi-nostr.lisp    Nostr DM front end~%")
-  (format t "  bin/operandi-sandbox-macos the same CLI under the macOS sandbox profile~%")
-  (format t "~%From source, without the launcher:~%")
-  (format t "  sbcl --non-interactive --load bin/operandi.lisp -- [FLAGS] [COMMAND | \"task\"]~%"))
+;;; ------------------------------ usage ------------------------------
+;;; The help text is DATA, not a wall of FORMAT calls.  Each section is
+;;; (TOPIC TITLE COLOUR ROWS OVERVIEW-P) and each row is
+;;; (LEFT SHORT &rest LONG-LINES): LEFT is the flag or command, SHORT its
+;;; one-line description, and LONG-LINES the detail shown only by
+;;; `--help TOPIC`.
+;;;
+;;; The split is the point.  A usage text nobody can scan is a usage text
+;;; nobody reads, and a flag that works but is undocumented is a flag nobody
+;;; finds — so the top level stays one line per flag (the way ds4's help
+;;; reads) and the paragraphs live behind a topic.  Keeping it a table is
+;;; also what makes "every flag is documented" checkable by eye instead of by
+;;; re-reading the parser.
+
+(defun %paint (str &rest codes)
+  "PAINT from operandi.tui, or STR unchanged when the TUI is not loaded.
+   Resolved by name so this file does not depend on the TUI's package."
+  (let ((f (find-symbol "PAINT" "OPERANDI.TUI")))
+    (if (and f (fboundp f))
+        (apply (symbol-function f) str codes)
+        str)))
+
+(defun %usage-sections ()
+  (list
+   (list "commands" "Commands" :cyan
+         '(("(none), tui, shell, repl" "interactive TUI")
+           ("\"task description\"" "run one task, print the answer, exit")
+           ("ask \"question\"" "the question phase: rival hypotheses, a swarm settles them, an answer from the verdicts")
+           ("--resume [ID] [tui]" "resume a saved session (latest if no ID)")
+           ("--resume [ID] \"task\"" "continue that session with one more turn"))
+         t)
+
+   (list "backends" "Backends" :magenta
+         `(("--llama ADDR [-m MODEL]" "the local llama.cpp server (the default)"
+            "ADDR is the server's address, not a model: [proto://][host][:port][/path]."
+            "A missing scheme means http, a missing host means localhost, a missing"
+            "path means /v1/chat/completions, and at least one component is required"
+            "— a bare --llama is an error, not a request for the default."
+            ""
+            "A port must be COLON-PREFIXED: :9931, not 9931. A bare number is"
+            "rejected rather than guessed at, because a forgotten colon is far"
+            "likelier than a hostname that is all digits."
+            ""
+            "-m MODEL names the model, for a multi-model server only. Without it the"
+            "model is asked of the server: the only one, else the largest, preferring"
+            "one it already has loaded — naming an unloaded model makes the router"
+            "load a multi-gigabyte file you did not ask for."
+            ,(format nil "Default: ~A" llm:*llama-url*))
+           ("--openrouter [MODEL]" "OpenRouter; MODEL is a vendor/name slug"
+            "Bare --openrouter uses the configured model. Token in"
+            "~/.operandi/openrouter.token (mode 600)."
+            "Default model: deepseek/deepseek-v4-flash.")
+           ("--routstr [NODE-URL] [MODEL]" "Routstr: independent Lightning-paid nodes"
+            "NODE-URL (https://...) picks the node; a bare model id uses the default"
+            "node. Token in ~/.operandi/routstr.token — a Cashu eCash token or an"
+            "sk- key from chat.routstr.com.")
+           ("--ppq [MODEL]" "PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/Lightning"
+            "Any PPQ id (gpt-6.1-sol, private/gpt-oss-120b, ...). Requests go out in"
+            "the clear unless --confidential-tinfoil is also given. Key in"
+            "~/.operandi/ppq.token.")
+           ("--tinfoil [MODEL]" "Tinfoil's own enclave, sealed end to end"
+            "inference.tinfoil.sh. There is no plaintext mode. MODEL is a bare"
+            "Tinfoil id (gpt-oss-120b, ...). Key in ~/.operandi/tinfoil.token.")
+           ("--confidential-tinfoil" "require every request to be EHBP-sealed to a verified enclave"
+            "The enclave's key must be bound into an attestation report verified"
+            "locally against the pinned AMD ARK. This is a claim about the SEAL, not"
+            "about the whole exchange. It FAILS rather than downgrading to plaintext."
+            "Valid with --ppq private/MODEL, --tinfoil, and --routstr tinfoil-MODEL;"
+            "on any other backend it is a configuration error."))
+         t)
+
+   (list "session" "Session" :green
+         '(("--rc TARGET" "mirror each turn to a Marmot chat"
+            "An npub, nprofile or NIP-05 starts a new chat; a chat name or group id"
+            "joins an existing one. Also /rc in the TUI.")
+           ("--tui" "force the interactive TUI"
+            "In the TUI, /help lists the /commands: /model, /effort, /workers,"
+            "/sessions, /resume, /cost, /search, /paste, /swarm, /rc, /system,"
+            "/tools, /clear, /ask, /quit."))
+         t)
+
+   (list "agent" "Agent" :yellow
+         '(("--worker-model M" "model for sub-agents: a vendor/name slug, llama, or inherit"
+            "inherit (the default) means sub-agents use the orchestrator's model.")
+           ("--effort LEVEL" "reasoning effort: off, low, medium, high, default"
+            "On OpenRouter, off sends reasoning.enabled=false and the levels send"
+            "reasoning.effort. On llama.cpp anything but off/default turns Qwen-style"
+            "thinking on. The compaction budget follows the backend (24k tokens on"
+            "llama, 96k on OpenRouter) unless OPERANDI_CONTEXT_BUDGET is set.")
+           ("--tools A,B,C" "allow-list: exactly these tools")
+           ("--no-tools X,Y" "the default tool set minus these")
+           ("--help, -h [TOPIC]" "this text, or one topic of it"
+            "Topics: commands, backends, session, agent, env, files, diagnostics.")
+           ("--confidential" "REMOVED — renamed to --confidential-tinfoil"
+            "The old name overclaimed, so it errors rather than being accepted"
+            "silently."))
+         t)
+
+   (list "env" "Environment" :blue
+         '(("OPERANDI_MAX_TOKENS" "per-turn output cap (default 16384)")
+           ("OPERANDI_CONTEXT_BUDGET" "compaction threshold in tokens")
+           ("OPERANDI_CONTEXT_HEADROOM" "fraction of the budget kept free (default 0.2)")
+           ("OPERANDI_MAX_ITERS" "hard cap on the agentic loop (default 500)")
+           ("OPERANDI_EFFORT" "same as --effort")
+           ("OPERANDI_WORKER_MODEL" "same as --worker-model")
+           ("OPERANDI_SEARCH" "web-search backend: openrouter, searxng, brave, auto")
+           ("OPERANDI_SWARM_DEADLINE" "seconds a Fan/Investigate batch may run (default 900)")
+           ("OPERANDI_NO_PREFLIGHT=1" "skip the model preflight")
+           ("OPERANDI_FANCY_TUI=1" "opt in to the scroll-region TUI")
+           ("OPERANDI_SBCL" "the sbcl binary the launcher uses"))
+         nil)
+
+   (list "files" "Files" :white
+         '(("~/.operandi/config.json" "default model: {\"model\": \"vendor/name\"} or \"llama\"")
+           ("~/.operandi/operandi.db" "saved sessions; --resume continues one")
+           ("~/.operandi/offload/" "raw conversation displaced by compaction")
+           ("~/.operandi/*.token" "one bearer token per backend, mode 600"))
+         nil)
+
+   (list "diagnostics" "Diagnostics" :red
+         '(("preflight" "the model is checked before any path that runs a turn"
+            "A bad slug, a provider-allowlist miss or an unreachable local server"
+            "fails here with exit 2 instead of blank-per-turn. Skip it with"
+            "OPERANDI_NO_PREFLIGHT=1.")
+           ("unknown --flag" "rejected with exit 2, never sent to the agent as task text")
+           ("exit codes" "0 ok, 2 configuration error, 130 interrupted (Ctrl-C)")
+           ("entry points" "bin/operandi, bin/operandi-acp, bin/operandi-nostr.lisp"
+            "bin/operandi-acp is an ACP server over stdio for editors (Zed, Buzz)."
+            "bin/operandi-nostr.lisp is a Nostr DM front end."
+            "bin/operandi-sandbox-macos runs this CLI under the macOS sandbox profile."))
+         nil)))
+
+(defun %usage-row (left right width)
+  (format t "  ~A ~A ~A~%"
+          (%paint (format nil "~VA" width left) :br-cyan)
+          (%paint "|" :gray)
+          right))
+
+(defun %usage-section (section width verbose)
+  (destructuring-bind (topic title colour rows overview-p) section
+    (declare (ignore topic overview-p))
+    (format t "~%~A~%" (%paint title colour :bold))
+    (dolist (row rows)
+      (%usage-row (first row) (second row) width)
+      (when verbose
+        (dolist (l (cddr row))
+          (if (string= l "")
+              (terpri)
+              (format t "  ~VA   ~A~%" width "" l)))))))
+
+(defun %usage-more-info (sections)
+  (format t "~%~A~%" (%paint "More Info" :bold))
+  (dolist (s sections)
+    (unless (fifth s)
+      (format t "  ~A ~A ~A~%"
+              (%paint (format nil "~VA" 12 (concatenate 'string (second s) ":")) :br-cyan)
+              (%paint "|" :gray)
+              (format nil "--help ~A" (first s)))))
+  (format t "  ~A ~A ~A~%"
+          (%paint (format nil "~VA" 12 "Everything:") :br-cyan)
+          (%paint "|" :gray)
+          "--help all"))
+
+(defun %usage-examples ()
+  (format t "~%~A~%" (%paint "Examples" :bold))
+  (dolist (row '(("chat" "operandi")
+                 ("one shot" "operandi \"summarize what's in this directory\"")
+                 ("local" "operandi --llama :9931 -m qwen3-32b \"task\"")
+                 ("frontier" "operandi --openrouter deepseek/deepseek-v4-flash \"task\"")
+                 ("resume" "operandi --resume")
+                 ("ask" "operandi ask \"why does the build fail?\"")))
+    (format t "  ~A ~A ~A~%"
+            (%paint (format nil "~VA" 12 (first row)) :br-cyan)
+            (%paint "|" :gray)
+            (second row))))
+
+(defun %usage (&optional topic)
+  "Print the help text, or one TOPIC of it.  See %USAGE-SECTIONS."
+  (let* ((sections (%usage-sections))
+         (want (and topic (string-downcase (string topic))))
+         (chosen (if (or (null want) (string= want "all"))
+                     sections
+                     (remove-if-not (lambda (s) (string= (first s) want)) sections)))
+         (width (min 30 (max 20 (reduce #'max
+                                        (mapcan (lambda (s)
+                                                  (mapcar (lambda (r) (length (first r)))
+                                                          (fourth s)))
+                                                sections))))))
+    (unless chosen
+      (format *error-output* "~&operandi: no help topic ~S~%  topics: ~{~A~^, ~}~%"
+              topic (mapcar #'first sections))
+      (sb-ext:exit :code 2))
+    (if want
+        (dolist (s chosen) (%usage-section s width t))
+        (progn
+          (format t "~&usage: operandi [FLAGS] [COMMAND | \"task\"]~%")
+          (dolist (s sections)
+            (when (fifth s) (%usage-section s width nil)))
+          (%usage-more-info sections)
+          (%usage-examples)))
+    (force-output)))
 
 ;; Apply the configured default model unless the command line names a backend
 ;; explicitly (--openrouter, with or without a model; a bare --openrouter also
@@ -569,7 +680,8 @@
     (resume (run-resumed-task resume (format nil "~{~A~^ ~}" args)))
     ;; Bare `operandi` (no task, no command) → the interactive TUI.
     ((null cmd) (run-shell))
-    ((string= cmd "--help") (%usage))
+    ;; --help [TOPIC]: the topic is the next argument, if any.
+    ((string= cmd "--help") (%usage (second args)))
     ((member cmd '("tui" "shell" "repl") :test #'string-equal) (run-shell))
     ;; operandi ask "why does X happen?" — the question phase, non-interactively
     ((string-equal cmd "ask")

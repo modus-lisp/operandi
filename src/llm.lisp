@@ -30,6 +30,7 @@
            #:llm-chat #:ht #:extract-json
            #:image-part #:text-part #:user-content #:content-text #:content-images
            #:image-file-p
+           #:*llama-url* #:llama-chat-url #:llama-ask-model #:llama-resolve-model
            #:set-backend-openrouter! #:set-backend-llama! #:set-backend-routstr!
            #:set-backend-ppq! #:set-backend-tinfoil!
            #:with-llama #:with-openrouter #:with-routstr #:with-ppq
@@ -45,9 +46,22 @@
 
 (in-package #:operandi.llm)
 
-(defparameter *llm-url* "http://127.0.0.1:8081/v1/chat/completions")
-(defparameter *llm-default-max-tokens* 256)
-(defparameter *llm-read-timeout* 120)
+(defparameter *llama-url* "http://localhost:9931/v1/chat/completions"
+  "The local llama.cpp server.  llama.cpp's own default port is 8080, but the
+   build we run listens on 9931; --llama (and the \"llama\" config model) point
+   here, and --llama URL overrides it for one run.")
+
+;;; The live backend state is DEFVAR, not DEFPARAMETER, on purpose.  These are
+;;; the knobs a running session turns — /model, --llama, set-backend-*! — and
+;;; DEFPARAMETER would RESET them every time this file is loaded into a live
+;;; image.  That is not hypothetical: re-loading llm.lisp to pick up an edit
+;;; mid-session silently reverted the backend to :llama with a NIL model, and
+;;; the next turn went to the local server with no model field and 400'd
+;;; ("model name is missing from the request").  DEFVAR leaves a bound symbol
+;;; alone, so a reload is now a no-op for state and only replaces the code.
+(defvar *llm-url* *llama-url*)
+(defvar *llm-default-max-tokens* 256)
+(defvar *llm-read-timeout* 120)
 
 ;;; ---- message content ------------------------------------------------------
 ;;; A message's "content" is a string, or — once images are involved — a
@@ -111,7 +125,7 @@
                 content)
       0))
 
-(defparameter *llm-backend* :llama
+(defvar *llm-backend* :llama
   ":LLAMA = local llama.cpp at *llm-url* (default).
    :OPENROUTER = OpenRouter API; *llm-url*, *llm-auth-token*, and
    *llm-model* must be set. Use USE-OPENROUTER to flip.
@@ -248,7 +262,7 @@ carries Tinfoil, or drop --confidential-tinfoil."
            *llm-backend* (and (eq *llm-backend* :routstr) *llm-model*)))
   t)
 
-(defparameter *llm-effort* nil
+(defvar *llm-effort* nil
   "Reasoning effort for the AGENT LOOP: NIL (leave it to the provider/model
    default), :OFF, :LOW, :MEDIUM, or :HIGH. Seeded from OPERANDI_EFFORT; the
    CLI's --effort and the TUI's /effort set it. What it means per backend:
@@ -291,10 +305,10 @@ carries Tinfoil, or drop --confidential-tinfoil."
     ((:ppq :tinfoil) body))
   body)
 
-(defparameter *llm-auth-token* nil
+(defvar *llm-auth-token* nil
   "Bearer token for the LLM endpoint, or NIL. Required for openrouter.")
 
-(defparameter *llm-model* nil
+(defvar *llm-model* nil
   "Model name string. Required for openrouter. Cheapest-first picks:
    minimax/minimax-m2.7 ($0.30/M in), deepseek/deepseek-v4-pro ($0.45),
    moonshotai/kimi-k2.6 ($0.75), anthropic/claude-sonnet-4-5 ($3 — 10x).
@@ -403,7 +417,7 @@ carries Tinfoil, or drop --confidential-tinfoil."
                                          (subseq text start (1+ i)))
                                       (error () nil))))))))))))
 
-(defparameter *llm-max-retries* 4
+(defvar *llm-max-retries* 4
   "Retries for a TRANSIENT LLM HTTP failure (429 rate-limit, 5xx, network/
    timeout) before giving up. Backoff is exponential. A provider 429 must not
    kill a whole scan/report — it usually clears within a few seconds.")
@@ -786,12 +800,148 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
                                     :model (operandi.ppq:ppq-wire-model ,md))))))
          ,@body))))
 
-(defun set-backend-llama! (&key (url "http://127.0.0.1:8081/v1/chat/completions"))
-  "Switch the LLM client back to the local llama.cpp server."
+(defun llama-chat-url (spec)
+  "Turn a --llama argument into a chat-completions URL.  SPEC is
+   [proto://][host][:port][/path] — the address of the server, not a model
+   name: a llama.cpp server usually has exactly one model loaded, so there is
+   nothing to name (use -m for the rare multi-model server).  At least one
+   component is required, so an empty argument SIGNALS rather than quietly
+   falling back to the default — a bare --llama is a mistake, not a request
+   for localhost.  A missing scheme means http, a missing host means
+   localhost, and a missing path means /v1/chat/completions.
+
+   A PORT MUST BE COLON-PREFIXED: \":9931\" is localhost on 9931.  A bare
+   number is NOT read as a port — it SIGNALS, because a bare number is a
+   forgotten colon far more often than it is a hostname, and silently
+   resolving \"9931\" to localhost:9931 would hide the typo.  A path is kept as
+   given, so a full endpoint passes through unchanged."
+  (let* ((s (string-trim " " (string spec)))
+         (scheme-end (search "://" s))
+         (scheme (if scheme-end (subseq s 0 (+ scheme-end 3)) "http://"))
+         (rest (if scheme-end (subseq s (+ scheme-end 3)) s))
+         (slash (position #\/ rest))
+         (authority (if slash (subseq rest 0 slash) rest))
+         (path (if slash (subseq rest slash) "")))
+    (when (and (plusp (length authority)) (every #'digit-char-p authority))
+      (error "a port must be colon-prefixed: --llama :~A, not ~A" authority authority))
+    (when (and (plusp (length authority)) (char= (char authority (1- (length authority))) #\:))
+      (error "a port must be colon-prefixed and non-empty: --llama :9931, not ~A" authority))
+    (when (and (string= authority "") (or (string= path "") (string= path "/")))
+      (error "--llama needs an address: [proto://][host][:port][/path] (e.g. --llama :9931)"))
+    (let ((authority (cond ((string= authority "") "localhost")
+                           ((char= (char authority 0) #\:)
+                            (concatenate 'string "localhost" authority))
+                           (t authority))))
+      (if (and (plusp (length path)) (not (string= path "/")))
+          (format nil "~A~A~A" scheme authority path)
+          (format nil "~A~A/v1/chat/completions" scheme authority)))))
+
+;;; ---- asking a llama.cpp server what it serves ------------------------------
+;;; A single-model llama.cpp server needs no model field at all, but its
+;;; ROUTER mode (several models behind one port, loaded on demand) 400s a
+;;; request that omits one.  So when no model was named we ask the server:
+;;; GET <base>/v1/models, and pick from what comes back.
+
+(defun llama-models-url (chat-url)
+  "The /v1/models URL for a chat-completions URL — the sibling endpoint, so a
+   custom path (a proxy prefix) is preserved."
+  (let ((i (search "/v1/chat/completions" chat-url)))
+    (if i (concatenate 'string (subseq chat-url 0 i) "/v1/models")
+        (let ((slash (position #\/ chat-url :from-end t :start (or (search "://" chat-url) 0))))
+          (if slash (concatenate 'string (subseq chat-url 0 slash) "/v1/models")
+              (concatenate 'string chat-url "/v1/models"))))))
+
+(defun llama-model-size (model)
+  "A comparable size for a /v1/models entry, or NIL when the server does not
+   say.  llama.cpp's router reports the model's own file size in bytes; a
+   plain server reports nothing, which is fine — there is only one model
+   there.  Falls back to the parameter count some servers expose."
+  (let ((size (gethash "size" model))
+        (meta (gethash "meta" model)))
+    (or (and (numberp size) size)
+        (and (hash-table-p meta)
+             (or (let ((n (gethash "n_params" meta))) (and (numberp n) n))
+                 ;; the router also reports the file size, but nested in meta
+                 (let ((n (gethash "size" meta))) (and (numberp n) n)))))))
+
+(defun llama-model-loaded-p (model)
+  "True when the server reports MODEL as loaded.  llama.cpp's router says so
+   under status.value; a plain server says nothing, which is not \"unloaded\"."
+  (let ((st (gethash "status" model)))
+    (and (hash-table-p st) (equal (gethash "value" st) "loaded"))))
+
+(defun llama-pick-model (models)
+  "Choose from a server's /v1/models list.  One model is the common case and
+   is taken as-is.  With several, prefer one the server already has LOADED —
+   asking for an unloaded model makes the router load it, which is a
+   multi-gigabyte side effect nobody asked for — and among equals take the
+   LARGEST, since a bigger model is the better default.  Returns (values ID
+   REASON), or (values NIL REASON) when there is nothing to choose from."
+  (let ((cands (remove-if-not (lambda (m) (and (hash-table-p m)
+                                               (let ((id (gethash "id" m)))
+                                                 (and (stringp id) (plusp (length id))))))
+                              (coerce models 'list))))
+    (cond
+      ((null cands) (values nil "the server listed no models"))
+      ((null (rest cands)) (values (gethash "id" (first cands)) "the only model it serves"))
+      (t (let* ((loaded (remove-if-not #'llama-model-loaded-p cands))
+                ;; Prefer a model the server already has in memory, but only
+                ;; when it is the ONLY one loaded: with several loaded there is
+                ;; no reason to prefer any of them, and the largest is the
+                ;; better default.  (The router reports every model's size, so
+                ;; "largest" is a real comparison, not a guess.)
+                (pool (if (= (length loaded) 1) loaded cands))
+                (sized (remove-if-not #'llama-model-size pool))
+                (pick (if sized
+                          (reduce (lambda (a b)
+                                    (if (> (llama-model-size a) (llama-model-size b)) a b))
+                                  sized)
+                          (first pool))))
+           (values (gethash "id" pick)
+                   (format nil "~D models; picked the ~:[first~;largest~]~:[~;, already loaded~]"
+                           (length cands) (and sized t)
+                           (and (eq pool loaded) t))))))))
+
+(defun llama-ask-model (chat-url &key (timeout 5))
+  "Ask the llama.cpp server at CHAT-URL which model to use.  Returns (values
+   MODEL REASON), or (values NIL REASON) if it could not be determined — the
+   caller decides whether that is fatal.  Never signals: a server that does
+   not implement /v1/models is not an error, it just leaves the model unset,
+   which is exactly right for a single-model server."
+  (handler-case
+      (let* ((body (http:get (llama-models-url chat-url) :read-timeout timeout))
+             (parsed (json:parse body))
+             (data (and (hash-table-p parsed) (gethash "data" parsed))))
+        (if (or (vectorp data) (listp data))
+            (llama-pick-model data)
+            (values nil "the server's /v1/models had no model list")))
+    (error (e) (values nil (format nil "could not ask the server (~A)" (type-of e))))))
+
+(defun llama-resolve-model (chat-url &key (timeout 5))
+  "The model to send to the llama.cpp server at CHAT-URL, asked of the server
+   itself.  Returns (values MODEL REASON), MODEL being NIL when the server
+   could not be asked — which is not an error: a single-model server wants no
+   model field, so NIL is the right answer there.  REASON is a short phrase
+   for the operator either way."
+  (multiple-value-bind (model reason) (llama-ask-model chat-url :timeout timeout)
+    (if model
+        (values model reason)
+        (values nil (format nil "~A; sending no model field" reason)))))
+
+(defun set-backend-llama! (&key (url *llama-url*) model (ask t))
+  "Switch the LLM client back to the local llama.cpp server.  URL defaults to
+   *LLAMA-URL* (http://localhost:9931/v1/chat/completions); pass :URL to point
+   at a server on another port.
+
+   MODEL is the model id to send.  When it is NIL and ASK is true (the
+   default) the server is asked what it serves — a single-model server needs
+   no model field at all, but llama.cpp's ROUTER mode 400s a request that
+   omits one, so the id has to come from somewhere.  Pass :ASK NIL to skip the
+   round-trip and send no model field, and :MODEL to name one outright."
   (setf *llm-backend*    :llama
         *llm-url*        url
         *llm-auth-token* nil
-        *llm-model*      nil
+        *llm-model*      (or model (and ask (llama-resolve-model url)))
         *llm-read-timeout* 120
         ;; Leaving a sealer installed would EHBP-seal a request to a backend
         ;; that never asked for it.  The sealer belongs to confidential :PPQ
@@ -807,7 +957,7 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
    credits even when operandi's cron tasks are running on a frontier
    backend."
   `(let ((*llm-backend* :llama)
-         (*llm-url* "http://127.0.0.1:8081/v1/chat/completions")
+         (*llm-url* *llama-url*)
          (*llm-auth-token* nil)
          (*llm-model* nil)
          (*llm-read-timeout* 120)

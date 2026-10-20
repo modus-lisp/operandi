@@ -6,16 +6,16 @@
 ;;; file from it, so the sbcl invocation below is the slow path, not the way
 ;;; you normally start operandi):
 ;;;
-;;;   bin/operandi [FLAGS] [COMMAND | "task"]
-;;;   bin/operandi --help
+;;;   bin/operandi [FLAGS] ["task"]
+;;;   bin/operandi --help [TOPIC]
 ;;;
-;;;   sbcl --non-interactive --load bin/operandi.lisp -- [FLAGS] [COMMAND | "task"]
+;;;   sbcl --non-interactive --load bin/operandi.lisp -- [FLAGS] ["task"]
 ;;;
-;;; The single-task form runs the agent loop once on the given prompt
-;;; and prints the final answer. The shell form is an interactive REPL:
-;;; each input line becomes a fresh agent run; type 'exit' to quit.
-;;; Conversation history is NOT carried across shell prompts — each task
-;;; is isolated.
+;;; With a prompt (bare, or --prompt/-p) the agent loop runs once and prints
+;;; the final answer. With no prompt at all the interactive TUI opens — that
+;;; is the default, and --repl only says so. There are no bare command words:
+;;; every mode is a flag (--repl, --ask, --resume), so a bare word is always
+;;; prompt text.
 ;;;
 ;;; --help prints the full list of flags, commands and environment
 ;;; variables; keep %USAGE below in step with the parser.
@@ -198,12 +198,23 @@
 
 (defun %usage-sections ()
   (list
-   (list "commands" "Commands" :cyan
-         '(("(none), tui, shell, repl" "interactive TUI")
-           ("\"task description\"" "run one task, print the answer, exit")
-           ("ask \"question\"" "the question phase: rival hypotheses, a swarm settles them, an answer from the verdicts")
-           ("--resume [ID] [tui]" "resume a saved session (latest if no ID)")
-           ("--resume [ID] \"task\"" "continue that session with one more turn"))
+   (list "modes" "Modes" :cyan
+         '(("(no prompt)" "interactive TUI — the default")
+           ("\"task description\"" "run one task, print the answer, exit"
+            "A bare prompt is every remaining argument, joined with spaces. There are"
+            "no bare command words: `operandi tui` is a task whose text is \"tui\"."
+            "The modes that used to be bare words are flags now — --repl, --ask.")
+           ("--prompt TEXT, -p TEXT" "the prompt, spelled out"
+            "Same as a bare prompt, for when you would rather not rely on the"
+            "leftover-arguments rule. Giving both is an error, not a precedence"
+            "puzzle. TEXT is taken as-is, even if it starts with a dash.")
+           ("--ask \"question\"" "the question phase: rival hypotheses, a swarm settles them, an answer from the verdicts")
+           ("--repl" "the interactive TUI, explicitly"
+            "It is already what you get with no prompt; this says so. A prompt"
+            "together with --repl is an error.")
+           ("--resume [ID]" "resume a saved session (latest if no ID)"
+            "With a prompt, continues that session with one more non-interactive"
+            "turn; without one, opens it in the TUI."))
          t)
 
    (list "backends" "Backends" :magenta
@@ -249,7 +260,7 @@
          '(("--rc TARGET" "mirror each turn to a Marmot chat"
             "An npub, nprofile or NIP-05 starts a new chat; a chat name or group id"
             "joins an existing one. Also /rc in the TUI.")
-           ("--tui" "force the interactive TUI"
+           ("--tui" "an older name for --repl"
             "In the TUI, /help lists the /commands: /model, /effort, /workers,"
             "/sessions, /resume, /cost, /search, /paste, /swarm, /rc, /system,"
             "/tools, /clear, /ask, /quit."))
@@ -266,7 +277,7 @@
            ("--tools A,B,C" "allow-list: exactly these tools")
            ("--no-tools X,Y" "the default tool set minus these")
            ("--help, -h [TOPIC]" "this text, or one topic of it"
-            "Topics: commands, backends, session, agent, env, files, diagnostics.")
+            "Topics: modes, backends, session, agent, env, files, diagnostics.")
            ("--confidential" "REMOVED — renamed to --confidential-tinfoil"
             "The old name overclaimed, so it errors rather than being accepted"
             "silently."))
@@ -344,7 +355,8 @@
                  ("local" "operandi --llama :9931 -m qwen3-32b \"task\"")
                  ("frontier" "operandi --openrouter deepseek/deepseek-v4-flash \"task\"")
                  ("resume" "operandi --resume")
-                 ("ask" "operandi ask \"why does the build fail?\"")))
+                 ("ask" "operandi --ask \"why does the build fail?\"")
+                 ("prompt" "operandi -p \"summarize this directory\"")))
     (format t "  ~A ~A ~A~%"
             (%paint (format nil "~VA" 12 (first row)) :br-cyan)
             (%paint "|" :gray)
@@ -369,7 +381,7 @@
     (if want
         (dolist (s chosen) (%usage-section s width t))
         (progn
-          (format t "~&usage: operandi [FLAGS] [COMMAND | \"task\"]~%")
+          (format t "~&usage: operandi [FLAGS] [\"task\"]~%")
           (dolist (s sections)
             (when (fifth s) (%usage-section s width nil)))
           (%usage-more-info sections)
@@ -394,7 +406,18 @@
 
 (let* ((raw (remove "--" (uiop:command-line-arguments) :test #'string=))
        (resume nil)
+       ;; --tui / --repl: force the interactive TUI.  It is also what you get
+       ;; when there is no prompt at all, so this only matters when a prompt
+       ;; was given too (which is an error — see below).
        (tui-p nil)
+       ;; --ask: the question phase instead of a plain task.
+       (ask-p nil)
+       ;; --prompt/-p TEXT, kept apart from the bare prompt so that giving both
+       ;; can be an error rather than a silent choice.
+       (prompt-arg nil)
+       ;; --help/-h [TOPIC].
+       (help-p nil)
+       (help-topic nil)
        ;; -m MODEL, remembered so it survives a --llama that comes after it
        ;; (set-backend-llama! otherwise clears the model).
        (llama-model nil)
@@ -607,8 +630,42 @@
                     (setf tool-names (%tools-allow (second acc)) acc (cddr acc)))
                    ((and acc (string= (first acc) "--no-tools"))
                     (setf tool-names (%tools-deny (second acc)) acc (cddr acc)))
-                   ((and acc (string= (first acc) "--tui"))
+                   ;; --ask: the question phase (rival hypotheses, a swarm
+                   ;; settles them, an answer from the verdicts) instead of a
+                   ;; plain task.  It used to be the bare command `ask`; a bare
+                   ;; word is now always prompt text, so the mode needs a flag.
+                   ((and acc (string= (first acc) "--ask"))
+                    (setf ask-p t acc (rest acc)))
+                   ;; --prompt/-p TEXT: the prompt, spelled out.  A bare prompt
+                   ;; still works — every remaining argument is joined into it —
+                   ;; so this exists for the cases where you would rather not
+                   ;; rely on that, and to make the arity explicit.
+                   ;;
+                   ;; TEXT is taken as-is, even if it starts with a dash: a
+                   ;; value-taking option consumes its argument, so `-p "-x"`
+                   ;; is a prompt and not a flag.  Only a MISSING argument is
+                   ;; an error.
+                   ((and acc (member (first acc) '("--prompt" "-p") :test #'string=))
+                    (let ((next (second acc)))
+                      (unless next
+                        (format *error-output* "operandi: ~A needs a prompt~%" (first acc))
+                        (sb-ext:exit :code 2))
+                      (setf prompt-arg next acc (cddr acc))))
+                   ;; --repl (and its older name --tui): the interactive TUI.
+                   ;; It is already what you get with no prompt, so this only
+                   ;; says so explicitly — and asking for a TUI AND a prompt is
+                   ;; a contradiction, not a choice to make silently (below).
+                   ((and acc (member (first acc) '("--repl" "--tui") :test #'string=))
                     (setf tui-p t acc (rest acc)))
+                   ;; --help/-h [TOPIC].  Consumed here rather than left in the
+                   ;; arguments, so a topic is unambiguous and -h cannot be
+                   ;; mistaken for a one-word prompt.
+                   ((and acc (member (first acc) '("--help" "-h") :test #'string=))
+                    (setf help-p t)
+                    (let ((next (second acc)))
+                      (when (and next (not (uiop:string-prefix-p "-" next)))
+                        (setf help-topic next)))
+                    (setf acc (if help-topic (cddr acc) (rest acc))))
                    ;; --rc TARGET: mirror every turn to a Marmot chat (see operandi.rc:rc).
                    ;; npub/nprofile/NIP-05 start a new chat; a hex id or chat name uses an existing one.
                    ((and acc (string= (first acc) "--rc"))
@@ -628,18 +685,42 @@
                     (setf acc (cddr acc)))
                    ;; Any other leading --flag is a typo or unknown option: fail loud
                    ;; instead of sending it to the agent as task text.
-                   ((and acc (> (length (first acc)) 2) (string= "--" (first acc) :end2 2)
-                         (not (string= (first acc) "--help")))
+                   ((and acc (> (length (first acc)) 2) (string= "--" (first acc) :end2 2))
                     (format *error-output* "operandi: unknown option ~A (try --help)~%" (first acc))
                     (sb-ext:exit :code 2))
                    (t (return))))
                acc))
-       ;; --tui and no argument at all are the same thing: the interactive TUI.
-       ;; -h is --help: it is short enough to slip past the unknown-option
-       ;; check below, so without this it would be handed to the agent as a
-       ;; one-word task.
-       (cmd (let ((c (if tui-p "tui" (first args))))
-              (if (and c (string= c "-h")) "--help" c))))
+       ;; The prompt: --prompt/-p if given, else whatever is left over.  There
+       ;; are no bare command words any more — `operandi tui` used to mean the
+       ;; TUI and `operandi ask "..."` the question phase, but a bare word is
+       ;; now always prompt text, so those modes are --repl and --ask.  Giving
+       ;; both spellings of the prompt is a mistake, not a precedence puzzle.
+       (prompt (cond ((and prompt-arg args)
+                      (format *error-output*
+                              "operandi: the prompt was given twice — with --prompt and as ~S~%"
+                              (format nil "~{~A~^ ~}" args))
+                      (sb-ext:exit :code 2))
+                     (prompt-arg prompt-arg)
+                     (args (format nil "~{~A~^ ~}" args))
+                     (t nil))))
+  ;; Contradictory modes are a configuration error, and they are checked BEFORE
+  ;; the model is resolved: asking the server which model to use, and printing
+  ;; it, only to then reject the invocation, is noise on the way to an error.
+  ;;
+  ;; A TUI and a prompt are contradictory — one is interactive, the other is a
+  ;; single turn that exits.  Say so rather than silently dropping one.
+  (when (and tui-p prompt)
+    (format *error-output*
+            "operandi: --repl is interactive, so it takes no prompt (got ~S)~%" prompt)
+    (sb-ext:exit :code 2))
+  (when (and ask-p (null prompt))
+    (format *error-output* "operandi: --ask needs a question~%")
+    (sb-ext:exit :code 2))
+  ;; --ask runs its own phase against a fresh question; --resume continues a
+  ;; saved conversation.  Both at once would silently drop one.
+  (when (and ask-p resume)
+    (format *error-output* "operandi: --ask and --resume are different modes; pick one~%")
+    (sb-ext:exit :code 2))
   ;; Resolve the local server's model in ONE place, for EVERY path that reaches
   ;; it — bare `operandi`, `--llama`, a "llama" config, the TUI.  A single-model
   ;; llama.cpp server needs no model field, but its ROUTER mode 400s a request
@@ -650,7 +731,7 @@
   ;; Not for --help: asking the server is a round-trip, and a usage request
   ;; should not depend on a server being up — nor print a model line above the
   ;; usage text.
-  (when (and (eq llm:*llm-backend* :llama) (not (equal cmd "--help")))
+  (when (and (eq llm:*llm-backend* :llama) (not help-p))
     (let ((reason (and llm:*llm-model* "named with -m")))
       (when (null llm:*llm-model*)
         (multiple-value-setq (llm:*llm-model* reason)
@@ -663,7 +744,7 @@
                     llm:*llm-url* llm:*llm-model* reason)
             (format t "~&operandi: llama ~A — ~A~%" llm:*llm-url* reason)))))
   ;; Preflight the model on any path that will actually run a turn (not bare help).
-  (unless (equal cmd "--help")
+  (unless help-p
     ;; A confidential session on a backend that cannot seal is a configuration
     ;; error, and it must be fatal BEFORE the first turn — not a warning that
     ;; scrolls past while plaintext goes out.
@@ -673,21 +754,18 @@
         (sb-ext:exit :code 2)))
     (preflight-or-die))
   (cond
-    ;; --resume alone or with an explicit tui command → resumed interactive TUI
-    ((and resume (or (null cmd) (member cmd '("tui" "shell" "repl") :test #'string-equal)))
-     (run-shell resume))
-    ;; --resume + a task → continue that session with one more (non-interactive) turn
-    (resume (run-resumed-task resume (format nil "~{~A~^ ~}" args)))
-    ;; Bare `operandi` (no task, no command) → the interactive TUI.
-    ((null cmd) (run-shell))
-    ;; --help [TOPIC]: the topic is the next argument, if any.
-    ((string= cmd "--help") (%usage (second args)))
-    ((member cmd '("tui" "shell" "repl") :test #'string-equal) (run-shell))
-    ;; operandi ask "why does X happen?" — the question phase, non-interactively
-    ((string-equal cmd "ask")
+    ;; --help [TOPIC]
+    (help-p (%usage help-topic))
+    ;; --repl, or no prompt at all → the interactive TUI.  --resume continues a
+    ;; saved session there.
+    ((or tui-p (null prompt)) (run-shell resume))
+    ;; --resume + a prompt → continue that session with one more turn.
+    (resume (run-resumed-task resume prompt))
+    ;; --ask "why does X happen?" — the question phase, non-interactively.
+    (ask-p
      (funcall (find-symbol "REPL" "OPERANDI.TUI")
-              :once (format nil "/ask ~{~A~^ ~}" (rest args)) :greet nil))
-    (t (run-once (format nil "~{~A~^ ~}" args) tool-names))))
+              :once (format nil "/ask ~A" prompt) :greet nil))
+    (t (run-once prompt tool-names))))
 
 ;; Exit cleanly once the command is done. Without this, an invocation that
 ;; lacks --non-interactive (e.g. `sbcl --noinform --load bin/operandi.lisp`)

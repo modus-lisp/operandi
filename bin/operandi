@@ -10,7 +10,7 @@
 # The core is rebuilt automatically on first run and whenever a source file is
 # newer than it. Usage mirrors bin/operandi.lisp:
 #   bin/operandi "task description"
-#   bin/operandi tui
+#   bin/operandi --repl
 #   bin/operandi --openrouter deepseek/deepseek-v4-flash "task"
 set -euo pipefail
 

@@ -19,13 +19,14 @@ gitignored) is built on first run and rebuilt automatically whenever a source
 file changes.
 
 ```
-bin/operandi tui                                  # interactive REPL
+bin/operandi                                      # interactive TUI (the default)
 bin/operandi "summarize what's in this directory" # one-shot task
+bin/operandi -p "summarize this directory"        # same, prompt spelled out
 bin/operandi --openrouter deepseek/deepseek-v4-flash "task"
-bin/operandi --openrouter deepseek/deepseek-v4-flash --effort low tui
+bin/operandi --openrouter deepseek/deepseek-v4-flash --effort low --repl
 ```
 
-Bare `bin/operandi` (no arguments) also opens the TUI. The default backend is
+With no prompt at all, `bin/operandi` opens the TUI. The default backend is
 a local llama.cpp on `http://localhost:9931`; `--openrouter` switches to
 OpenRouter (token at `~/.operandi/openrouter.token`).
 
@@ -97,31 +98,33 @@ without waiting for a core rebuild, or when the core can't be written:
 
 ```
 sbcl --non-interactive --load bin/operandi.lisp -- "your task here"
-sbcl --non-interactive --load bin/operandi.lisp -- tui
+sbcl --non-interactive --load bin/operandi.lisp -- --repl
 ```
 
 `bin/operandi --help` prints the same list of flags, commands and environment
 variables as the tables below, from the running binary. It is sectioned and
 coloured on a tty (plain when piped, or with `NO_COLOR` set), and
-`--help TOPIC` prints one section in full: `commands`, `backends`, `session`,
+`--help TOPIC` prints one section in full: `modes`, `backends`, `session`,
 `agent`, `env`, `files`, `diagnostics`, or `all`.
 
 ## CLI
 
 ```
-operandi [FLAGS] [COMMAND | "task description"]
+operandi [FLAGS] ["task description"]
 ```
 
-**Commands** (the first non-flag argument):
+There are no bare command words. Every mode is a flag, so a bare word is
+always prompt text — `operandi tui` is a task whose text is "tui".
 
-| Command | Meaning |
-|---------|---------|
-| *(none)* | interactive TUI |
-| `tui` / `shell` / `repl` | interactive TUI |
-| `ask <question>` | the question phase, non-interactively: rival hypotheses → a swarm settles them → an answer from the verdicts |
-| *anything else* | a one-shot task; the remaining arguments are joined into the prompt |
+| Mode | Meaning |
+|------|---------|
+| *(no prompt)* | interactive TUI — the default |
+| `"task description"` | a one-shot task; the remaining arguments are joined into the prompt |
+| `--prompt TEXT`, `-p TEXT` | the same, spelled out; giving both is an error |
+| `--ask "question"` | the question phase, non-interactively: rival hypotheses → a swarm settles them → an answer from the verdicts |
+| `--repl` | the interactive TUI, explicitly; a prompt together with `--repl` is an error |
 
-**Flags** (any order, before the command):
+**Flags** (any order):
 
 | Flag | Meaning |
 |------|---------|
@@ -138,8 +141,8 @@ operandi [FLAGS] [COMMAND | "task description"]
 | `--resume [ID]` | resume a saved session (latest if no ID); with a task, runs one more non-interactive turn |
 | `--tools A,B,C` | allow-list: exactly these tools |
 | `--no-tools X,Y` | the default tool set minus these |
-| `--tui` | force the interactive TUI |
-| `--help`, `-h` `[TOPIC]` | usage; `TOPIC` is one of `commands`, `backends`, `session`, `agent`, `env`, `files`, `diagnostics`, `all` |
+| `--repl` | the interactive TUI, explicitly (`--tui` is an older name for it) |
+| `--help`, `-h` `[TOPIC]` | usage; `TOPIC` is one of `modes`, `backends`, `session`, `agent`, `env`, `files`, `diagnostics`, `all` |
 
 An unknown `--flag` is rejected (exit 2) rather than sent to the agent as task
 text. Before any path that runs a turn, the model is preflighted — a bad slug
@@ -252,7 +255,7 @@ ln -s ~/workspace/modus-lisp/operandi/bin/operandi-sandbox-macos ~/.local/bin/op
 Then run `operandi` as usual, from the project you want it to work on:
 
 ```
-cd ~/projects/myapp && operandi tui
+cd ~/projects/myapp && operandi
 ```
 
 What the sandbox allows:

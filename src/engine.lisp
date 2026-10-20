@@ -2,7 +2,7 @@
 ;;;
 ;;; The agent loop. Sends a chat completion request to whatever
 ;;; backend operandi.llm is currently configured for — local llama.cpp
-;;; (port 8081) by default, or OpenRouter via set-backend-openrouter! — checks
+;;; (port 9931) by default, or OpenRouter via set-backend-openrouter! — checks
 ;;; if the response contains tool_calls, executes them, appends
 ;;; results to the conversation, and loops until the model returns a
 ;;; final text answer or we hit MAX-ITERATIONS.
@@ -62,7 +62,7 @@
   (let ((v (uiop:getenv name)))
     (or (and v (ignore-errors (parse-integer v :junk-allowed t))) default)))
 
-(defparameter *max-iterations* (%env-int "OPERANDI_MAX_ITERS" 500)
+(defvar *max-iterations* (%env-int "OPERANDI_MAX_ITERS" 500)
   "Hard cap on the agentic loop. Frontier models doing real analysis
    (e.g. computing correlations across thousands of rows) commonly
    want 30+ tool calls; with auto-compaction keeping context bounded
@@ -77,7 +77,7 @@
 (defparameter *chat-retry-sleep* 0.5
   "Initial sleep before retry, in seconds. Doubles per retry.")
 
-(defparameter *context-token-budget* (%env-int "OPERANDI_CONTEXT_BUDGET" 24000)
+(defvar *context-token-budget* (%env-int "OPERANDI_CONTEXT_BUDGET" 24000)
   "Primary compaction trigger: when the running conversation's estimated
    tokens exceed this, compact. Message count is a poor proxy — a single
    50KB tool result is ~12k tokens, so a few big outputs blow the model's
@@ -90,7 +90,7 @@
    This is a CEILING, not the trigger: compaction fires at COMPACT-THRESHOLD,
    which is this less *CONTEXT-HEADROOM*.")
 
-(defparameter *context-headroom*
+(defvar *context-headroom*
   (let ((e (uiop:getenv "OPERANDI_CONTEXT_HEADROOM")))
     (or (and e (ignore-errors (let ((v (read-from-string e)))
                                 (and (realp v) (< -0.001 v 0.9) (float v 1.0)))))
@@ -155,16 +155,16 @@
    append/compaction. Lets a host that aborts a turn (Ctrl-C in the TUI)
    salvage what the agent did before the interrupt instead of dropping it.")
 
-(defparameter *compact-keep-last* 14
+(defvar *compact-keep-last* 14
   "Number of recent messages preserved verbatim during compaction.")
 
-(defparameter *tool-result-keep-chars* 1200
+(defvar *tool-result-keep-chars* 1200
   "Tier-1 compaction (before any LLM summary) truncates each large OLD
    tool result to this many leading chars + a note. Big tool outputs are
    the bulk of the tokens, so trimming them reclaims most space cheaply
    and keeps the conversation's structure intact.")
 
-(defparameter *compact-after-messages* 60
+(defvar *compact-after-messages* 60
   "DEPRECATED — compaction is token-driven now (see *CONTEXT-TOKEN-BUDGET*).
    Retained so any host that set it doesn't break; no longer consulted.")
 
@@ -188,7 +188,7 @@
                             (+ (* (- 1d0 alpha) *chars-per-token*)
                                (* alpha observed))))))))
 
-(defparameter *image-tokens* 1500
+(defvar *image-tokens* 1500
   "Estimated prompt tokens per attached image. Providers bill a screenshot
    at roughly 1-2k regardless of its base64 length, which is what the
    content string would otherwise be measured by.")
@@ -296,7 +296,7 @@ decision, and user message from all of them. Later spans supersede earlier
 ones where they conflict (a task that was pending and then completed is
 completed). Do not shorten for brevity — nothing may be lost.")
 
-(defparameter *compaction-max-tokens* 8192
+(defvar *compaction-max-tokens* 8192
   "Output cap for one summarizer call. The brief has nine sections and
    quotes code, and on OpenRouter a reasoning model's thinking counts
    against this too; 4096 cut section 3 off mid-snippet.")
@@ -454,7 +454,7 @@ completed). Do not shorten for brevity — nothing may be lost.")
                                   (- (length c) *tool-result-keep-chars*)))
                       m))))
 
-(defparameter *offload-dir*
+(defvar *offload-dir*
   (namestring (merge-pathnames ".operandi/offload/" (user-homedir-pathname)))
   "Where compaction OFFLOADS the raw displaced middle. Compaction is then
    reversible — nothing is destroyed; the agent can Read the file to recover
@@ -540,13 +540,13 @@ completed). Do not shorten for brevity — nothing may be lost.")
           (namestring path)))
     (error () nil)))
 
-(defparameter *stall-repeat* 4
+(defvar *stall-repeat* 4
   "How many times the SAME (tool, arguments) pair may repeat before the run is
    treated as stalled. Four rather than two: a retry is normal, a second look at
    a file after editing it is normal, and a legitimate sweep can read the same
    path twice. Four identical calls in a row is not a sweep.")
 
-(defparameter *stall-window* 12
+(defvar *stall-window* 12
   "How many recent tool calls the no-progress check looks at. If a window this
    long contains no call the run has not already made, nothing new is being
    touched.")
@@ -889,7 +889,7 @@ another tool or give a final answer.")
 
 (defun ht (&rest pairs) (apply #'llm:ht pairs))
 
-(defparameter *do-chat-max-tokens* (%env-int "OPERANDI_MAX_TOKENS" 16384)
+(defvar *do-chat-max-tokens* (%env-int "OPERANDI_MAX_TOKENS" 16384)
   "Default max-tokens for each chat call inside the agent loop. Override
    via OPERANDI_MAX_TOKENS, DEFPARAMETER, or LET.
 
@@ -902,13 +902,13 @@ another tool or give a final answer.")
    still — the thinking trace is spent from the same budget before a single
    argument byte is emitted.")
 
-(defparameter *do-chat-disable-reasoning* nil
+(defvar *do-chat-disable-reasoning* nil
   "If T (and backend is OpenRouter), send reasoning.enabled=false in the
    request body. Set for models that can't compose reasoning_content with
    the tool_calls protocol — chiefly Qwen-thinking variants. Models that
    require reasoning (Minimax M2/M2.5) will 400 if this is enabled.")
 
-(defparameter *max-tool-calls* nil
+(defvar *max-tool-calls* nil
   "Optional hard cap on total tool calls within a single RUN invocation,
    counting across all iterations. When exceeded, the next tool call is
    short-circuited with a synthetic 'tool budget exhausted' result so the
@@ -916,7 +916,7 @@ another tool or give a final answer.")
    Set to e.g. 5 in research-heavy calls where some models (Minimax M2)
    will otherwise search 15+ times.")
 
-(defparameter *prompt-cache* t
+(defvar *prompt-cache* t
   "When T and the model is an Anthropic (Claude) model — which, unlike
    OpenAI/DeepSeek/most OpenRouter providers, does NOT cache prompt
    prefixes automatically — mark the large, stable system message with a
@@ -952,7 +952,7 @@ another tool or give a final answer.")
           out)
         v)))
 
-(defparameter *stream* t
+(defvar *stream* t
   "Stream chat completions (SSE) instead of one blocking response. Gives
    time-to-first-token and live output, and makes a turn interruptible
    mid-generation (Ctrl-C aborts the read). Same request otherwise; the
@@ -1393,7 +1393,7 @@ another tool or give a final answer.")
       "tool_call_id" tool-call-id
       "content" (or content "")))
 
-(defparameter *max-empty-turns* 2
+(defvar *max-empty-turns* 2
   "How many times to nudge a model that ends a turn with empty content
    AND no tool call (a stall — often a null-content final message) before
    giving up and salvaging. Each nudge costs one iteration.")

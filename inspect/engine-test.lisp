@@ -39,12 +39,16 @@
 
 ;;; ---- scripted backend ----------------------------------------------
 
-(defun assistant-resp (&key content tool-calls)
+(defun assistant-resp (&key content tool-calls finish)
   "A parsed chat-completion response, shaped like the real API. CONTENT
-   NIL becomes JSON null (the symbol NULL, as json-simple would produce)."
+   NIL becomes JSON null (the symbol NULL, as json-simple would produce).
+   FINISH, if given, is the choice's finish_reason (\"length\" = cut off
+   at the output cap)."
   (let ((m (llm:ht "role" "assistant" "content" (or content 'null))))
     (when tool-calls (setf (gethash "tool_calls" m) tool-calls))
-    (llm:ht "choices" (vector (llm:ht "message" m)))))
+    (let ((choice (llm:ht "message" m)))
+      (when finish (setf (gethash "finish_reason" choice) finish))
+      (llm:ht "choices" (vector choice)))))
 
 (defun bash-call (id cmd)
   (llm:ht "id" id "type" "function"
@@ -107,6 +111,16 @@
                     (assistant-resp :tool-calls (vector (bash-call "c2" "echo two")))
                     (assistant-resp :content 'null)
                     (assistant-resp :content "FINISHED"))))
+
+  ;; A turn CUT OFF at the output cap after writing some text is not a final
+  ;; answer: the text is usually the lead-in to a tool call that the cap
+  ;; swallowed ("Now the test files.", "First the header:").  Twice in one
+  ;; afternoon a worker ended its whole run on exactly that.
+  (check "text cut off at the output cap is not taken as the answer"
+    (string= "DONE"
+             (final (assistant-resp :content "Recon done. First the header:"
+                                    :finish "length")
+                    (assistant-resp :content "DONE"))))
 
   ;; run returns a usage struct (calls/tokens/cost) as its 4th value.
   (check "run returns a usage struct as its 4th value"

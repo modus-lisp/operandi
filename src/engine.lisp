@@ -1523,6 +1523,27 @@ another tool or give a final answer.")
            ;; Continue loop (compaction happens at the top of the next
            ;; iteration, before the next send).
            )
+          ((and text (equal (response-finish-reason parsed) "length"))
+           ;; Text, but CUT OFF at the output cap: not a final answer.  It is
+           ;; almost always the lead-in to a tool call the cap swallowed ("Now
+           ;; the test files.", "First the header:"), and taking it as the
+           ;; answer ended real runs halfway through their work.  The partial
+           ;; turn is already in the history; say what happened and go on.
+           (when verbose
+             (format t "~&[operandi] turn with text truncated at the output cap (~A tok); continuing~%"
+                     *do-chat-max-tokens*))
+           (setf messages
+                 (append messages
+                         (list (ht "role" "user" "content"
+                                   (format nil
+                                           "Your last turn was cut off at the ~A-token ~
+                                            output limit, so its tool call (if any) was ~
+                                            lost and the task is NOT finished. Continue ~
+                                            from where you were: take the single next ~
+                                            step, and keep each tool call's payload well ~
+                                            under that limit (write large files in ~
+                                            several pieces)."
+                                           *do-chat-max-tokens*))))))
           (text
            ;; Real final answer; we're done.
            (when verbose (format t "~&[operandi] done after ~A iter~%" n))

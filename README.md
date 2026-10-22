@@ -166,6 +166,7 @@ the `/effort` command.
 | `OPERANDI_CONTEXT_BUDGET` | compaction threshold in tokens |
 | `OPERANDI_CONTEXT_HEADROOM` | fraction of the budget kept free (default 0.2) |
 | `OPERANDI_MAX_ITERS` | hard cap on the agentic loop (default 500) |
+| `OPERANDI_WRAPUP_ITERS` | model turns granted after that cap to write findings up before the run stops (default 3; 0 = stop at the cap) |
 | `OPERANDI_EFFORT` | same as `--effort` |
 | `OPERANDI_WORKER_MODEL` | same as `--worker-model` |
 | `OPERANDI_SEARCH` | web-search backend: `openrouter`, `searxng`, `brave`, `auto` |

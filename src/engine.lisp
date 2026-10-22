@@ -35,6 +35,7 @@
   (:export #:run
            #:preflight-model
            #:*max-iterations*
+           #:*wrapup-iterations*
            #:*max-empty-turns*
            #:*prompt-cache*
            #:*stream*
@@ -61,6 +62,12 @@
    without editing the source: OPERANDI_MAX_ITERS / OPERANDI_CONTEXT_BUDGET."
   (let ((v (uiop:getenv name)))
     (or (and v (ignore-errors (parse-integer v :junk-allowed t))) default)))
+
+(defvar *wrapup-iterations* (%env-int "OPERANDI_WRAPUP_ITERS" 3)
+  "Model turns granted after the iteration cap so the worker can write up what
+   it has (findings to disk, then a final answer) instead of the run ending on
+   the cap with nothing written. Bounded: once these are spent the run stops.
+   Override via OPERANDI_WRAPUP_ITERS; 0 restores the bare stop at the cap.")
 
 (defvar *max-iterations* (%env-int "OPERANDI_MAX_ITERS" 500)
   "Hard cap on the agentic loop. Frontier models doing real analysis
@@ -1461,7 +1468,8 @@ another tool or give a final answer.")
          ;; global is refused ("a thread stored one of its own objects into
          ;; shared memory") -- every real-backend turn ended in refusal.
          (*chars-per-token* *chars-per-token*)
-         (*last-offload-path* nil))
+         (*last-offload-path* nil)
+         (wrapping-up nil))   ; the cap has been reached and wrap-up turns granted
     (declare (special hooks:*current-run-id*
                        tools:*file-read-state*
                        tools:*todos*
@@ -1475,28 +1483,55 @@ another tool or give a final answer.")
     (note-progress messages)
     (loop
       (incf n)
-      (when (> n max-iterations)
+      ;; FIRST TRIP OF THE CAP: do not stop yet.  Grant a few final turns so the
+      ;; worker can write its findings out (to a file, if the task has one) and
+      ;; give an answer, rather than ending the run on the cap with nothing on
+      ;; disk.  The grant is bounded: the second trip falls through to the stop
+      ;; below.  The note goes in now, so the model's view of the cap is the same
+      ;; whether it answers in the wrap-up or the run stops there.
+      (when (and (> n max-iterations) (not wrapping-up) (plusp *wrapup-iterations*))
+        (setf wrapping-up t
+              max-iterations (+ n *wrapup-iterations* -1))
         (when verbose
-          (format t "~&[operandi] hit max-iterations ~A; stopping~%"
-                  max-iterations))
+          (format t "~&[operandi] hit max-iterations ~A; granting ~D wrap-up turn~:P~%"
+                  (- n 1) *wrapup-iterations*))
         ;; SAY SO IN THE HISTORY, not only in the return value.  The reply string
         ;; goes to whoever called RUN; the MESSAGES go on to the next turn, and
         ;; without this the model's view is a tool result followed, for no stated
         ;; reason, by the operator saying "continue" — so it guesses what to
-        ;; continue, and guessing wrong looks like it forgot the task.  The
-        ;; output-cap path below already does this; the iteration cap is the same
-        ;; kind of interruption and deserves the same sentence.  "Your last"
+        ;; continue, and guessing wrong looks like it forgot the task.  "Your last"
         ;; prefix is load-bearing: RENDER-USER-TURNS keys on it to tell an engine
         ;; nudge from something the operator actually asked for.
         (setf messages
               (append messages
                       (list (ht "role" "user" "content"
                                 (format nil
-                                        "Your last turn was stopped at the ~A-iteration cap ~
+                                        "Your last turn was stopped at the ~D-iteration cap ~
                                          before it finished. Nothing is wrong and nothing was ~
-                                         lost — the work is simply unfinished. Pick up from the ~
-                                         last completed step; say what remains before continuing ~
-                                         it." max-iterations)))))
+                                         lost — the work is simply unfinished. This is your final ~
+                                         stretch: you have ~D model turn~:P left. Stop starting new ~
+                                         work. Write up what you have now — the findings, the ~
+                                         evidence for each, and what remains unverified. If the ~
+                                         task calls for a file, write it to disk first, then give ~
+                                         your answer."
+                                        (- n 1) *wrapup-iterations*))))))
+      (when (> n max-iterations)
+        (when verbose
+          (format t "~&[operandi] hit max-iterations ~A; stopping~%"
+                  max-iterations))
+        ;; No wrap-up was granted (OPERANDI_WRAPUP_ITERS=0): say so in the history
+        ;; here, as the grant above does.  "Your last" prefix is load-bearing, as
+        ;; there.
+        (unless wrapping-up
+          (setf messages
+                (append messages
+                        (list (ht "role" "user" "content"
+                                  (format nil
+                                          "Your last turn was stopped at the ~D-iteration cap ~
+                                           before it finished. Nothing is wrong and nothing was ~
+                                           lost — the work is simply unfinished. Pick up from the ~
+                                           last completed step; say what remains before continuing ~
+                                           it." max-iterations))))))
         ;; ...and hand back a history that is under budget, like every other exit
         ;; from this loop.  The compaction below runs before each SEND, so bailing
         ;; out here used to be the one path that returned an uncompacted history

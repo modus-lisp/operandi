@@ -54,6 +54,7 @@
 (defpackage #:operandi-cli
   (:use #:cl)
   (:local-nicknames (#:eng #:operandi.engine)
+                    (#:session #:operandi.session)
                     (#:llm #:operandi.llm)
                     (#:json #:json-simple)
                     (#:tools #:operandi.tools)))
@@ -80,12 +81,20 @@
    The model's reasoning trace goes to STDERR, dimmed: it is the scratchpad,
    not the answer, and on a tool-calling turn it is often the ONLY place the
    model says what it is about to do.  Keeping it off stdout means a piped
-   `operandi \"task\" > answer.txt` still gets just the answer."
-  (let* ((buf (make-string-output-stream))
+   `operandi \"task\" > answer.txt` still gets just the answer.
+
+   The run is SAVED as a session, the same record the TUI keeps, so a run that
+   hits the iteration cap (or is killed) can be picked up with
+   `operandi --resume ID \"write up what you have\"` rather than started over."
+  (let* ((saved (session:make-session))
+         (buf (make-string-output-stream))
          (dim (%stderr-dim-p))
          (think-open nil)
          (think-line (make-string-output-stream))
          (eng:*on-token* (lambda (s) (write-string s buf) (write-string s) (force-output)))
+         ;; durable DURING the run, as the TUI's turns are: a killed run leaves its
+         ;; in-flight history on disk, not nothing
+         (eng:*on-progress* (lambda (live) (session:checkpoint-session saved live)))
          (eng:*on-reasoning*
            (lambda (s)
              ;; Reasoning arrives in token-sized fragments; buffer to the next
@@ -104,15 +113,29 @@
                                 (setf start (1+ nl)))
                             (t (return)))))))
     (multiple-value-bind (text history iters usage) (eng:run prompt :tool-names tool-names)
-      (declare (ignore history))
+      ;; commit the run to its session, as RUN-TURN does for a TUI turn
+      (setf (session:session-history saved) history)
+      (incf (gethash :turns saved))
+      (session:session-add-usage saved usage)
+      (session:persist-session saved)
       (when think-open
         (let ((tail (get-output-stream-string think-line)))
           (when (plusp (length tail))
             (format *error-output* "~@[~C[2m~]│ ~A~@[~C[0m~]~%" (and dim #\Escape) tail (and dim #\Escape)))))
-      (let ((streamed (string-right-trim '(#\Space #\Newline) (get-output-stream-string buf))))
-        (unless (string= (string-right-trim '(#\Space #\Newline) (or text "")) streamed)
+      ;; BUF holds EVERY turn's streamed text, not just the final one, so the
+      ;; answer is already on screen when it is the tail of BUF.  Comparing for
+      ;; equality reprinted it after any multi-turn run (the wrap-up made that
+      ;; common); a suffix test does not.  Reprint only what did not stream
+      ;; (a synthetic or salvaged answer).
+      (let* ((streamed (string-right-trim '(#\Space #\Newline) (get-output-stream-string buf)))
+             (final (string-right-trim '(#\Space #\Newline) (or text "")))
+             (n (length final)))
+        (unless (and (<= n (length streamed))
+                     (string= final streamed :start2 (- (length streamed) n)))
           (format t "~&~A" text)))
       (format t "~&~%[~A iters, ~A]~%" iters (llm:usage-summary usage))
+      (format t "~&session ~A saved; to continue: operandi --resume ~A \"<what to do next>\"~%"
+              (gethash :id saved) (gethash :id saved))
       (let ((err (funcall (find-symbol "MIRROR-TURN" "OPERANDI.RC") prompt (or text ""))))
         (when err (format *error-output* "~&operandi: ~A~%" err))))))
 

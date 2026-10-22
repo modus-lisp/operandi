@@ -633,7 +633,7 @@
                          (operandi.subagent:run-investigate
                           hyps
                           (format nil "Project: ~A~%The question being answered: ~A" project question)
-                          operandi.subagent:*ask-worker-tools*
+                          (operandi.subagent:ask-worker-tools)
                           1)
                        (declare (ignore text))
                        (dolist (r records)

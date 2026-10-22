@@ -39,6 +39,7 @@
            #:parse-worker-model
            #:*ask-max-hypotheses*
            #:*ask-worker-tools*
+           #:ask-worker-tools
            #:install-thread-error-guard
            #:*swarm-deadline*
            #:run-investigate
@@ -46,7 +47,9 @@
            #:elicit-hypotheses
            #:project-findings
            #:findings-brief
-           #:synthesis-prompt))
+           #:synthesis-prompt
+           #:*ask-synthesis-tools*
+           #:ask-structured))
 
 (in-package #:operandi.subagent)
 
@@ -833,6 +836,13 @@ start may outlive you: kill every background process before you report."
    to its scratch dir and runs it in a SEPARATE sbcl through Bash, where it
    can crash all it likes.")
 
+(defun ask-worker-tools ()
+  "*ASK-WORKER-TOOLS* plus the external MCP tools a worker may use: those a
+   server marks read-only, or every tool of a server configured \"workers\": true."
+  (append *ask-worker-tools*
+          (remove-if (lambda (n) (member n *ask-worker-tools* :test #'string=))
+                     tools:*extra-worker-tools*)))
+
 (defun parse-hypothesis-list (text)
   "The JSON array of strings in TEXT — tolerating a ```json fence or prose
    around it, which models add despite being told not to. NIL if none."
@@ -911,6 +921,75 @@ high confidence — that work is done."
           question
           (and prior (plusp (length prior)) prior)
           (json:stringify (coerce records 'vector) :pretty t)))
+
+;;; ---------------------- the question phase, as data -------------------
+;;; /ask is a TUI turn: it paints progress and hands the synthesis to the
+;;; session. A harness (the MCP server, a script, another agent) wants the
+;;; same pipeline as a VALUE -- the hypotheses, every verdict record, the
+;;; answer and the cost -- so it can reason over the claims instead of
+;;; scraping a terminal. ASK-STRUCTURED is that: ledger -> hypotheses (the
+;;; caller's, or elicited) -> swarm -> optional synthesis, returned as one
+;;; hash table that JSON:STRINGIFY can print. The verdicts are recorded to
+;;; the ledger exactly as /ask records them (by RUN-INVESTIGATE).
+
+(defparameter *ask-synthesis-tools* '("Read" "Grep" "Glob" "Bash" "Findings")
+  "What the synthesis turn may use: enough to follow up an undetermined or
+   conflicting verdict, nothing that edits or delegates.")
+
+(defun %usage-ht (u)
+  (if u
+      (llm:ht "cost_usd" (llm:usage-cost-usd u)
+              "prompt_tokens" (llm:usage-prompt-tokens u)
+              "completion_tokens" (llm:usage-completion-tokens u)
+              "calls" (llm:usage-calls u))
+      'null))
+
+(defun ask-structured (question &key hypotheses context (synthesize t) worker-model)
+  "Run the question phase non-interactively and return a hash table:
+   question, project, commit, hypotheses, hypotheses_source (\"caller\" or
+   \"elicited\"), prior_findings, verdicts (the records RUN-INVESTIGATE
+   returns), answer (NULL unless SYNTHESIZE), timed_out, debris and usage.
+   HYPOTHESES given = settle exactly those; NIL = elicit rivals first.
+   Signals an ERROR when there is nothing to settle."
+  (let* ((project (namestring (uiop:getcwd)))
+         (commit (%git-head))
+         (prior-records (project-findings project))
+         (prior (and prior-records (findings-brief prior-records)))
+         (total (llm:make-usage))
+         (source (if hypotheses "caller" "elicited"))
+         (hyps (or hypotheses
+                   (llm:with-usage-accounting (u)
+                     (prog1 (elicit-hypotheses question :prior prior)
+                       (llm:usage-incf total u))))))
+    (unless hyps
+      (error "no hypotheses to settle: the model returned none usable for ~S" question))
+    (multiple-value-bind (text records batch debris timed-out)
+        (run-investigate hyps
+                         (format nil "Project: ~A~%The question being answered: ~A~@[~%~%~A~]"
+                                 project question context)
+                         (ask-worker-tools) 1 worker-model)
+      (declare (ignore text))
+      (llm:usage-incf total batch)
+      (let ((answer
+              (when synthesize
+                (multiple-value-bind (final msgs n usage)
+                    (eng:run (synthesis-prompt question prior records)
+                             :tool-names *ask-synthesis-tools* :verbose nil)
+                  (declare (ignore msgs n))
+                  (llm:usage-incf total usage)
+                  final))))
+        (llm:ht "question" question
+                "project" project
+                "commit" (or commit 'null)
+                "hypotheses" (coerce hyps 'vector)
+                "hypotheses_source" source
+                "prior_findings" (length prior-records)
+                "verdicts" (coerce records 'vector)
+                "answer" (or answer 'null)
+                "timed_out" (and timed-out t)
+                "debris" (coerce debris 'vector)
+                "worker_model" (or worker-model *worker-model* 'null)
+                "usage" (%usage-ht total))))))
 
 (tools:define-tool "Investigate"
     (:description "Settle several INDEPENDENT hypotheses in parallel and get

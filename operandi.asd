@@ -47,6 +47,7 @@
      (:file "safefetch" :depends-on ("http" "llm" "text"))    ; operandi.safefetch
      (:file "hooks"    :depends-on ("store"))                 ; operandi.hooks
      (:file "tools"    :depends-on ("llm" "search" "hooks" "safefetch" "text"))  ; operandi.tools
+     (:file "mcp"      :depends-on ("http" "llm" "tools" "text"))                ; operandi.mcp (MCP client)
      (:file "engine"   :depends-on ("http" "llm" "tools" "hooks" "safefetch"))   ; operandi.engine
      (:file "subagent" :depends-on ("llm" "tools" "engine"))  ; operandi.subagent
      (:file "cron"     :depends-on ("engine"))                ; operandi.cron

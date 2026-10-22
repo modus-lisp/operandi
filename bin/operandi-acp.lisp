@@ -38,5 +38,8 @@
     (error (e) (format *error-output* "~&operandi-acp: MCP config: ~A~%" e))))
 
 ;; Serve until the client closes stdin. JSON-RPC goes to the captured stdout.
+;; Settings seeded from the environment are re-read from this run's, not the
+;; image's build (see src/env.lisp).
+(funcall (find-symbol "RESTORE-ENVIRONMENT" "OPERANDI.ENV"))
 (funcall (find-symbol "SERVE" "OPERANDI.ACP") :out cl-user::*acp-stdout*)
 (sb-ext:exit :code 0)

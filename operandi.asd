@@ -40,7 +40,8 @@
   :components
   ((:module "src"
     :components
-    ((:file "text")                                           ; operandi.text
+    ((:file "env")                                            ; operandi.env
+     (:file "text")                                           ; operandi.text
      (:file "http")                                           ; operandi.http
      (:file "payments" :depends-on ("http"))                  ; operandi.payments
      (:file "ppq"      :depends-on ("http"))                  ; operandi.ppq
@@ -48,13 +49,13 @@
      (:file "llm"      :depends-on ("http" "ppq" "maple"))    ; operandi.llm
      (:file "actor")                                          ; operandi.actor
      (:file "store")                                          ; operandi.store
-     (:file "search"   :depends-on ("http" "llm"))            ; operandi.search
+     (:file "search"   :depends-on ("env" "http" "llm"))            ; operandi.search
      (:file "safefetch" :depends-on ("http" "llm" "text"))    ; operandi.safefetch
      (:file "hooks"    :depends-on ("store"))                 ; operandi.hooks
      (:file "tools"    :depends-on ("llm" "search" "hooks" "safefetch" "text"))  ; operandi.tools
      (:file "mcp"      :depends-on ("http" "llm" "tools" "text"))                ; operandi.mcp (MCP client)
-     (:file "engine"   :depends-on ("http" "llm" "tools" "hooks" "safefetch"))   ; operandi.engine
-     (:file "subagent" :depends-on ("llm" "tools" "engine"))  ; operandi.subagent
+     (:file "engine"   :depends-on ("env" "http" "llm" "tools" "hooks" "safefetch"))   ; operandi.engine
+     (:file "subagent" :depends-on ("env" "llm" "tools" "engine"))  ; operandi.subagent
      (:file "cron"     :depends-on ("engine"))                ; operandi.cron
      (:file "session"  :depends-on ("llm"))                   ; operandi.session
      (:file "sessiontree")                                    ; operandi.sessiontree

@@ -126,7 +126,7 @@
           ((and (find #\/ k) (not (find #\Space k))) (values k t))
           (t (values nil nil)))))
 
-(defvar *worker-model*
+(operandi.env:defenv *worker-model*
   (let ((e (uiop:getenv "OPERANDI_WORKER_MODEL")))
     (and e (nth-value 0 (parse-worker-model e))))
   "Model the subagent tier runs on (Task, Fan, Spawn, Investigate workers),
@@ -202,13 +202,14 @@
     (when eng:*subagent-usage* (llm:usage-incf eng:*subagent-usage* batch))
     batch))
 
-(defparameter *swarm-deadline*
+(operandi.env:defenv *swarm-deadline*
   (let ((e (uiop:getenv "OPERANDI_SWARM_DEADLINE")))
     (or (and e (ignore-errors (parse-integer e))) 900))
   "Seconds an Investigate swarm may run before its stragglers are stopped and
    the harness carries on with the verdicts it has. A swarm that cannot finish
    must end LATE and PARTIAL, never hang: one live /ask sat for 33 hours after
-   the laptop slept mid-run, holding the one verdict it had got.")
+   the laptop slept mid-run, holding the one verdict it had got."
+  defparameter)
 
 (defun %stop-workers (threads)
   "Stop every thread in THREADS still running, then give them a moment to

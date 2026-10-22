@@ -49,14 +49,16 @@
           ((member k '("auto" "") :test #'string=) (values nil t))
           (t (values nil nil)))))
 
-(defparameter *backend*
+(operandi.env:defenv *backend*
   (let ((e (uiop:getenv "OPERANDI_SEARCH"))) (and e (parse-backend e)))
   "Forced search backend, or NIL to follow the LLM backend (see file header).
-   Seeded from OPERANDI_SEARCH; /search in the TUI sets it.")
+   Seeded from OPERANDI_SEARCH; /search in the TUI sets it."
+  defparameter)
 
-(defparameter *searxng-url*
+(operandi.env:defenv *searxng-url*
   (or (uiop:getenv "SEARXNG_URL") "http://127.0.0.1:8080")
-  "Base URL of a SearXNG instance. The sandbox profile allows localhost:8080.")
+  "Base URL of a SearXNG instance. The sandbox profile allows localhost:8080."
+  defparameter)
 
 (defparameter *token-file*
   (merge-pathnames ".operandi/brave-search.token" (user-homedir-pathname))

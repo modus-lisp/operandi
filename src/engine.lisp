@@ -38,6 +38,8 @@
            #:*payment-required-hook* #:payment-required-p #:handle-payment-required
            #:*max-iterations*
            #:*wrapup-iterations*
+           #:*wrapup-grace*
+           #:ended-at-cap-p
            #:*max-empty-turns*
            #:*prompt-cache*
            #:*stream*
@@ -65,13 +67,20 @@
   (let ((v (uiop:getenv name)))
     (or (and v (ignore-errors (parse-integer v :junk-allowed t))) default)))
 
-(defvar *wrapup-iterations* (%env-int "OPERANDI_WRAPUP_ITERS" 3)
+(operandi.env:defenv *wrapup-iterations* (%env-int "OPERANDI_WRAPUP_ITERS" 3)
   "Model turns granted after the iteration cap so the worker can write up what
    it has (findings to disk, then a final answer) instead of the run ending on
    the cap with nothing written. Bounded: once these are spent the run stops.
    Override via OPERANDI_WRAPUP_ITERS; 0 restores the bare stop at the cap.")
 
-(defvar *max-iterations* (%env-int "OPERANDI_MAX_ITERS" 500)
+(operandi.env:defenv *wrapup-grace* (%env-int "OPERANDI_WRAPUP_GRACE" 2)
+  "Extra turns granted AFTER the announced wrap-up turns, unannounced.  The
+   model is told its last turn is its last; a model that miscounts (seen:
+   ds41f, told \"3 turns left\", spent its third believing it had one more)
+   gets these too, each repeating the final-turn warning, so its write-up
+   still lands.  Override via OPERANDI_WRAPUP_GRACE; 0 = exactly as announced.")
+
+(operandi.env:defenv *max-iterations* (%env-int "OPERANDI_MAX_ITERS" 500)
   "Hard cap on the agentic loop. Frontier models doing real analysis
    (e.g. computing correlations across thousands of rows) commonly
    want 30+ tool calls; with auto-compaction keeping context bounded
@@ -86,7 +95,7 @@
 (defparameter *chat-retry-sleep* 0.5
   "Initial sleep before retry, in seconds. Doubles per retry.")
 
-(defvar *context-token-budget* (%env-int "OPERANDI_CONTEXT_BUDGET" 24000)
+(operandi.env:defenv *context-token-budget* (%env-int "OPERANDI_CONTEXT_BUDGET" 24000)
   "Primary compaction trigger: when the running conversation's estimated
    tokens exceed this, compact. Message count is a poor proxy — a single
    50KB tool result is ~12k tokens, so a few big outputs blow the model's
@@ -99,7 +108,7 @@
    This is a CEILING, not the trigger: compaction fires at COMPACT-THRESHOLD,
    which is this less *CONTEXT-HEADROOM*.")
 
-(defvar *context-headroom*
+(operandi.env:defenv *context-headroom*
   (let ((e (uiop:getenv "OPERANDI_CONTEXT_HEADROOM")))
     (or (and e (ignore-errors (let ((v (read-from-string e)))
                                 (and (realp v) (< -0.001 v 0.9) (float v 1.0)))))
@@ -915,7 +924,7 @@ another tool or give a final answer.")
 
 (defun ht (&rest pairs) (apply #'llm:ht pairs))
 
-(defvar *do-chat-max-tokens* (%env-int "OPERANDI_MAX_TOKENS" 16384)
+(operandi.env:defenv *do-chat-max-tokens* (%env-int "OPERANDI_MAX_TOKENS" 16384)
   "Default max-tokens for each chat call inside the agent loop. Override
    via OPERANDI_MAX_TOKENS, DEFPARAMETER, or LET.
 
@@ -1563,6 +1572,20 @@ another tool or give a final answer.")
                        (when (and (stringp c) (plusp (length c)))
                          (format nil "[no final summary from the model; last tool result follows]~%~A" c))))))
 
+(defun ended-at-cap-p (history)
+  "True if the run that produced HISTORY ended at its iteration cap: the last
+   user message in it is the engine's cap or wrap-up note, not a later request.
+   A resumed session uses this to tell the model the cap is gone -- without
+   that, it reads \"you have 3 model turns left\" as still true (seen: \"I have
+   3 turns presumably\") and rations a fresh budget."
+  (let ((c (loop for m in (reverse history)
+                 for c = (and (equal (gethash "role" m) "user")
+                              (llm:content-text (gethash "content" m)))
+                 when (and c (plusp (length c))) return c)))
+    (and c (uiop:string-prefix-p "Your last" c)
+         (or (search "-iteration cap" c) (search "wrap-up turn" c))
+         t)))
+
 (defun run (initial-prompt &key
                              (system nil)
                              (tool-names (tools:default-tools))
@@ -1601,7 +1624,7 @@ another tool or give a final answer.")
          ;; shared memory") -- every real-backend turn ended in refusal.
          (*chars-per-token* *chars-per-token*)
          (*last-offload-path* nil)
-         (wrapping-up nil))   ; the cap has been reached and wrap-up turns granted
+         (wrapping-up nil))   ; N at which the cap tripped and wrap-up turns were granted
     (declare (special hooks:*current-run-id*
                        tools:*file-read-state*
                        tools:*todos*
@@ -1622,11 +1645,11 @@ another tool or give a final answer.")
       ;; below.  The note goes in now, so the model's view of the cap is the same
       ;; whether it answers in the wrap-up or the run stops there.
       (when (and (> n max-iterations) (not wrapping-up) (plusp *wrapup-iterations*))
-        (setf wrapping-up t
-              max-iterations (+ n *wrapup-iterations* -1))
+        (setf wrapping-up n
+              max-iterations (+ n *wrapup-iterations* (max 0 *wrapup-grace*) -1))
         (when verbose
-          (format t "~&[operandi] hit max-iterations ~A; granting ~D wrap-up turn~:P~%"
-                  (- n 1) *wrapup-iterations*))
+          (format t "~&[operandi] hit max-iterations ~A; granting ~D wrap-up turn~:P (+~D unannounced)~%"
+                  (- n 1) *wrapup-iterations* (max 0 *wrapup-grace*)))
         ;; SAY SO IN THE HISTORY, not only in the return value.  The reply string
         ;; goes to whoever called RUN; the MESSAGES go on to the next turn, and
         ;; without this the model's view is a tool result followed, for no stated
@@ -1647,6 +1670,29 @@ another tool or give a final answer.")
                                          task calls for a file, write it to disk first, then give ~
                                          your answer."
                                         (- n 1) *wrapup-iterations*))))))
+;; THE COUNTDOWN.  The grant above says "N turns left" ONCE, and a model
+      ;; has to keep the count itself -- ds41f, told 3, spent its third turn
+      ;; believing it had one more and never wrote its file.  So every later
+      ;; wrap-up turn is told how many remain, and from the last ANNOUNCED turn
+      ;; on, that this one is the last: the unannounced grace turns
+      ;; (*WRAPUP-GRACE*) repeat that warning rather than counting down further.
+      (when (and wrapping-up (> n wrapping-up) (<= n max-iterations))
+        (let ((announced-left (- (+ wrapping-up *wrapup-iterations*) n)))
+          (setf messages
+                (append messages
+                        (list (ht "role" "user" "content"
+                                  (if (<= announced-left 1)
+                                      (format nil
+                                              "Your last turn used a wrap-up turn. THIS IS YOUR FINAL ~
+                                               TURN: the run stops after it. Write your findings now, in ~
+                                               this turn -- to disk first if the task calls for a file -- ~
+                                               and give your answer. Any other tool call is wasted.")
+                                      (format nil
+                                              "Your last turn used a wrap-up turn; ~D left, this one ~
+                                               included. Do not start new work: write up what you ~
+                                               have (to disk first if the task calls for a file), ~
+                                               then answer."
+                                              announced-left))))))))
       (when (> n max-iterations)
         (when verbose
           (format t "~&[operandi] hit max-iterations ~A; stopping~%"

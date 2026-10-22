@@ -692,6 +692,12 @@
           (t (llm:set-backend-openrouter! :model m)))
     (eng:apply-backend-defaults)))
 
+;; The core was saved with the environment of its BUILD.  Re-read every
+;; environment-seeded setting (and UIOP's own restore steps) from THIS run's
+;; environment before any flag is parsed, so OPERANDI_MAX_ITERS and friends
+;; mean what they say and a flag still overrides them.  See src/env.lisp.
+(funcall (find-symbol "RESTORE-ENVIRONMENT" "OPERANDI.ENV"))
+
 (let* ((raw (remove "--" (uiop:command-line-arguments) :test #'string=))
        (resume nil)
        ;; --tui / --repl: force the interactive TUI.  It is also what you get

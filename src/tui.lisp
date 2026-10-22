@@ -481,7 +481,12 @@
    next request only, and every history write strips it back out."
   (setf (gethash :pending-resume-note sess)
         (llm:ht "role" "user"
-                "content" (session:resume-note (gethash :closed-at sess)))))
+                "content" (format nil "~A~@[ ~A~]"
+                                  (session:resume-note (gethash :closed-at sess))
+                                  ;; the earlier run ended at its iteration cap: its
+                                  ;; "N turns left" is not this run's budget
+                                  (and (eng:ended-at-cap-p (session:session-history sess))
+                                       "[That run ended at its iteration cap. The cap, and any count of turns it gave, belonged to that run and no longer apply: this run has a fresh budget.]")))))
 
 (defun strip-resume-note (sess msgs)
   "MSGS without the pending resume note object, if it was spliced in this turn."

@@ -31,7 +31,8 @@
 //   OPERANDI_FAN_MAX   max parallel agents per operandi_fan call (default 8)
 //   OPERANDI_WAIT_MS   how long a call blocks before handing back a
 //                      job id (default 110000)
-//   OPERANDI_MAX_MS    hard wall-clock kill for a single job (default 600000)
+//   OPERANDI_MAX_MS    hard wall-clock kill for a single job (default 1800000 =
+//                      30 min); operandi_run/operandi_fan take max_minutes per call
 //   OPERANDI_SBCL      path to sbcl (default "sbcl"; passed to the launcher)
 //   OPERANDI_FINDINGS  the findings ledger (default ~/.operandi/findings.jsonl)
 //
@@ -55,7 +56,10 @@ const LAUNCHER = path.join(ROOT, "bin", "operandi");
 const SBCL = process.env.OPERANDI_SBCL || "sbcl";
 const DEFAULT_MODEL = process.env.OPERANDI_MODEL || "deepseek/deepseek-v4.1-flash";
 const WAIT_MS = Number(process.env.OPERANDI_WAIT_MS || 110000);
-const MAX_MS = Number(process.env.OPERANDI_MAX_MS || 600000);
+const MAX_MS = Number(process.env.OPERANDI_MAX_MS || 1800000);
+// A caller may ask for a longer (or shorter) kill per job, up to this.
+const MAX_MINUTES_CAP = 240;
+const jobLimitMs = (maxMinutes) => (maxMinutes ? Math.round(maxMinutes * 60000) : MAX_MS);
 const FAN_MAX = Number(process.env.OPERANDI_FAN_MAX || 8); // max parallel agents per operandi_fan call
 const FINDINGS = process.env.OPERANDI_FINDINGS || path.join(os.homedir(), ".operandi", "findings.jsonl");
 // Marker that bin/operandi.lisp's ask-json prints its one result line behind.
@@ -153,11 +157,11 @@ function ensureCore() {
 // operandi_ask the project being asked about, so Read/Grep/Bash default there.
 // `args` are the CLI arguments after the backend flag; `stdin`, if given, is
 // written to the child's standard input.
-function startJob(task, model, cwd = ROOT) {
-  return startCli([task], model, cwd);
+function startJob(task, model, cwd = ROOT, maxMs = MAX_MS) {
+  return startCli([task], model, cwd, { maxMs });
 }
 
-function startCli(args, model, cwd = ROOT, { stdin = null, kind = "run" } = {}) {
+function startCli(args, model, cwd = ROOT, { stdin = null, kind = "run", maxMs = MAX_MS } = {}) {
   const id = randomUUID().slice(0, 8);
   const argv = [];
   // --model, not --openrouter: the model on whichever backend this machine is
@@ -165,7 +169,7 @@ function startCli(args, model, cwd = ROOT, { stdin = null, kind = "run" } = {}) 
   if (model) argv.push("--model", model);
   argv.push(...args);
 
-  const job = { id, kind, status: "running", started: Date.now(), stdout: "", stderr: "", code: null, signal: null, child: null, waiters: [] };
+  const job = { id, kind, maxMs, status: "running", started: Date.now(), stdout: "", stderr: "", code: null, signal: null, child: null, waiters: [] };
   jobs.set(id, job);
 
   const finish = () => { for (const w of job.waiters) w(); job.waiters = []; };
@@ -183,13 +187,13 @@ function startCli(args, model, cwd = ROOT, { stdin = null, kind = "run" } = {}) 
     child.stdout.on("data", (d) => (job.stdout += d.toString()));
     child.stderr.on("data", (d) => (job.stderr += d.toString()));
 
-    const hardKill = setTimeout(() => { if (job.status === "running") { job.killed = true; child.kill("SIGKILL"); } }, MAX_MS);
+    const hardKill = setTimeout(() => { if (job.status === "running") { job.killed = true; child.kill("SIGKILL"); } }, maxMs);
 
     child.on("close", (code, signal) => {
       clearTimeout(hardKill);
       job.code = code; job.signal = signal;
       job.status = code === 0 ? "done" : "error";
-      if (job.killed) job.stderr += `\n[killed: exceeded OPERANDI_MAX_MS=${MAX_MS}ms or cancelled]`;
+      if (job.killed) job.stderr += `\n[killed: exceeded the job limit of ${maxMs}ms (OPERANDI_MAX_MS / max_minutes) or cancelled]`;
       finish();
     });
     child.on("error", (err) => {
@@ -224,9 +228,10 @@ server.tool(
   {
     task: z.string().describe("The task for operandi, e.g. 'What is 21+21? Answer with just the number.'"),
     model: z.string().optional().describe(`OpenRouter model id (default ${DEFAULT_MODEL}). e.g. deepseek/deepseek-v4.1-flash.`),
+    max_minutes: z.number().positive().max(MAX_MINUTES_CAP).optional().describe(`Wall-clock kill for this job in minutes (default ${MAX_MS / 60000}, max ${MAX_MINUTES_CAP}).`),
   },
-  async ({ task, model }) => {
-    const job = startJob(task, model || DEFAULT_MODEL);
+  async ({ task, model, max_minutes }) => {
+    const job = startJob(task, model || DEFAULT_MODEL, ROOT, jobLimitMs(max_minutes));
     await waitJob(job, WAIT_MS);
     return text(renderJob(job));
   }
@@ -255,10 +260,11 @@ server.tool(
   {
     tasks: z.array(z.string()).min(1).max(FAN_MAX).describe(`Independent tasks to run in parallel (each its own agent; up to ${FAN_MAX}).`),
     model: z.string().optional().describe(`OpenRouter model for all workers (default ${DEFAULT_MODEL}).`),
+    max_minutes: z.number().positive().max(MAX_MINUTES_CAP).optional().describe(`Wall-clock kill for each job in minutes (default ${MAX_MS / 60000}, max ${MAX_MINUTES_CAP}).`),
   },
-  async ({ tasks, model }) => {
+  async ({ tasks, model, max_minutes }) => {
     const m = model || DEFAULT_MODEL;
-    const started = tasks.map((t) => ({ task: t, job: startJob(t, m) }));
+    const started = tasks.map((t) => ({ task: t, job: startJob(t, m, ROOT, jobLimitMs(max_minutes)) }));
     await Promise.all(started.map(({ job }) => waitJob(job, WAIT_MS)));
     const parts = started.map(({ task, job }, i) => {
       const head = `### [${i + 1}] ${task.replace(/\s+/g, " ").slice(0, 100)}`;

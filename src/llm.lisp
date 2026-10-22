@@ -42,7 +42,7 @@
            #:*usage-sink* #:usage #:make-usage #:copy-usage
            #:usage-calls #:usage-prompt-tokens #:usage-completion-tokens
            #:usage-cost-usd #:usage-cached-tokens #:with-usage-accounting
-           #:fold-usage #:usage-incf #:usage-summary))
+           #:fold-usage #:usage-incf #:usage-summary #:ask-usage-cost-p))
 
 (in-package #:operandi.llm)
 
@@ -124,6 +124,12 @@
       (count-if (lambda (p) (and (hash-table-p p) (equal (gethash "type" p) "image_url")))
                 content)
       0))
+
+(defparameter *ppq-fee-factor* 1.055d0
+  "PPQ's usage.cost is the UPSTREAM price; what PPQ charges (its
+   /queries/history price_in_usd, the balance drop) is this multiple of it.
+   Measured 2026-10-16: 1.0550 on four calls across three upstream providers
+   and two models. Re-measure if PPQ's pricing changes.")
 
 (defvar *llm-backend* :llama
   ":LLAMA = local llama.cpp at *llm-url* (default).
@@ -334,6 +340,17 @@ carries Tinfoil, or drop --confidential-tinfoil."
 (defvar *usage-sink* nil
   "Bound to a USAGE struct to accumulate LLM token/cost usage; else NIL.")
 
+(defun ask-usage-cost-p (&optional (backend *llm-backend*))
+  "Whether a request on BACKEND carries {\"usage\":{\"include\":true}}.
+   OpenRouter and Routstr only report USD cost when asked. Hosted :PPQ too,
+   and there asking also ROUTES: PPQ skips the upstream providers that reject
+   the field (its ppq-routing-receipt says unsupported_field), so every answer
+   comes from one that reports cost -- on purpose: we would rather lose a
+   provider than a run's spend. Not confidential :PPQ: the enclave's OpenAI
+   dialect does not know the field and 400s on it."
+  (or (member backend '(:openrouter :routstr))
+      (and (eq backend :ppq) (not *confidential*))))
+
 (defun fold-usage (dst parsed)
   "Add PARSED's OpenAI/OpenRouter `usage` block into the DST usage struct,
    counting one call. Also captures prefix-cache hits — providers report
@@ -358,6 +375,9 @@ carries Tinfoil, or drop --confidential-tinfoil."
             (incf (usage-prompt-tokens dst) pt)
             (incf (usage-completion-tokens dst) ct)
             (incf (usage-cached-tokens dst) cached)
+            ;; PPQ's usage.cost is the UPSTREAM price; what it charges is this multiple
+            (when (eq *llm-backend* :ppq)
+              (setf cost (* cost *ppq-fee-factor*)))
             (when (and (zerop cost) (eq *llm-backend* :ppq) *llm-model*)
               (setf cost (or (operandi.ppq:ppq-price-usd *llm-model* pt ct
                                                          :cached-tokens cached)
@@ -515,10 +535,9 @@ call with :want-stream nil"))
                            (t *llm-effort*)))
     (when *llm-model*
       (setf (gethash "model" body-ht) *llm-model*))
-    ;; OpenRouter, Routstr and PPQ only report real USD cost when asked;
-    ;; harmless to llama.  :TINFOIL is excluded — its enclave dialect rejects
-    ;; the unknown field with a 400.
-    (when (member *llm-backend* '(:openrouter :routstr :ppq))
+    ;; OpenRouter, Routstr and PPQ only report real USD cost when asked (see
+    ;; ASK-USAGE-COST-P: confidential PPQ does not get the field).
+    (when (ask-usage-cost-p)
       (setf (gethash "usage" body-ht) (ht "include" t)))
     (loop for (k v) on extra by #'cddr
           do (setf (gethash (string-downcase (string k)) body-ht) v))

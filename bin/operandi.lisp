@@ -54,17 +54,13 @@
 (defpackage #:operandi-cli
   (:use #:cl)
   (:local-nicknames (#:eng #:operandi.engine)
+                    (#:session #:operandi.session)
                     (#:llm #:operandi.llm)
                     (#:json #:json-simple)
                     (#:tools #:operandi.tools)))
 (in-package #:operandi-cli)
 
 (defun %csv (s) (and s (mapcar (lambda (x) (string-trim " " x)) (uiop:split-string s :separator ","))))
-(defun %tools-allow (csv) "The tool set for --tools: exactly the named tools." (%csv csv))
-(defun %tools-deny (csv)  "The tool set for --no-tools: the defaults minus the named tools."
-  (let ((deny (%csv csv)))
-    (remove-if (lambda (n) (member n deny :test #'string-equal)) (tools:default-tools))))
-
 (defun %stderr-dim-p ()
   "T when stderr is a terminal, so the reasoning trace can be dimmed there
    without leaving escape codes in a redirected log."
@@ -80,12 +76,20 @@
    The model's reasoning trace goes to STDERR, dimmed: it is the scratchpad,
    not the answer, and on a tool-calling turn it is often the ONLY place the
    model says what it is about to do.  Keeping it off stdout means a piped
-   `operandi \"task\" > answer.txt` still gets just the answer."
-  (let* ((buf (make-string-output-stream))
+   `operandi \"task\" > answer.txt` still gets just the answer.
+
+   The run is SAVED as a session, the same record the TUI keeps, so a run that
+   hits the iteration cap (or is killed) can be picked up with
+   `operandi --resume ID \"write up what you have\"` rather than started over."
+  (let* ((saved (session:make-session))
+         (buf (make-string-output-stream))
          (dim (%stderr-dim-p))
          (think-open nil)
          (think-line (make-string-output-stream))
          (eng:*on-token* (lambda (s) (write-string s buf) (write-string s) (force-output)))
+         ;; durable DURING the run, as the TUI's turns are: a killed run leaves its
+         ;; in-flight history on disk, not nothing
+         (eng:*on-progress* (lambda (live) (session:checkpoint-session saved live)))
          (eng:*on-reasoning*
            (lambda (s)
              ;; Reasoning arrives in token-sized fragments; buffer to the next
@@ -104,15 +108,29 @@
                                 (setf start (1+ nl)))
                             (t (return)))))))
     (multiple-value-bind (text history iters usage) (eng:run prompt :tool-names tool-names)
-      (declare (ignore history))
+      ;; commit the run to its session, as RUN-TURN does for a TUI turn
+      (setf (session:session-history saved) history)
+      (incf (gethash :turns saved))
+      (session:session-add-usage saved usage)
+      (session:persist-session saved)
       (when think-open
         (let ((tail (get-output-stream-string think-line)))
           (when (plusp (length tail))
             (format *error-output* "~@[~C[2m~]│ ~A~@[~C[0m~]~%" (and dim #\Escape) tail (and dim #\Escape)))))
-      (let ((streamed (string-right-trim '(#\Space #\Newline) (get-output-stream-string buf))))
-        (unless (string= (string-right-trim '(#\Space #\Newline) (or text "")) streamed)
+      ;; BUF holds EVERY turn's streamed text, not just the final one, so the
+      ;; answer is already on screen when it is the tail of BUF.  Comparing for
+      ;; equality reprinted it after any multi-turn run (the wrap-up made that
+      ;; common); a suffix test does not.  Reprint only what did not stream
+      ;; (a synthetic or salvaged answer).
+      (let* ((streamed (string-right-trim '(#\Space #\Newline) (get-output-stream-string buf)))
+             (final (string-right-trim '(#\Space #\Newline) (or text "")))
+             (n (length final)))
+        (unless (and (<= n (length streamed))
+                     (string= final streamed :start2 (- (length streamed) n)))
           (format t "~&~A" text)))
       (format t "~&~%[~A iters, ~A]~%" iters (llm:usage-summary usage))
+      (format t "~&session ~A saved; to continue: operandi --resume ~A \"<what to do next>\"~%"
+              (gethash :id saved) (gethash :id saved))
       (let ((err (funcall (find-symbol "MIRROR-TURN" "OPERANDI.RC") prompt (or text ""))))
         (when err (format *error-output* "~&operandi: ~A~%" err))))))
 
@@ -173,6 +191,213 @@
         (error (e)
           (format *error-output* "operandi: ignoring ~A: ~A~%" p e)
           nil)))))
+
+(defun %tools-allow (csv)
+  "The tool set for --tools: exactly the named tools. A name ending in * takes
+   every registered tool with that prefix (mcp__rea__*)."
+  (tools:expand-tool-names (%csv csv)))
+
+(defun %tools-deny (csv)
+  "The tool set for --no-tools: the defaults minus the named tools (globs too)."
+  (let ((deny (tools:expand-tool-names (%csv csv))))
+    (remove-if (lambda (n) (member n deny :test #'string-equal)) (tools:default-tools))))
+
+;;; The marker a harness looks for on stdout; keep in sync with mcp/server.js.
+(defparameter +json-result-marker+ "@@OPERANDI-JSON@@")
+
+(defun %emit-json-result (ht)
+  (format t "~&~A ~A~%" +json-result-marker+ (json:stringify ht))
+  (finish-output))
+
+(defun run-ask-json ()
+  "Read an ask request as JSON from stdin, run OPERANDI.SUBAGENT:ASK-STRUCTURED,
+   print the result as one marker line. Exits 1 on any error."
+  (handler-case
+      (let* ((req (json:parse (uiop:slurp-stream-string *standard-input*)))
+             (get (lambda (k) (let ((v (and (hash-table-p req) (gethash k req))))
+                                (if (eq v 'null) nil v))))
+             (question (funcall get "question"))
+             (hyps (funcall get "hypotheses"))
+             (synth (multiple-value-bind (v present)
+                        (and (hash-table-p req) (gethash "synthesize" req))
+                      (if present (and v (not (eq v 'null))) t))))
+        (unless (and (stringp question) (plusp (length question)))
+          (error "request needs a non-empty \"question\" string"))
+        (when (and hyps (not (and (vectorp hyps) (every #'stringp hyps))))
+          (error "\"hypotheses\" must be an array of strings"))
+        (%emit-json-result
+         (funcall (find-symbol "ASK-STRUCTURED" "OPERANDI.SUBAGENT")
+                  question
+                  :hypotheses (and hyps (plusp (length hyps)) (coerce hyps 'list))
+                  :context (funcall get "context")
+                  :synthesize synth
+                  :worker-model (funcall get "worker_model"))))
+    (error (e)
+      (%emit-json-result (let ((h (make-hash-table :test 'equal)))
+                           (setf (gethash "error" h) (princ-to-string e))
+                           h))
+      (sb-ext:exit :code 1 :abort t))))
+
+(defun config-value (key)
+  "KEY of ~/.operandi/config.json, or NIL if absent/unreadable."
+  (let ((p (config-path)))
+    (when (probe-file p)
+      (handler-case
+          (let ((v (gethash key (json:parse (uiop:read-file-string p)))))
+            (and (stringp v) (plusp (length v)) v))
+        (error () nil)))))
+
+(defun config-backend ()
+  "\"ppq\" or \"openrouter\" (the default) from the config's `backend`."
+  (let ((b (config-value "backend")))
+    (if (and b (string-equal b "ppq")) "ppq" "openrouter")))
+
+(defun config-integer (key)
+  "KEY of the config as a non-negative integer, or NIL."
+  (let ((p (config-path)))
+    (when (probe-file p)
+      (handler-case
+          (let ((v (gethash key (json:parse (uiop:read-file-string p)))))
+            (and (integerp v) (>= v 0) v))
+        (error () nil)))))
+
+;; A caller-issued PPQ key (e.g. one per campaign run, so PPQ itself reports
+;; that run's spend): a FILE, mode 0600, never the key in the environment.
+;; The account (credit id, balance, top-ups) is still the machine's.
+(defparameter *ppq-token-override* (uiop:getenv "OPERANDI_PPQ_TOKEN_FILE"))
+
+(defun auto-topup-plan ()
+  "(values cents nip05) when this machine may ask its operator for PPQ credit
+   on its own: config backend ppq + auto_topup_cents + an operator NIP-05.
+   NIL otherwise -- operandi never invoices anyone unless told it may."
+  (let ((cents (config-integer "auto_topup_cents"))
+        (nip05 (or (config-value "operator_nip05") (uiop:getenv "OPERANDI_NOSTR_NIP05"))))
+    (when (and cents (plusp cents) nip05 (string= (config-backend) "ppq"))
+      (values cents nip05))))
+
+(defparameter *topup-lock-dir* (merge-pathnames ".operandi/topup.lock/" (user-homedir-pathname))
+  "Held (an atomic mkdir) by the ONE operandi process invoicing the operator.
+   The in-process single-flight in the engine covers threads; a campaign runs
+   many processes, and without this each would send its own invoice.")
+
+(defun %pid-alive-p (pid)
+  (and (integerp pid) (probe-file (format nil "/proc/~D/" pid))))
+
+(defun %try-topup-lock ()
+  "Take the cross-process top-up lock, clearing one left by a dead process."
+  (flet ((take ()
+           (handler-case
+               (progn (funcall (find-symbol "MKDIR" "SB-POSIX") (namestring *topup-lock-dir*) #o700)
+                      (with-open-file (o (merge-pathnames "pid" *topup-lock-dir*) :direction :output
+                                                                                :if-exists :supersede)
+                        (format o "~D~%" (funcall (find-symbol "GETPID" "SB-POSIX"))))
+                      t)
+             (error () nil))))
+    (or (take)
+        (let ((pid (ignore-errors (parse-integer (uiop:read-file-string (merge-pathnames "pid" *topup-lock-dir*))
+                                                 :junk-allowed t))))
+          (when (and pid (not (%pid-alive-p pid)))
+            (ignore-errors (uiop:delete-directory-tree *topup-lock-dir* :validate t))
+            (take))))))
+
+(defun %release-topup-lock ()
+  (ignore-errors (uiop:delete-directory-tree *topup-lock-dir* :validate t)))
+
+(defun %funded-p ()
+  (let ((b (ignore-errors (operandi.payments:ppq-balance))))
+    (and (hash-table-p b) (realp (gethash "balance" b)) (> (gethash "balance" b) 0.05))))
+
+(defun auto-topup ()
+  "*PAYMENT-REQUIRED-HOOK*: invoice the operator over Nostr for
+   auto_topup_cents and wait for payment, re-issuing an expired invoice (up to
+   3). True once paid. ONE process invoices at a time (*TOPUP-LOCK-DIR*); the
+   others wait for it and retry. All output to stderr: under ACP/MCP stdout is
+   protocol."
+  (multiple-value-bind (cents nip05) (auto-topup-plan)
+    (when cents
+      (let ((*standard-output* *error-output*))
+        #+sbcl (ignore-errors (require :sb-posix))
+        (loop until (%try-topup-lock)
+              do (format t "~&[operandi] another operandi is asking for credit; waiting~%")
+                 (loop repeat 720 while (probe-file *topup-lock-dir*) do (sleep 5))
+                 ;; whoever held it has paid (or given up): retry the request
+                 (return-from auto-topup t))
+        (unwind-protect
+             (if (%funded-p)
+                 t                                  ; paid while we waited for the lock
+                 (progn
+                   (format t "~&[operandi] PPQ credit exhausted: asking ~A for ~D.~2,'0D USD over Nostr~%"
+                           nip05 (floor cents 100) (mod cents 100))
+                   (loop repeat 3
+                         do (let ((paid (operandi.payments:request-ppq-payment
+                                         cents :unit :cents :provider :nostr :nip05 nip05
+                                         :memo "operandi is out of PPQ credit" :timeout 3600)))
+                              (when paid
+                                (format t "~&[operandi] paid -- continuing~%")
+                                (return t))))))
+          (%release-topup-lock))))))
+
+(defun use-model! (m)
+  "MODEL M on the configured backend (llama is always the local server)."
+  (cond ((string-equal m "llama") (llm:set-backend-llama! :ask nil))
+        ((string= (config-backend) "ppq")
+         ;; no account yet, but allowed to ask for credit: make one now, so the
+         ;; first inference's 402 can be paid instead of failing for want of a key
+         ;; (never under a caller-issued key: creating an account would write
+         ;; a different account's key into the caller's file)
+         (when (and (not *ppq-token-override*)
+                    (not (operandi.payments:ppq-account-p)) (auto-topup-plan))
+           (handler-case
+               (let ((cid (operandi.payments:ppq-create-account)))
+                 (format *error-output* "~&[operandi] created a PPQ account (credit id ~A)~%" cid))
+             (error (e) (format *error-output* "~&[operandi] could not create a PPQ account: ~A~%" e))))
+         (unless (llm:set-backend-ppq! :model m)
+           (format *error-output* "operandi: the PPQ backend is configured but unusable (no ~~/.operandi/ppq.token?) -- try `operandi --topup ppq ...`~%")))
+        (t (llm:set-backend-openrouter! :model m)))
+  (eng:apply-backend-defaults))
+
+(defun run-topup (args)
+  "operandi --topup ppq AMOUNT [cents|sats] [--to NIP05] [--no-wait]
+
+   Buy PPQ credit over Lightning. AMOUNT is an integer in base units: cents
+   (the default; 1500 = $15.00) or sats. With no PPQ key on this machine, an
+   account is created first (PPQ's /accounts/create needs no credentials). The
+   invoice goes to --to, else config `operator_nip05`, else
+   $OPERANDI_NOSTR_NIP05, as a Nostr DM -- someone else pays from their phone --
+   or, with none of those, is shown here as a QR code. Then waits for payment
+   (up to an hour) unless --no-wait, and prints the balance."
+  (let* ((to (let ((p (position "--to" args :test #'string=))) (and p (nth (1+ p) args))))
+         (no-wait (member "--no-wait" args :test #'string=))
+         (pos (remove-if (lambda (a) (or (uiop:string-prefix-p "--" a) (equal a to))) args))
+         (service (first pos))
+         (amount (and (second pos) (every #'digit-char-p (second pos)) (parse-integer (second pos))))
+         (unit (let ((u (string-downcase (or (third pos) "cents"))))
+                 (cond ((string= u "cents") :cents) ((string= u "sats") :sats))))
+         (nip05 (or to (config-value "operator_nip05") (uiop:getenv "OPERANDI_NOSTR_NIP05"))))
+    (unless (and (equal service "ppq") amount (plusp amount) unit)
+      (format *error-output* "usage: operandi --topup ppq AMOUNT [cents|sats] [--to NIP05] [--no-wait]   (AMOUNT: an integer; 1500 cents = $15.00)~%")
+      (sb-ext:exit :code 2))
+    (handler-case
+        (progn
+          (unless (operandi.payments:ppq-account-p)
+            (multiple-value-bind (cid key) (operandi.payments:ppq-create-account)
+              (declare (ignore key))
+              (format t "~&No PPQ key here: created a PPQ account (credit id ~A); key in ~A~%"
+                      cid (namestring operandi.payments:*ppq-token-file*))))
+          (let ((paid (operandi.payments:request-ppq-payment
+                       amount :unit unit :provider (if nip05 :nostr :terminal) :nip05 nip05
+                       :wait (not no-wait) :timeout 3600)))
+            (when (and paid (not no-wait))
+              (let ((b (ignore-errors (operandi.payments:ppq-balance))))
+                (when b (format t "~&Balance: ~A~%" (json:stringify b)))))
+            (sb-ext:exit :code (if (or no-wait paid) 0 1))))
+      (error (e)
+        (format *error-output* "~&operandi --topup: ~A~%" e)
+        (sb-ext:exit :code 1)))))
+
+;; May this machine ask its operator for credit? (config auto_topup_cents)
+(when (auto-topup-plan)
+  (setf eng:*payment-required-hook* #'auto-topup))
 
 ;;; ------------------------------ usage ------------------------------
 ;;; The help text is DATA, not a wall of FORMAT calls.  Each section is
@@ -276,6 +501,19 @@
             "llama, 96k on OpenRouter) unless OPERANDI_CONTEXT_BUDGET is set.")
            ("--tools A,B,C" "allow-list: exactly these tools")
            ("--no-tools X,Y" "the default tool set minus these")
+           ("--mcp-config FILE" "also read FILE's mcpServers (repeatable)"
+            "Read after the default ~/.operandi/mcp.json. --no-default-mcp skips the default.")
+           ("--mcp NAME=SPEC" "a stdio MCP server, or Streamable HTTP with NAME=https://URL"
+            "NAME=COMMAND [ARGS…] runs a stdio server. Its tools join the tool set, so"
+            "--tools and --no-tools can name them as mcp__NAME__TOOL. Repeatable.")
+           ("--mcp-status" "list the external MCP servers, their state and tools")
+           ("--topup ppq AMOUNT [cents|sats]" "buy PPQ credit over Lightning, then exit"
+            "AMOUNT is in base units: cents by default (1500 = $15.00), or sats."
+            "[--to NIP05] [--no-wait]. The invoice is DMed to --to, else config"
+            "operator_nip05, else $OPERANDI_NOSTR_NIP05; with none, shown as a QR code.")
+           ("--ask-json" "the question phase as JSON: a request on stdin, one result line"
+            "Request: {\"question\": ..., \"hypotheses\": [...]?, \"context\": ...?,"
+            "\"synthesize\": bool?, \"worker_model\": ...?}. For harnesses (mcp/server.js).")
            ("--help, -h [TOPIC]" "this text, or one topic of it"
             "Topics: modes, backends, session, agent, env, files, diagnostics.")
            ("--confidential" "REMOVED — renamed to --confidential-tinfoil"
@@ -428,6 +666,20 @@
        ;; not.
        (llama-explicit nil)
        (tool-names (tools:default-tools))     ; available-tools allow-list (default = all)
+       ;; --tools / --no-tools are resolved AFTER the MCP servers start: their
+       ;; tools join the set, so a name can be an MCP tool (mcp__server__tool).
+       (tools-allow nil)
+       (tools-deny nil)
+       ;; External MCP servers: ~/.operandi/mcp.json unless --no-default-mcp,
+       ;; then --mcp-config FILE and --mcp NAME=SPEC, each repeatable, in order.
+       (mcp-default t)
+       (mcp-configs '())
+       (mcp-specs '())
+       ;; The modes that used to be bare commands, now flags (a bare word is
+       ;; prompt text): --topup ARGS…, --mcp-status, --ask-json.
+       (topup-args nil)
+       (mcp-status-p nil)
+       (ask-json-p nil)
        ;; Strip leading flags (--openrouter [model], --resume [id], --tools/--no-tools) in any order.
        (args (let ((acc raw))
                (loop
@@ -627,9 +879,40 @@
                             (t                       (setf resume :latest acc tail)))))
                    ;; --tools A,B,C  -> ONLY those tools; --no-tools X,Y -> defaults minus X,Y.
                    ((and acc (string= (first acc) "--tools"))
-                    (setf tool-names (%tools-allow (second acc)) acc (cddr acc)))
+                    (setf tools-allow (second acc) acc (cddr acc)))
                    ((and acc (string= (first acc) "--no-tools"))
-                    (setf tool-names (%tools-deny (second acc)) acc (cddr acc)))
+                    (setf tools-deny (second acc) acc (cddr acc)))
+                   ;; --model M: M on the CONFIGURED backend (config.json `backend`),
+                   ;; so a harness need not know whether this machine pays OpenRouter
+                   ;; or PPQ.
+                   ((and acc (string= (first acc) "--model"))
+                    (unless (and (second acc) (plusp (length (second acc))))
+                      (format *error-output* "operandi: --model takes a model id~%")
+                      (sb-ext:exit :code 2))
+                    (use-model! (second acc))
+                    (setf acc (cddr acc)))
+                   ;; External MCP servers: --mcp-config FILE (repeatable, after the
+                   ;; default ~/.operandi/mcp.json), --mcp NAME=SPEC (repeatable),
+                   ;; --no-default-mcp (skip the default file).
+                   ((and acc (string= (first acc) "--mcp-config"))
+                    (unless (and (second acc) (plusp (length (second acc))))
+                      (format *error-output* "operandi: --mcp-config takes a file~%")
+                      (sb-ext:exit :code 2))
+                    (setf mcp-configs (append mcp-configs (list (second acc))) acc (cddr acc)))
+                   ((and acc (string= (first acc) "--mcp"))
+                    (unless (and (second acc) (find #\= (second acc)))
+                      (format *error-output* "operandi: --mcp takes NAME=COMMAND [ARGS…] or NAME=https://URL~%")
+                      (sb-ext:exit :code 2))
+                    (setf mcp-specs (append mcp-specs (list (second acc))) acc (cddr acc)))
+                   ((and acc (string= (first acc) "--no-default-mcp"))
+                    (setf mcp-default nil acc (rest acc)))
+                   ;; --topup takes everything after it: operandi --topup ppq 1500 --to NIP05
+                   ((and acc (string= (first acc) "--topup"))
+                    (setf topup-args (rest acc) acc nil))
+                   ((and acc (string= (first acc) "--mcp-status"))
+                    (setf mcp-status-p t acc (rest acc)))
+                   ((and acc (string= (first acc) "--ask-json"))
+                    (setf ask-json-p t acc (rest acc)))
                    ;; --ask: the question phase (rival hypotheses, a swarm
                    ;; settles them, an answer from the verdicts) instead of a
                    ;; plain task.  It used to be the bare command `ask`; a bare
@@ -743,8 +1026,9 @@
             (format t "~&operandi: llama ~A — model ~A (~A)~%"
                     llm:*llm-url* llm:*llm-model* reason)
             (format t "~&operandi: llama ~A — ~A~%" llm:*llm-url* reason)))))
-  ;; Preflight the model on any path that will actually run a turn (not bare help).
-  (unless help-p
+  ;; Preflight the model on any path that will actually run a turn (not bare help,
+  ;; and not topup, which talks to PPQ's billing API and needs no model).
+  (unless (or help-p topup-args)
     ;; A confidential session on a backend that cannot seal is a configuration
     ;; error, and it must be fatal BEFORE the first turn — not a warning that
     ;; scrolls past while plaintext goes out.
@@ -753,7 +1037,26 @@
         (format *error-output* "~&operandi: ~A~%" e)
         (sb-ext:exit :code 2)))
     (preflight-or-die))
+  ;; External MCP servers, before the tool set is resolved: their tools join it.
+  ;; A file or spec the operator named that cannot be read is fatal; a server
+  ;; that will not start is reported and skipped.
+  (unless (or help-p topup-args)
+    (handler-case
+        (operandi.mcp:start-from-options :use-default mcp-default
+                                         :config-files mcp-configs
+                                         :cli-specs mcp-specs)
+      (error (e)
+        (format *error-output* "~&operandi: ~A~%" e)
+        (sb-ext:exit :code 2))))
+  (setf tool-names (cond (tools-allow (%tools-allow tools-allow))
+                         (tools-deny (%tools-deny tools-deny))
+                         (t (tools:default-tools))))
   (cond
+    (topup-args (run-topup topup-args))
+    (mcp-status-p (write-string (operandi.mcp:status-text)) (finish-output))
+    ;; operandi --ask-json < request.json: the question phase as DATA, for a
+    ;; harness (the MCP server).  One result line on stdout, "@@OPERANDI-JSON@@ {...}".
+    (ask-json-p (run-ask-json))
     ;; --help [TOPIC]
     (help-p (%usage help-topic))
     ;; --repl, or no prompt at all → the interactive TUI.  --resume continues a

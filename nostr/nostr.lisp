@@ -29,7 +29,8 @@
   (:export #:*owner-nip05* #:*relays* #:*system-prompt* #:*tool-names* #:*model*
            #:*key-file* #:*state-file* #:*chunk-chars* #:*max-chunks* #:*greeting*
            #:agent-npub #:agent-pubkey #:start #:stop #:running-p #:run-loop
-           #:process-item #:send-dm #:split-text))
+           #:process-item #:send-dm #:split-text
+           #:notify #:send-payment-request))
 (in-package #:operandi.nostr)
 
 ;;; ------------------------------- config -------------------------------
@@ -304,3 +305,55 @@ plainly; never fabricate a value to fill a hole."
   (apply #'start start-args)
   (handler-case (loop (sleep 3600))
     (#+sbcl sb-sys:interactive-interrupt #-sbcl error () (stop) (format t "~&[operandi.nostr] stopped.~%"))))
+
+;;; ------------------------------ one-off DMs ------------------------------
+;;; The agent loop above talks to ONE operator over a long-lived pool. These
+;;; send a single NIP-17 DM to any NIP-05 and return -- for a CLI command or a
+;;; library caller that just needs to tell someone something (a payment
+;;; request, above all). Delivery is CONFIRMED: POOL-PUBLISH-SYNC waits for
+;;; each relay's OK, and the result says how many accepted, so "sent" is never
+;;; a guess.
+
+(defun %dm-inbox-relays (pool pubkey)
+  "PUBKEY's advertised NIP-17 DM inbox relays (kind 10050), best-effort."
+  (ignore-errors
+    (let ((evs (pool:fetch-events pool
+                (list (flt:make-filter :kinds (list +dm-relays-kind+) :authors (list pubkey) :limit 1))
+                :timeout 5)))
+      (when evs (ev:tag-values (first evs) "relay")))))
+
+(defun notify (nip05 text &key (relays *relays*) (timeout 10))
+  "Send TEXT to NIP05 as NIP-17 DMs from the agent's key, without starting the
+   agent loop. Returns (values relays-that-accepted acks). Signals if NIP05 does
+   not resolve or no relay accepted any part."
+  (let ((pubkey (nip05:resolve-pubkey nip05)))
+    (unless pubkey (error "could not resolve NIP-05 ~A to a pubkey" nip05))
+    (let* ((their (ignore-errors (nth-value 1 (nip05:resolve nip05))))
+           (pool (pool:make-pool (remove-duplicates (append relays their) :test #'equal))))
+      (unwind-protect
+           (progn
+             (dolist (u (%dm-inbox-relays pool pubkey)) (ignore-errors (pool:add-relay pool u)))
+             (let ((acks '()) (after nil) (chunks (split-text text)))
+               (loop for c in chunks for i from 1
+                     do (let* ((body (if (> (length chunks) 1) (format nil "(~a/~a) ~a" i (length chunks) c) c))
+                               (wrap (if after
+                                         (nip59:build-giftwrap (keys:keypair-secret-key (ensure-agent-key)) pubkey body :after after)
+                                         (nip59:build-giftwrap (keys:keypair-secret-key (ensure-agent-key)) pubkey body))))
+                          (setf acks (append acks (pool:pool-publish-sync pool wrap :timeout timeout))
+                                after (ev:event-created-at wrap))))
+               (let ((ok (remove-duplicates
+                          (loop for a in acks when (eq (pool:ack-status a) :accepted) collect (pool:ack-url a))
+                          :test #'equal)))
+                 (unless ok
+                   (error "no relay accepted the DM to ~A (~{~A~^, ~})" nip05
+                          (mapcar (lambda (a) (format nil "~A ~(~A~)" (pool:ack-url a) (pool:ack-status a))) acks)))
+                 (values ok acks))))
+        (ignore-errors (pool:close-pool pool))))))
+
+(defun send-payment-request (nip05 bolt11 &key amount memo expires-at checkout-url)
+  "DM a Lightning invoice to NIP05. The bolt11 sits on a line of its own so a
+   client renders it as payable. Returns NOTIFY's values."
+  (notify nip05
+          (format nil "Payment request from operandi~@[: ~A~]~%~@[Amount: ~A~%~]~@[Expires: ~A~%~]~%~A~@[~%~%Or pay in a browser: ~A~]"
+                  memo amount expires-at bolt11 checkout-url)))
+

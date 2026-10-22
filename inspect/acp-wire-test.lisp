@@ -14,6 +14,13 @@
 ;;;         --non-interactive --load inspect/acp-wire-test.lisp
 ;;; Exit 0 iff all checks pass.
 
+(require :asdf)
+(unless (find-package :operandi.acp)
+  (unless (find-package :ql)
+    (let ((q (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
+      (when (probe-file q) (load q))))
+  (funcall (read-from-string "ql:quickload") :operandi :silent t))
+
 (defpackage #:acp-wire-test (:use #:cl)
   (:local-nicknames (#:acp #:operandi.acp) (#:json #:json-simple)))
 (in-package #:acp-wire-test)

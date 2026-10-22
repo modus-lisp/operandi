@@ -17,7 +17,8 @@
            #:*routstr-node* #:*default-token-file*
            ;; PPQ (ppq.ai) Lightning top-up -- same shape, different endpoint.
            #:create-ppq-topup #:ppq-topup-status #:request-ppq-payment
-           #:ppq-token #:*ppq-api* #:*ppq-token-file*))
+           #:ppq-token #:*ppq-api* #:*ppq-token-file*
+           #:ppq-create-account #:ppq-balance #:*ppq-credit-id-file* #:ppq-account-p))
 
 (in-package #:operandi.payments)
 
@@ -57,14 +58,74 @@
 (defun %ppq-auth ()
   (list (cons "Authorization" (format nil "Bearer ~A" (ppq-token)))))
 
-(defun create-ppq-topup (sats)
-  "Create a PPQ Lightning top-up invoice for SATS.  Returns a plist:
-   :invoice-id :bolt11 :amount :expires-at :checkout-url."
-  (unless (and (integerp sats) (<= 100 sats 1000000))
-    (error 'payment-error :message (format nil "PPQ amount must be 100..1000000 sats, got ~A" sats)))
+(defparameter *ppq-credit-id-file*
+  (merge-pathnames ".operandi/ppq.credit_id" (user-homedir-pathname))
+  "PPQ account credit id: the balance check and account-level calls name the
+   account by it (the API key authorizes requests).")
+
+(defun ppq-account-p ()
+  "True when this machine has a PPQ API key."
+  (and (probe-file *ppq-token-file*) (plusp (length (ppq-token)))))
+
+(defun %write-secret (path text)
+  (ensure-directories-exist path)
+  (with-open-file (o path :direction :output :if-exists :supersede :if-does-not-exist :create)
+    (write-line text o))
+  #+sbcl (ignore-errors (funcall (find-symbol "CHMOD" "SB-POSIX") (namestring path) #o600)))
+
+(defun ppq-create-account ()
+  "Create a PPQ account (POST /accounts/create needs no credentials) and store
+   its API key in *PPQ-TOKEN-FILE* and credit id in *PPQ-CREDIT-ID-FILE*.
+   Refuses when a key is already there: a second account would split the
+   balance, and the old key would be lost. Returns (values credit-id api-key)."
+  (when (ppq-account-p)
+    (error 'payment-error :message
+           (format nil "a PPQ key already exists in ~A; not creating another account"
+                   (namestring *ppq-token-file*))))
+  #+sbcl (ignore-errors (require :sb-posix))
+  (let* ((text (http:post (format nil "~A/accounts/create" *ppq-api*)
+                          :content "{}" :headers '(("Content-Type" . "application/json"))
+                          :read-timeout 25))
+         (j (%parse text))
+         (key (gethash "api_key" j))
+         (cid (gethash "credit_id" j)))
+    (unless (and (stringp key) (plusp (length key)))
+      (error 'payment-error :message (format nil "PPQ account creation returned no api_key: ~A" text)))
+    (%write-secret *ppq-token-file* key)
+    (when (stringp cid) (%write-secret *ppq-credit-id-file* cid))
+    (values cid key)))
+
+(defun ppq-balance ()
+  "The account balance as PPQ reports it (a hash table), or NIL without a
+   credit id."
+  (when (probe-file *ppq-credit-id-file*)
+    (let* ((cid (string-trim '(#\Space #\Tab #\Newline #\Return)
+                             (with-open-file (s *ppq-credit-id-file*) (or (read-line s nil nil) ""))))
+           (h (make-hash-table :test 'equal)))
+      (setf (gethash "credit_id" h) cid)
+      (%parse (http:post (format nil "~A/credits/balance" *ppq-api*)
+                         :content (%json-body h) :headers '(("Content-Type" . "application/json"))
+                         :read-timeout 20)))))
+
+(defun create-ppq-topup (amount &key (unit :sats))
+  "Create a PPQ Lightning top-up invoice for AMOUNT in base units: UNIT :sats
+   (100..1,000,000) or :cents (USD cents). Integers only -- no decimal amounts
+   anywhere; cents become PPQ's USD at the wire. Returns a plist: :invoice-id
+   :bolt11 :amount :expires-at :checkout-url."
+  (unless (and (integerp amount) (plusp amount))
+    (error 'payment-error :message (format nil "PPQ amount must be a positive integer of ~(~A~), got ~A" unit amount)))
+  (ecase unit
+    (:sats (unless (<= 100 amount 1000000)
+             (error 'payment-error :message (format nil "PPQ amount must be 100..1000000 sats, got ~A" amount))))
+    (:cents nil))
+  (let* ((currency (if (eq unit :sats) "SATS" "USD"))
+         (wire (if (eq unit :sats)
+                   amount
+                   (multiple-value-bind (dollars rem) (floor amount 100)
+                     (if (zerop rem) dollars (/ amount 100d0))))))
   (let* ((h (make-hash-table :test 'equal)))
-    (setf (gethash "amount" h) sats
-          (gethash "currency" h) "SATS")
+    (setf (gethash "amount" h) wire
+          (gethash "currency" h) currency)
     (let* ((text (http:post (format nil "~A/topup/create/btc-lightning" *ppq-api*)
                             :content (%json-body h)
                             :headers (cons (cons "Content-Type" "application/json")
@@ -77,7 +138,7 @@
             :bolt11 (gethash "lightning_invoice" j)
             :amount (gethash "amount" j)
             :expires-at (gethash "expires_at" j)
-            :checkout-url (gethash "checkout_url" j)))))
+            :checkout-url (gethash "checkout_url" j))))))
 
 (defun ppq-topup-status (invoice-id)
   "Status plist for a PPQ top-up: :status (\"paid\"/...), :raw."
@@ -89,25 +150,53 @@
                        (or (gethash "status" j) (gethash "payment_status" j)))
           :raw text)))
 
-(defun request-ppq-payment (sats &key (provider :terminal) (timeout 900)
-                                       (interval 5)
-                                       (out-path (merge-pathnames
-                                                  "ppq-invoice.png"
-                                                  (user-homedir-pathname))))
-  "Create a PPQ Lightning top-up for SATS, show its bolt11 as a QR code, and wait
-   for payment.  PROVIDER is :terminal (half-block QR) or :open (PNG in the image
-   viewer).  Returns the paid status plist, or NIL on timeout/expiry."
-  (let* ((inv (create-ppq-topup sats))
+(defun %send-over-nostr (nip05 bolt11 &rest keys)
+  "SEND-PAYMENT-REQUEST from the optional operandi/nostr system, loaded on
+   first use so the core stays free of cl-nostr."
+  (unless (find-package "OPERANDI.NOSTR")
+    (let ((*standard-output* *error-output*))
+      (funcall (or (and (find-package "QL") (find-symbol "QUICKLOAD" "QL"))
+                   (lambda (s &rest r) (declare (ignore r)) (asdf:load-system s)))
+               "operandi/nostr" :silent t)))
+  (apply (find-symbol "SEND-PAYMENT-REQUEST" "OPERANDI.NOSTR") nip05 bolt11 keys))
+
+(defun request-ppq-payment (amount &key (unit :sats) (provider :terminal) nip05 memo
+                                        (wait t) (timeout 900) (interval 5)
+                                        (out-path (merge-pathnames
+                                                   "ppq-invoice.png"
+                                                   (user-homedir-pathname))))
+  "Create a PPQ Lightning top-up for AMOUNT base UNITs (:sats or :cents) and present it, then wait
+   for payment. PROVIDER is :terminal (half-block QR), :open (PNG in the image
+   viewer) or :nostr (a NIP-17 DM to NIP05 -- someone else pays, from their
+   phone). Returns the paid status plist, or NIL on timeout/expiry."
+  (let* ((inv (create-ppq-topup amount :unit unit))
          (bolt11 (getf inv :bolt11))
-         (id (getf inv :invoice-id)))
-    (format t "~&PPQ top-up: ~D sats~%invoice_id: ~A~%expires_at: ~A~%checkout:   ~A~%~%~A~%~%"
-            sats id (getf inv :expires-at) (getf inv :checkout-url) bolt11)
+         (id (getf inv :invoice-id))
+         (label (if (eq unit :cents)
+                    (multiple-value-bind (d c) (floor amount 100) (format nil "$~D.~2,'0D" d c))
+                    (format nil "~D sats" amount))))
+    (format t "~&PPQ top-up: ~A~%invoice_id: ~A~%expires_at: ~A~%checkout:   ~A~%~%~A~%~%"
+            label id (getf inv :expires-at) (getf inv :checkout-url) bolt11)
     (ecase provider
       (:terminal (render-terminal bolt11))
-      (:open (open-image (%write-qr-png bolt11 out-path))))
+      (:open (open-image (%write-qr-png bolt11 out-path)))
+      (:nostr
+       (unless nip05 (error 'payment-error :message ":nostr needs a NIP-05 to send the invoice to"))
+       (let ((relays (%send-over-nostr nip05 bolt11 :amount label
+                                       :memo (or memo "PPQ API credit for operandi")
+                                       :expires-at (getf inv :expires-at)
+                                       :checkout-url (getf inv :checkout-url))))
+         (format t "~&Sent to ~A over Nostr (accepted by ~{~A~^, ~}).~%" nip05 relays))))
+    (unless wait (return-from request-ppq-payment inv))
     (format t "~&Waiting for payment (timeout ~Ds)...~%" timeout)
-    (let ((deadline (+ (get-universal-time) timeout)))
+    (let ((deadline (+ (get-universal-time) timeout))
+          (expires (let ((e (getf inv :expires-at))) (and (realp e) e))))
       (loop
+        ;; PPQ invoices live ~15 minutes: past expiry nothing can pay this one,
+        ;; so stop and let the caller issue another rather than wait out TIMEOUT
+        (when (and expires (> (- (get-universal-time) 2208988800) expires))
+          (format t "~&Invoice expired unpaid.~%")
+          (return nil))
         (let ((st (ppq-topup-status id)))
           (when (and (stringp (getf st :status))
                      (member (string-downcase (getf st :status))

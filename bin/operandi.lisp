@@ -485,13 +485,15 @@
             "downgrading to plaintext. The endpoint's operator must also be named in"
             "--trust: the seal proves where the request goes, not what happens there."
             "Today that is Tinfoil's router: --tinfoil, --ppq private/MODEL, or"
-            "--routstr tinfoil-MODEL, with --trust=tinfoil-routing,tinfoil-inference.")
+            "--routstr tinfoil-MODEL, with --trust=tinfoil-untrusted,tinfoil-inference.")
            ("--trust=LIST" "the operators you trust with cleartext, comma-separated"
             "tinfoil-inference  Tinfoil's model enclaves and their GPUs."
-            "tinfoil-routing    Tinfoil's shared router; it forwards to the model"
+            "tinfoil-untrusted  Tinfoil's shared router: a safeguards sidecar reads the"
+            "                   transcript, and config and reports cross outside any"
+            "                   enclave. Named for what it is; it forwards to the model"
             "                   enclaves, so it needs tinfoil-inference."
             "maple-routing      Maple's OpenSecret enclave; it routes some traffic to"
-            "                   Tinfoil's router, so it needs tinfoil-routing."
+            "                   Tinfoil's router, so it needs tinfoil-untrusted."
             "A name without what it needs is an error, as is an unknown name. Nothing"
             "reaches tinfoil-inference directly, so it never suffices alone.")))
          t)
@@ -878,7 +880,7 @@
                     ;; Replaced, not renamed: the seal and the operator are now two
                     ;; flags.  The old flag errors rather than being accepted.
                     (format *error-output*
-                            "~&operandi: --confidential-tinfoil was replaced by --confidential --trust=tinfoil-routing,tinfoil-inference.~%")
+                            "~&operandi: --confidential-tinfoil was replaced by --confidential --trust=tinfoil-untrusted,tinfoil-inference.~%")
                     (sb-ext:exit :code 2))
                    ((and acc (string= (first acc) "--confidential"))
                     ;; Every request sealed to a verified attestation, whose operator is
@@ -896,7 +898,7 @@
                     (let* ((inline (uiop:string-prefix-p "--trust=" (first acc)))
                            (spec (if inline (subseq (first acc) (length "--trust=")) (second acc))))
                       (unless (and spec (plusp (length spec)) (not (uiop:string-prefix-p "--" spec)))
-                        (format *error-output* "operandi: --trust needs a list of names, e.g. --trust=tinfoil-routing,tinfoil-inference~%")
+                        (format *error-output* "operandi: --trust needs a list of names, e.g. --trust=tinfoil-untrusted,tinfoil-inference~%")
                         (sb-ext:exit :code 2))
                       (multiple-value-bind (names bad) (llm:parse-trust-list spec)
                         (when bad

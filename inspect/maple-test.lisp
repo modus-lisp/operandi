@@ -77,7 +77,7 @@
 
   (check "--confidential on :maple is refused even with all three trusted: the proxy is unverified"
     (let ((llm:*llm-backend* :maple) (llm:*llm-model* "gpt-oss-120b") (llm:*confidential* t)
-          (llm:*trust* '("maple-routing" "tinfoil-routing" "tinfoil-inference")))
+          (llm:*trust* '("maple-routing" "tinfoil-untrusted" "tinfoil-inference")))
       (handler-case (progn (llm:require-confidential!) nil)
         (error () t))))
 

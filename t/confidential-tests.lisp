@@ -67,20 +67,20 @@
     (handler-case (progn (llm:require-confidential!) nil)
       (error () t))))
 
-(defparameter *tinfoil-trust* '("tinfoil-routing" "tinfoil-inference"))
+(defparameter *tinfoil-trust* '("tinfoil-untrusted" "tinfoil-inference"))
 
 (check "--confidential + :openrouter is refused, whatever --trust says"
        (and (claim-refused-p :openrouter "deepseek/deepseek-v4-flash" nil)
-            (claim-refused-p :openrouter "deepseek/deepseek-v4-flash" '("maple-routing" "tinfoil-routing" "tinfoil-inference"))))
+            (claim-refused-p :openrouter "deepseek/deepseek-v4-flash" '("maple-routing" "tinfoil-untrusted" "tinfoil-inference"))))
 
 (check "--confidential on :tinfoil with no --trust is refused: sealed is not trusted"
        (claim-refused-p :tinfoil "gpt-oss-120b" nil))
 
-(check "--confidential --trust=tinfoil-routing,tinfoil-inference on :tinfoil is allowed"
+(check "--confidential --trust=tinfoil-untrusted,tinfoil-inference on :tinfoil is allowed"
        (not (claim-refused-p :tinfoil "gpt-oss-120b" *tinfoil-trust*)))
 
-(check "tinfoil-routing without tinfoil-inference is refused: the router hands cleartext on"
-       (claim-refused-p :tinfoil "gpt-oss-120b" '("tinfoil-routing")))
+(check "tinfoil-untrusted without tinfoil-inference is refused: the router hands cleartext on"
+       (claim-refused-p :tinfoil "gpt-oss-120b" '("tinfoil-untrusted")))
 
 (check "tinfoil-inference alone enables nothing: nothing reaches it directly"
        (claim-refused-p :tinfoil "gpt-oss-120b" '("tinfoil-inference")))
@@ -96,7 +96,7 @@
             (not (claim-refused-p :routstr "tinfoil-gemma4-31b" *tinfoil-trust*))))
 
 (check "--confidential on :maple (through maple-proxy) is refused, even trusting maple"
-       (claim-refused-p :maple "gpt-oss-120b" '("maple-routing" "tinfoil-routing" "tinfoil-inference")))
+       (claim-refused-p :maple "gpt-oss-120b" '("maple-routing" "tinfoil-untrusted" "tinfoil-inference")))
 
 (check "no --confidential means no check at all"
        (let ((llm:*llm-backend* :openrouter) (llm:*confidential* nil) (llm:*trust* nil))
@@ -111,8 +111,8 @@
             (not (llm:sealable-p :openrouter "x"))))
 
 (check "trust names are case- and space-tolerant; a typo is reported, not dropped"
-       (multiple-value-bind (names bad) (llm:parse-trust-list " Maple-Routing, Tinfoil-Routing ,wrong")
-         (and (equal names '("maple-routing" "tinfoil-routing" "wrong")) (equal bad '("wrong")))))
+       (multiple-value-bind (names bad) (llm:parse-trust-list " Maple-Routing, Tinfoil-Untrusted ,wrong")
+         (and (equal names '("maple-routing" "tinfoil-untrusted" "wrong")) (equal bad '("wrong")))))
 
 ;;; ---- 3. the transport refuses a plaintext answer ----------------------------
 ;;;
@@ -184,7 +184,7 @@
                (let ((llm:*llm-backend* :routstr)
                      (llm:*llm-model* model)
                      (llm:*confidential* t)
-                     (llm:*trust* '("tinfoil-routing" "tinfoil-inference")))
+                     (llm:*trust* '("tinfoil-untrusted" "tinfoil-inference")))
                  (llm:set-backend-routstr! :model model :url node :token-file keyfile)
                  (llm:require-confidential!)
                  (multiple-value-bind (text parsed)

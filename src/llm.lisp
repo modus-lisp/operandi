@@ -177,15 +177,17 @@
   '(("tinfoil-inference" nil
      "Tinfoil's model enclaves: the inference container and the GPUs under it.
      Nothing in operandi can reach one directly, so on its own this enables no path.")
-    ("tinfoil-routing" ("tinfoil-inference")
+    ("tinfoil-untrusted" ("tinfoil-inference")
      "Tinfoil's shared router (inference.tinfoil.sh): its image, the safeguards
      sidecar that reads transcripts, the runtime config it fetches, and its choice of
-     model enclave.  The router hands cleartext to Tinfoil's model enclaves, so this
-     needs tinfoil-inference.")
-    ("maple-routing" ("tinfoil-routing")
+     model enclave.  Its violation reports go to api.tinfoil.sh, outside any
+     enclave.  The name is a contradiction on purpose: declaring it should feel
+     like what it is.  The router hands cleartext to Tinfoil's model enclaves, so
+     this needs tinfoil-inference.")
+    ("maple-routing" ("tinfoil-untrusted")
      "Maple's OpenSecret enclave on AWS Nitro and the providers it routes to.  Some
      of every model's traffic can reach Tinfoil's shared router, so this needs
-     tinfoil-routing."))
+     tinfoil-untrusted."))
   "Every name --trust accepts: (NAME REQUIRES DESCRIPTION).  A name can be declared
    only together with everything it REQUIRES, because its operator hands cleartext
    on to them.")
@@ -238,7 +240,7 @@
 (defun path-trust (&optional (backend *llm-backend*) (model *llm-model*))
   "The --trust name a confidential request on this path needs: the operator of the
    attested endpoint it is sealed to.  NIL when the path cannot be sealed."
-  (and (sealable-p backend model) "tinfoil-routing"))
+  (and (sealable-p backend model) "tinfoil-untrusted"))
 
 (defun confidential-refusal (&optional (backend *llm-backend*) (model *llm-model*))
   "NIL when --confidential allows BACKEND/MODEL, else the reason it does not."

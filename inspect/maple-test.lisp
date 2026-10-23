@@ -130,29 +130,61 @@
            (equal llm:*llm-auth-token* "test-key")
            (llm:sealable-p :maple "deepseek-v4-1-flash"))))
 
-  (check "route table: trust names per model"
-    (and (equal (operandi.maple:model-trust "gpt-oss-120b") '("maple-routing" "tinfoil-untrusted"))
-         (equal (operandi.maple:model-trust "glm-5-3-flash") '("maple-routing" "continuum"))
-         (equal (operandi.maple:model-trust "glm-5-3") '("maple-routing" "continuum" "tinfoil-untrusted"))
-         (equal (operandi.maple:model-trust "deepseek-v4-1-flash")
-                '("maple-routing" "maple-inference" "tinfoil-untrusted"))
-         (equal (operandi.maple:model-trust "deepseek-v4-1-flash-1017-uncensored")
-                '("maple-routing" "maple-inference"))
-         (null (operandi.maple:model-trust "gpt-9"))))
-  (check "enclave + --confidential: the uncensored DeepSeek needs only Maple's two names"
-    (not (enclave-refused-p "deepseek-v4-1-flash-1017-uncensored" '("maple-routing" "maple-inference"))))
-  (check "enclave + --confidential: stock DeepSeek also needs tinfoil-untrusted (5% and fallback)"
-    (and (enclave-refused-p "deepseek-v4-1-flash" '("maple-routing" "maple-inference"))
-         (not (enclave-refused-p "deepseek-v4-1-flash" '("maple-routing" "maple-inference" "tinfoil-untrusted")))))
-  (check "enclave + --confidential: a Tinfoil-routed model is refused with only Maple's names"
-    (enclave-refused-p "gpt-oss-120b" '("maple-routing" "maple-inference")))
-  (check "enclave + --confidential: glm-5-3-flash needs continuum, not Tinfoil"
-    (and (enclave-refused-p "glm-5-3-flash" '("maple-routing"))
-         (not (enclave-refused-p "glm-5-3-flash" '("maple-routing" "continuum")))))
-  (check "enclave + --confidential: maple-routing is always needed"
-    (enclave-refused-p "deepseek-v4-1-flash-1017-uncensored" '("maple-inference")))
-  (check "enclave + --confidential: a model no pinned release routes is refused"
-    (enclave-refused-p "gpt-9" '("maple-routing" "maple-inference" "tinfoil-untrusted" "continuum")))
+  ;; The live image, as the signed fixture describes it.  A fake session stands in for
+  ;; the attestation so nothing here touches the network.
+  (let* ((fixture (merge-pathnames "../t/fixtures/maple-routed-4984a12f.json"
+                                   (directory-namestring *load-truename*)))
+         (event (cl-nostr.event:json->event (uiop:read-file-string fixture)))
+         (reader (cl-nostr.event:event-pubkey event))
+         (live '("832b7d6df249b80b3ae11c10972cf8e82dda2fed28873542f80ac431157749c758c0ab81e97736b9968086809819a570"
+                 "a91689e37a54303051f68263010f397ddfa92d66e17df7a03a6777c33ff1e4fc12b69bbbe786894d43dcba1cf6d60aaa"
+                 "9f7d3d49d4f05e6c808d0751e6b8ecd4e641e6dd71a6b84485ae7860fa4edf3faa746a2500f5d35cc6ee9af55b940e10"))
+         (other (list (make-string 96 :initial-element #\e) (second live) (third live))))
+    (flet ((need (model &key (roots (list reader)) (pcrs live) (files (list fixture)))
+             (let ((operandi.maple:*wot-roots* roots) (operandi.maple:*statement-files* files))
+               (operandi.maple:required-trust model pcrs)))
+           (refused-p (model trust &key (roots (list reader)))
+             (let ((operandi.maple::*session* (operandi.maple::make-session :id "test" :key nil :pcrs live))
+                   (operandi.maple:*wot-roots* roots) (operandi.maple:*statement-files* (list fixture)))
+               (enclave-refused-p model trust))))
+      (check "fixture: the signed routed record verifies"
+        (equal (witness:statement-method (witness:event->statement event)) "routed"))
+      (check "no web of trust: every model needs everyone Maple can send to"
+        (and (equal (need "deepseek-v4-1-flash-1017-uncensored" :roots nil) operandi.maple:+all-trust+)
+             (equal (need "glm-5-3-flash" :roots nil) operandi.maple:+all-trust+)))
+      (check "a trusted routed record narrows each model to its own routes"
+        (and (equal (need "gpt-oss-120b") '("maple-routing" "tinfoil-untrusted"))
+             (equal (need "glm-5-3-flash") '("maple-routing" "continuum"))
+             (equal (need "glm-5-3") '("maple-routing" "continuum" "tinfoil-untrusted"))
+             (equal (need "deepseek-v4-1-flash") '("maple-routing" "maple-inference" "tinfoil-untrusted"))
+             (equal (need "deepseek-v4-1-flash-1017-uncensored") '("maple-routing" "maple-inference"))))
+      (check "a record about another image does not count for the live one"
+        (equal (need "glm-5-3-flash" :pcrs other) operandi.maple:+all-trust+))
+      (check "a record from outside the web of trust does not count"
+        (equal (need "glm-5-3-flash" :roots (list (make-string 64 :initial-element #\7)))
+               operandi.maple:+all-trust+))
+      (check "a model the record does not list needs everyone"
+        (equal (need "gpt-9") operandi.maple:+all-trust+))
+      (check "a tampered record does not verify and does not count"
+        (let ((bad (merge-pathnames "operandi-maple-tampered.json" (uiop:temporary-directory))))
+          (unwind-protect
+               (progn
+                 (with-open-file (o bad :direction :output :if-exists :supersede)
+                   (write-line (cl-ppcre:regex-replace "continuum" (uiop:read-file-string fixture) "tinfoil")
+                               o))
+                 (equal (need "glm-5-3-flash" :files (list bad)) operandi.maple:+all-trust+))
+            (ignore-errors (delete-file bad)))))
+      (check "--confidential: the uncensored DeepSeek needs only Maple's two names"
+        (not (refused-p "deepseek-v4-1-flash-1017-uncensored" '("maple-routing" "maple-inference"))))
+      (check "--confidential: stock DeepSeek also needs tinfoil-untrusted (5% and fallback)"
+        (and (refused-p "deepseek-v4-1-flash" '("maple-routing" "maple-inference"))
+             (not (refused-p "deepseek-v4-1-flash" '("maple-routing" "maple-inference" "tinfoil-untrusted")))))
+      (check "--confidential: glm-5-3-flash needs continuum, not Tinfoil"
+        (and (refused-p "glm-5-3-flash" '("maple-routing"))
+             (not (refused-p "glm-5-3-flash" '("maple-routing" "continuum")))))
+      (check "--confidential without a web of trust: only all four names will do"
+        (and (refused-p "glm-5-3-flash" '("maple-routing" "continuum") :roots nil)
+             (not (refused-p "glm-5-3-flash" operandi.maple:+all-trust+ :roots nil))))))
 
   (flet ((effort-body (effort)
            (let ((body (llm:ht "messages" #())))

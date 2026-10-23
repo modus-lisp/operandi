@@ -12,104 +12,135 @@
 ;;;;                                    ChaCha20-Poly1305 under the session key, both ways
 ;;;;
 ;;;; The document is verified locally (cl-sev-snp: signature, chain to the pinned AWS
-;;;; root, our nonce), and its PCR0/1/2 must be one of the RELEASES below.  An enclave
-;;;; we do not know is refused before anything is sent.
+;;;; root, our nonce) before anything is sent.
 ;;;;
-;;;; WHY A TABLE.  The enclave decrypts our request and forwards it, in the clear inside
-;;;; its own TLS, to a GPU provider.  Which provider is decided per MODEL by a route
-;;;; table compiled into the image (provider_registry.rs: `const` routes, parsed "only
-;;;; [from] compiled internal identities, never an arbitrary endpoint"); fallbacks stay
-;;;; inside the model's own routes; sticky routes only repeat a route the table chose;
-;;;; the remote feature-flag service only shows or hides models; the upstream URLs are
-;;;; set by the image's own entrypoint (Continuum through the continuum-proxy binary in
-;;;; the image, Tinfoil through the Tinfoil SDK in the image).  So a pinned image fixes,
-;;;; per model, who can see the cleartext — and that is what --trust has to cover.
-;;;;
-;;;; Maple's own pages say only that "the model runs in its own attested enclave".  The
-;;;; table below is what the source says instead.
+;;;; WHO SEES THE CLEARTEXT NEXT.  The enclave decrypts our request and forwards it to a
+;;;; GPU provider, chosen per model by a route table compiled into its image
+;;;; (provider_registry.rs).  The table changes with Maple's releases, every few days, so
+;;;; it is not kept here: it is a `routed' statement (witness, DEP-14 kind 55502) about
+;;;; the image's PCRs, signed by whoever read the source.  When enough readers in your web
+;;;; of trust agree on where the live image sends your model, that is what --trust has to
+;;;; cover.  Otherwise it is everyone Maple can send to (+ALL-PROVIDERS+).
 
 (defpackage #:operandi.maple
   (:use #:cl)
-  (:local-nicknames (#:json #:json-simple) (#:http #:operandi.http) (#:snp #:cl-sev-snp))
-  (:export #:*enclave-base* #:*releases* #:release-pcr0 #:release-source
-           #:model-providers #:model-trust #:known-model-p #:provider-trust
-           #:enclave-post #:reset-session #:session-release))
+  (:local-nicknames (#:json #:json-simple) (#:http #:operandi.http) (#:snp #:cl-sev-snp)
+                    (#:w #:witness))
+  (:export #:*enclave-base* #:*statement-files* #:*wot-roots* #:*threshold*
+           #:+all-trust+ #:provider-trust #:live-routes #:required-trust #:routes-explanation
+           #:live-pcrs #:enclave-post #:reset-session #:*on-new-enclave*))
 
 (in-package #:operandi.maple)
 
 (defvar *enclave-base* "https://enclave.trymaple.ai"
   "Maple's OpenSecret enclave.")
 
-;;; ---- the pinned releases -------------------------------------------------------
+(defvar *service* "enclave.trymaple.ai"
+  "The service name `routed' statements about this enclave carry.")
 
-(defparameter *releases*
-  '((:pcr0 "832b7d6df249b80b3ae11c10972cf8e82dda2fed28873542f80ac431157749c758c0ab81e97736b9968086809819a570"
-     :pcr1 "a91689e37a54303051f68263010f397ddfa92d66e17df7a03a6777c33ff1e4fc12b69bbbe786894d43dcba1cf6d60aaa"
-     :pcr2 "9f7d3d49d4f05e6c808d0751e6b8ecd4e641e6dd71a6b84485ae7860fa4edf3faa746a2500f5d35cc6ee9af55b940e10"
-     :source "4984a12f37c3ae93ec1b6ffbe0e6465114ac2e27"
-     ;; "Approve prod OpenSecret EIF measurements from 4984a12f37c3", 2026-10-22.
-     ;; Maple's own statement that this source builds to these PCRs; not yet rebuilt by us.
-     :approved "87b7c49dc368f76d636417ee1e91c5c29019cd20"
-     :reproduced nil
-     ;; provider_registry.rs at SOURCE.  Weights are the code's comments, for the record;
-     ;; only the SET of providers matters to the trust check, because fallback moves a
-     ;; request to any healthy route of the same model.
-     :routes (("gpt-oss-120b"                        :tinfoil)
-              ("gemma4-31b"                          :tinfoil)
-              ("kimi-k3"                             :tinfoil)
-              ("llama3-3-70b"                        :tinfoil)
-              ("gpt-oss-safeguard-120b"              :tinfoil)
-              ("glm-5-3"                             :continuum :tinfoil)   ; 75% / 25%
-              ("glm-5-3-flash"                       :continuum)
-              ("deepseek-v4-1-flash"                 :maple :tinfoil)       ; i01 95% / 5%, and on i01 failure
-              ("deepseek-v4-1-flash-1017-uncensored" :maple))))             ; i02 only, no fallback; per-account flag
-  "Every OpenSecret image this client will talk to: its PCRs, the source Maple approved
-   for them, and the providers each model can be sent to.  Add a release by reading
-   provider_registry.rs at its source commit; an unknown PCR0 is refused.")
+;;; ---- where the cleartext can go -------------------------------------------------
 
-(defun release-pcr0 (release) (getf release :pcr0))
-(defun release-source (release) (getf release :source))
+(defparameter +all-trust+ '("maple-routing" "maple-inference" "tinfoil-untrusted" "continuum")
+  "Everyone Maple's enclave can hand a request to, as --trust names: required when no
+   `routed' statement in the web of trust covers the model on the live image.")
 
 (defun provider-trust (provider)
-  "The --trust names that cover PROVIDER seeing the cleartext."
-  (ecase provider
-    (:tinfoil '("tinfoil-untrusted"))
-    (:continuum '("continuum"))
-    (:maple '("maple-inference"))))
+  "The --trust name covering PROVIDER (OpenSecret's own name for it), or NIL if there is
+   none: a provider with no name can never be covered."
+  (cond ((string= provider "tinfoil") "tinfoil-untrusted")
+        ((string= provider "continuum") "continuum")
+        ((uiop:string-prefix-p "maple-" provider) "maple-inference")
+        (t nil)))
 
-(defun model-providers (model)
-  "Every provider MODEL can reach under any pinned release, or NIL if no release
-   routes it."
-  (remove-duplicates
-   (loop for r in *releases*
-         append (rest (assoc model (getf r :routes) :test #'string=)))
-   :from-end t))
+(defvar *statement-files*
+  (append (list (merge-pathnames ".local/share/witness/statements.jsonl" (user-homedir-pathname)))
+          (let ((env (uiop:getenv "OPERANDI_STATEMENTS")))
+            (and env (remove "" (uiop:split-string env :separator ":") :test #'string=))))
+  "Where `routed' (and `proclaim') statements are read from: the witness store, plus
+   the files in OPERANDI_STATEMENTS (colon-separated).  Each holds one event per line.
+   Nothing is fetched from relays yet.")
 
-(defun known-model-p (model)
-  (some (lambda (r) (assoc model (getf r :routes) :test #'string=)) *releases*))
+(defvar *wot-roots*
+  (let ((env (uiop:getenv "OPERANDI_WOT_ROOTS")))
+    (and env (remove "" (mapcar (lambda (s) (string-trim " " s))
+                                (uiop:split-string env :separator ","))
+                     :test #'string=)))
+  "The pubkeys (hex or npub) whose web of trust decides which `routed' statements count.
+   From OPERANDI_WOT_ROOTS.  NIL: none count, and every model needs +ALL-TRUST+.")
 
-(defun model-trust (model)
-  "The --trust names a confidential request for MODEL needs: Maple's own enclave plus
-   whoever its route table can hand the cleartext to.  NIL for a model no pinned
-   release routes."
-  (and (known-model-p model)
-       (remove-duplicates (cons "maple-routing"
-                                (mapcan (lambda (p) (copy-list (provider-trust p)))
-                                        (model-providers model)))
-                          :test #'string= :from-end t)))
+(defvar *threshold* 1 "Distinct trusted readers who must agree on a model's routes.")
+
+(defun %load-statements ()
+  (loop for f in *statement-files*
+        when (probe-file f)
+          append (with-open-file (in f)
+                   (loop for line = (read-line in nil) while line
+                         for trimmed = (string-trim '(#\Space #\Tab #\Return) line)
+                         when (plusp (length trimmed))
+                           append (handler-case
+                                      (list (w:event->statement (cl-nostr.event:json->event trimmed)))
+                                    (error () nil))))))
+
+(defun live-routes (pcrs model)
+  "Where the image measured as PCRS (PCR0 PCR1 PCR2, hex) sends MODEL, according to the
+   web of trust.  Returns (values PROVIDERS SIGNERS CONFLICT): PROVIDERS is NIL when no
+   agreement covers it."
+  (if (null *wot-roots*)
+      (values nil nil nil)
+      (let ((policy (w:make-policy (%load-statements) :roots *wot-roots*)))
+        (w:routed-providers policy (format nil "~(~{~a~^|~}~)" pcrs) model
+                            :service *service* :threshold *threshold*))))
+
+(defun required-trust (model &optional (pcrs (live-pcrs)))
+  "The --trust names a confidential request for MODEL to the image PCRS needs.  Returns
+   (values NAMES HOW): HOW is :ROUTED when a web-of-trust agreement narrowed it, else
+   :DEFAULT (everyone Maple can send to).  Signals when the agreed routes name a provider
+   no --trust name covers."
+  (multiple-value-bind (providers) (live-routes pcrs model)
+    (if (null providers)
+        (values +all-trust+ :default)
+        (values (remove-duplicates
+                 (cons "maple-routing"
+                       (mapcar (lambda (p)
+                                 (or (provider-trust p)
+                                     (error "maple: the routes for ~a include ~s, which no --trust name covers"
+                                            model p)))
+                               providers))
+                 :test #'string= :from-end t)
+                :routed))))
+
+(defun routes-explanation (model &optional (pcrs (live-pcrs)))
+  "One line saying where MODEL's route requirement came from, for refusal messages."
+  (multiple-value-bind (providers signers conflict) (live-routes pcrs model)
+    (cond (providers
+           (format nil "~a on the live image (PCR0 ~a…) goes to ~{~a~^, ~}, per ~{~a~^, ~}"
+                   model (subseq (first pcrs) 0 12) providers
+                   (mapcar (lambda (s) (subseq (w:key-npub s) 0 16)) signers)))
+          (conflict
+           (format nil "readers in your web of trust disagree about where ~a goes on the live image (PCR0 ~a…), so Maple may send it anywhere it routes"
+                   model (subseq (first pcrs) 0 12)))
+          ((null *wot-roots*)
+           (format nil "no web of trust is configured (OPERANDI_WOT_ROOTS), so Maple may send ~a anywhere it routes"
+                   model))
+          (t
+           (format nil "no `routed' statement in your web of trust covers ~a on the live image (PCR0 ~a…), so Maple may send it anywhere it routes"
+                   model (subseq (first pcrs) 0 12))))))
 
 ;;; ---- the session ----------------------------------------------------------------
 
-(defstruct (session (:conc-name sess-)) id key release)
+(defstruct (session (:conc-name sess-)) id key pcrs)
 
 (defvar *session* nil "The current enclave session, or NIL.")
 (defvar *session-lock* (bt:make-lock "maple-session"))
+(defvar *checked-pcrs* nil "The image *ON-NEW-ENCLAVE* last accepted.")
 
-(defun reset-session () (bt:with-lock-held (*session-lock*) (setf *session* nil)))
+(defvar *on-new-enclave* nil
+  "Called with no arguments, outside the session lock, the first time a session is with
+   an image other than the last one accepted.  It signals to refuse the image: the
+   check made against the old image is not a check of this one.")
 
-(defun session-release ()
-  "The release the current session was verified against, or NIL."
-  (let ((s *session*)) (and s (sess-release s))))
+(defun reset-session ()
+  (bt:with-lock-held (*session-lock*) (setf *session* nil)))
 
 (defun %u8 (x) (coerce x '(simple-array (unsigned-byte 8) (*))))
 (defun %utf8 (s) (%u8 (babel:string-to-octets s :encoding :utf-8)))
@@ -128,16 +159,6 @@
       (format nil "~a-~a-~a-~a-~a"
               (subseq h 0 8) (subseq h 8 12) (subseq h 12 16) (subseq h 16 20) (subseq h 20)))))
 
-(defun %release-for (doc)
-  "The pinned release whose PCR0, PCR1 and PCR2 all match DOC, or NIL."
-  (let ((p0 (%hex (snp:nitro-doc-pcr doc 0)))
-        (p1 (%hex (snp:nitro-doc-pcr doc 1)))
-        (p2 (%hex (snp:nitro-doc-pcr doc 2))))
-    (find-if (lambda (r) (and (string= p0 (getf r :pcr0))
-                              (string= p1 (getf r :pcr1))
-                              (string= p2 (getf r :pcr2))))
-             *releases*)))
-
 (defun %open (key b64)
   "Decrypt one {\"encrypted\": ...} payload, or signal."
   (let* ((e (%u8 (snp:base64-decode b64)))
@@ -152,8 +173,8 @@
       (snp:base64-encode (%u8 (concatenate '(vector (unsigned-byte 8)) nonce ct tag))))))
 
 (defun %handshake (&key (base *enclave-base*))
-  "Attest the enclave, check it is a pinned release, and agree a session key with the
-   key the attestation vouches for.  Returns a SESSION; signals on any failure."
+  "Attest the enclave and agree a session key with the key the attestation vouches for.
+   Returns a SESSION; signals on any failure."
   (let* ((nonce (%uuid4))
          (body (http:get (format nil "~a/attestation/~a" base nonce) :read-timeout 30))
          (j (json:parse body))
@@ -165,57 +186,49 @@
       (unless (and doc ok)
         (error "maple: the enclave's Nitro attestation did not verify: ~{~a~^, ~}"
                (mapcar #'car (remove-if #'cdr checks))))
-      (let ((release (%release-for doc)))
-        (unless release
-          (error "maple: the enclave runs an image this client does not know (PCR0 ~a). ~
-                  Pinned: ~{~a~^, ~}.  Add it to OPERANDI.MAPLE:*RELEASES* only after reading ~
-                  its route table."
-                 (%hex (snp:nitro-doc-pcr doc 0)) (mapcar #'release-pcr0 *releases*)))
-        (let ((server-pk (%u8 (snp:nitro-doc-public-key doc))))
-          (unless (= (length server-pk) 32)
-            (error "maple: the attested public key is ~d bytes, not an X25519 key" (length server-pk)))
-          (multiple-value-bind (sk pk) (natrium:x25519-keypair)
-            (unwind-protect
-                 (let* ((resp (json:parse
-                               (http:post (format nil "~a/key_exchange" base)
-                                          :content (json:stringify
-                                                    (%ht "client_public_key" (snp:base64-encode (%u8 pk))
-                                                         "nonce" nonce))
-                                          :headers '(("Content-Type" . "application/json"))
-                                          :read-timeout 30)))
-                        (sealed (gethash "encrypted_session_key" resp))
-                        (sid (gethash "session_id" resp)))
-                   (unless (and (stringp sealed) (stringp sid))
-                     (error "maple: key_exchange returned no session"))
-                   (let ((key (%open (%u8 (natrium:x25519 sk server-pk)) sealed)))
-                     (unless (= (length key) 32)
-                       (error "maple: the session key is ~d bytes" (length key)))
-                     (make-session :id sid :key (%u8 key) :release release)))
-              (fill sk 0))))))))
+      (let ((server-pk (%u8 (snp:nitro-doc-public-key doc)))
+            (pcrs (loop for i below 3 collect (%hex (snp:nitro-doc-pcr doc i)))))
+        (unless (= (length server-pk) 32)
+          (error "maple: the attested public key is ~d bytes, not an X25519 key" (length server-pk)))
+        (multiple-value-bind (sk pk) (natrium:x25519-keypair)
+          (unwind-protect
+               (let* ((resp (json:parse
+                             (http:post (format nil "~a/key_exchange" base)
+                                        :content (json:stringify
+                                                  (%ht "client_public_key" (snp:base64-encode (%u8 pk))
+                                                       "nonce" nonce))
+                                        :headers '(("Content-Type" . "application/json"))
+                                        :read-timeout 30)))
+                      (sealed (gethash "encrypted_session_key" resp))
+                      (sid (gethash "session_id" resp)))
+                 (unless (and (stringp sealed) (stringp sid))
+                   (error "maple: key_exchange returned no session"))
+                 (let ((key (%open (%u8 (natrium:x25519 sk server-pk)) sealed)))
+                   (unless (= (length key) 32)
+                     (error "maple: the session key is ~d bytes" (length key)))
+                   (make-session :id sid :key (%u8 key) :pcrs pcrs)))
+            (fill sk 0)))))))
 
 (defun %session (&key (base *enclave-base*))
-  (bt:with-lock-held (*session-lock*)
-    (or *session* (setf *session* (%handshake :base base)))))
+  (let ((s (bt:with-lock-held (*session-lock*)
+             (or *session* (setf *session* (%handshake :base base))))))
+    (unless (equal (sess-pcrs s) *checked-pcrs*)
+      (when *on-new-enclave* (funcall *on-new-enclave*))
+      (setf *checked-pcrs* (sess-pcrs s)))
+    s))
 
-(defun %model-of (body)
-  (let ((j (ignore-errors (json:parse body))))
-    (and (hash-table-p j) (gethash "model" j))))
+(defun live-pcrs ()
+  "PCR0, PCR1, PCR2 of the enclave, attesting it if there is no session yet."
+  (sess-pcrs (bt:with-lock-held (*session-lock*)
+               (or *session* (setf *session* (%handshake))))))
 
 (defun enclave-post (url body headers &key (base *enclave-base*) (read-timeout 300))
   "POST BODY (a chat-completions JSON string) to URL through the enclave session and
-   return the decrypted response body as a string.  HEADERS supply Authorization.
-
-   The request is refused before it is sent if the live release does not route the
-   body's model: the trust check at startup was made against the pinned table, and a
-   release that disagrees with it is not the one that check was about.  A response
-   that is not encrypted under the session key is an error, never parsed."
+   return the decrypted response body as a string.  HEADERS supply Authorization.  A
+   response that is not encrypted under the session key is an error, never parsed."
   (let ((attempt 0))
     (loop
-      (let* ((s (%session :base base))
-             (model (%model-of body)))
-        (unless (and model (assoc model (getf (sess-release s) :routes) :test #'string=))
-          (error "maple: the enclave's release (source ~a) does not route model ~s"
-                 (subseq (release-source (sess-release s)) 0 12) model))
+      (let ((s (%session :base base)))
         (handler-case
             (let* ((auth (assoc "Authorization" headers :test #'string-equal))
                    (resp (http:post url

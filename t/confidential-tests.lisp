@@ -96,11 +96,13 @@
        (let ((llm:*maple-mode* :proxy))
          (claim-refused-p :maple "gpt-oss-120b" '("maple-routing" "tinfoil-untrusted" "continuum"))))
 
-(check "--confidential on Maple's enclave: per model, from the pinned route table"
-       (let ((llm:*maple-mode* :enclave))
-         (and (not (claim-refused-p :maple "gpt-oss-120b" '("maple-routing" "tinfoil-untrusted")))
-              (claim-refused-p :maple "gpt-oss-120b" '("maple-routing"))
-              (not (claim-refused-p :maple "deepseek-v4-1-flash-1017-uncensored" '("maple-routing" "maple-inference"))))))
+(check "--confidential on Maple's enclave with no web of trust: everyone Maple can send to"
+       (let ((llm:*maple-mode* :enclave)
+             (operandi.maple:*wot-roots* nil)
+             (operandi.maple::*session* (operandi.maple::make-session :id "t" :key nil :pcrs '("a" "b" "c"))))
+         (and (claim-refused-p :maple "glm-5-3-flash" '("maple-routing" "continuum"))
+              (not (claim-refused-p :maple "glm-5-3-flash"
+                                    '("maple-routing" "maple-inference" "tinfoil-untrusted" "continuum"))))))
 
 (check "no --confidential means no check at all"
        (let ((llm:*llm-backend* :openrouter) (llm:*confidential* nil) (llm:*trust* nil))

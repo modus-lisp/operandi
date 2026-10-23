@@ -475,9 +475,9 @@
             "Tinfoil id (gpt-oss-120b, ...). Key in ~/.operandi/tinfoil.token.")
            ("--maple [ADDR] [MODEL]" "Maple: its enclave directly, or a maple-proxy at ADDR"
             "Without ADDR, operandi verifies the AWS Nitro attestation of Maple's"
-            "enclave, requires a pinned release, and encrypts every request to it."
-            "Maple decides per model who sees the cleartext next; under --confidential"
-            "the model's routes must be in --trust (see --trust below). Key in"
+            "enclave and encrypts every request to it. Maple decides per model who sees"
+            "the cleartext next; under --confidential that must be in --trust (see"
+            "--trust below). Key in"
             "~/.operandi/maple.token. With ADDR (same grammar as --llama), plain HTTP to"
             "a maple-proxy that operandi does not verify; --confidential refuses it."
             "MODEL is a Maple id (gpt-oss-120b, deepseek-v4-1-flash, ...).")
@@ -499,15 +499,9 @@
             "maple-inference    Maple's own GPU guests (i01, i02)."
             "continuum          Continuum (Edgeless Privatemode), via Maple's image."
             "An unknown name is an error."
-            "Maple, per model (pinned release 4984a12f):"
-            "  gpt-oss-120b gemma4-31b kimi-k3 llama3-3-70b gpt-oss-safeguard-120b"
-            "      maple-routing,tinfoil-untrusted"
-            "  glm-5-3              maple-routing,continuum,tinfoil-untrusted"
-            "  glm-5-3-flash        maple-routing,continuum"
-            "  deepseek-v4-1-flash  maple-routing,maple-inference,tinfoil-untrusted"
-            "                       (95% to i01, 5% to Tinfoil, and Tinfoil when i01 fails)"
-            "  deepseek-v4-1-flash-1017-uncensored  maple-routing,maple-inference"
-            "                       (i02 only; Maple enables it per account)")))
+            "Maple: everyone it can send to (maple-routing,maple-inference,"
+            "tinfoil-untrusted,continuum), unless a `routed' statement from your web of"
+            "trust (OPERANDI_WOT_ROOTS) says where the live image sends your model.")))
          t)
 
    (list "session" "Session" :green

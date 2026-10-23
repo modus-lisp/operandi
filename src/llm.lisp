@@ -188,8 +188,9 @@
     ("maple-routing"
      "Maple's OpenSecret enclave on AWS Nitro: AWS as operator and verifier, and the
      code at the pinned source, which decrypts the request and picks the provider.
-     Which providers a model can reach is in OPERANDI.MAPLE:*RELEASES*, so the other
-     names a --maple model needs come from there, not from here.")
+     Which providers a model can reach comes from `routed' statements in your web of
+     trust (OPERANDI.MAPLE); without one, a --maple model needs every name Maple can
+     send to.")
     ("maple-inference"
      "Maple's own GPU guests (i01, i02): SEV-SNP machines whose measurement Maple's
      enclave pins, running an inference container, on GPUs nobody appraises.")
@@ -230,23 +231,17 @@
 (defun path-trust (&optional (backend *llm-backend*) (model *llm-model*))
   "The --trust names a confidential request on this path needs: the operator of the
    attested endpoint it is sealed to, and everyone that operator can hand the
-   cleartext to.  NIL when the path cannot be sealed, or (for :MAPLE) when no
-   pinned release routes MODEL."
+   cleartext to.  NIL when the path cannot be sealed.  For :MAPLE this attests the
+   live enclave (network) and asks the web of trust where its image sends MODEL."
   (cond ((not (sealable-p backend model)) nil)
-        ((eq backend :maple) (and model (operandi.maple:model-trust model)))
+        ((eq backend :maple) (values (operandi.maple:required-trust model)))
         (t (list "tinfoil-untrusted"))))
 
 (defun confidential-refusal (&optional (backend *llm-backend*) (model *llm-model*))
   "NIL when --confidential allows BACKEND/MODEL, else the reason it does not."
   (let* ((need (path-trust backend model))
          (missing (remove-if (lambda (n) (member n *trust* :test #'string=)) need)))
-    (cond ((and (eq backend :maple) (sealable-p backend model) (null need))
-           (format nil "no pinned Maple release routes model ~s; known: ~{~a~^, ~}"
-                   model (remove-duplicates
-                          (loop for r in operandi.maple:*releases*
-                                append (mapcar #'first (getf r :routes)))
-                          :test #'string= :from-end t)))
-          ((null need)
+    (cond ((null need)
            (format nil "the ~(~a~) path~@[ with ~a~] is not sealed to an attestation operandi verifies~a"
                    backend model
                    (case backend
@@ -254,9 +249,12 @@
                      (:routstr "; use a tinfoil-* model")
                      (:maple "; --maple ADDR goes through maple-proxy, which operandi does not verify; use --maple MODEL")
                      (t ""))))
+          ((and missing (eq backend :maple))
+           (format nil "~a; --trust does not name ~{~a~^, ~}. Declare --trust=~{~a~^,~}"
+                   (operandi.maple:routes-explanation model) missing need))
           (missing
-           (format nil "the ~(~a~) path~@[ with ~a~] can hand the cleartext to ~{~a~^, ~}, which --trust does not name; declare --trust=~{~a~^,~}"
-                   backend (and (eq backend :maple) model) missing need))
+           (format nil "the ~(~a~) path can hand the cleartext to ~{~a~^, ~}, which --trust does not name; declare --trust=~{~a~^,~}"
+                   backend missing need))
           (t nil))))
 
 (defun claim-check! (&optional (backend *llm-backend*) (model *llm-model*))
@@ -781,8 +779,9 @@ call with :want-stream nil"))
 
    With no URL, talk to Maple's enclave directly (OPERANDI.MAPLE): every request is
    encrypted to a session key agreed with a key in an AWS Nitro attestation verified
-   here, and the enclave must be a pinned release.  This needs an API key.  It is
-   sealed, so --confidential accepts it once --trust covers the model's routes.
+   here.  This needs an API key.  It is sealed, so --confidential accepts it once
+   --trust covers everyone the live image can send the model to
+   (OPERANDI.MAPLE:REQUIRED-TRUST).
 
    With URL, go through a maple-proxy there.  The token is optional and the path is
    not verified by operandi, so --confidential refuses it whatever --trust says.  A
@@ -803,7 +802,15 @@ call with :want-stream nil"))
                 *llm-model*      model
                 *llm-read-timeout* 300
                 *sealed-post*    (lambda (url body headers)
-                                   (operandi.maple:enclave-post url body headers)))
+                                   (operandi.maple:enclave-post url body headers))
+                ;; Maple redeploys every few days, and a new image can route differently:
+                ;; the first session with an image the startup check did not see is
+                ;; checked again before anything is sent to it.
+                operandi.maple:*on-new-enclave*
+                (lambda ()
+                  (when (and *confidential* (eq *llm-backend* :maple))
+                    (let ((why (confidential-refusal)))
+                      (when why (error "--confidential: Maple's enclave is now a different image: ~a." why))))))
           t)))
       ((maple-refusal url)
        (format *error-output* "~&set-backend-maple!: ~A~%" (maple-refusal url))

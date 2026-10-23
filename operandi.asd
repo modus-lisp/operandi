@@ -24,6 +24,7 @@
                                 ; what makes :PPQ --confidential-tinfoil a local trust decision, not a promise
                "cl-sev-snp/kds" ; ...plus the AMD KDS fetch for the ARK/ASK chain
                "natrium"        ; X25519 and ChaCha20-Poly1305 for Maple's enclave sessions
+               "witness"        ; signed `routed' statements: where Maple sends each model
                "babel"
                "quri"
                "cl-base64"

@@ -137,9 +137,9 @@ always prompt text — `operandi tui` is a task whose text is "tui".
 | `--routstr [NODE-URL] [MODEL]` | use Routstr (Lightning-paid nodes); `NODE-URL` picks the node |
 | `--ppq [MODEL]` | use PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/Lightning |
 | `--tinfoil [MODEL]` | use Tinfoil's own enclave, sealed end to end (no plaintext mode) |
-| `--maple [ADDR] [MODEL]` | use Maple through a **local** `maple-proxy` at `ADDR` (default `127.0.0.1:8080`). The proxy does Maple's attested transport; operandi does **not** verify the enclave, so `--confidential` refuses it. Plaintext to a non-loopback host is refused. Optional key in `~/.operandi/maple.token` |
-| `--confidential` | seal every request to a key bound into a hardware attestation that operandi verifies, and refuse any path that can't be sealed that way. The sealed endpoint's operator must also be in `--trust`. Today that's Tinfoil's router: `--tinfoil`, `--ppq private/MODEL` or `--routstr tinfoil-MODEL` |
-| `--trust=LIST` | the operators trusted with the cleartext: `maple-routing` (needs both Tinfoil names: it routes some traffic to Tinfoil's router), `tinfoil-untrusted` (Tinfoil's shared router, whose safeguards sidecar reads transcripts and whose config and reports cross outside any enclave; needs `tinfoil-inference`, the model enclaves it forwards to), `tinfoil-inference` (alone it enables nothing; nothing reaches the model enclaves directly). A name without what it needs is an error |
+| `--maple [ADDR] [MODEL]` | Maple. Without `ADDR`, operandi verifies the AWS Nitro attestation of Maple's enclave, requires a pinned release, and encrypts every request to it itself; under `--confidential` the model's routes must be in `--trust` (table below). Key in `~/.operandi/maple.token`. With `ADDR`, plain HTTP to a `maple-proxy` that operandi does not verify, which `--confidential` refuses |
+| `--confidential` | seal every request to a key bound into a hardware attestation that operandi verifies, and refuse any path that can't be sealed that way. Whoever can see the cleartext after that must be in `--trust`. Sealed paths: Tinfoil's router (`--tinfoil`, `--ppq private/MODEL`, `--routstr tinfoil-MODEL`) and Maple's enclave (`--maple MODEL`) |
+| `--trust=LIST` | who you trust with the cleartext: `tinfoil-untrusted` (Tinfoil's shared router, whose safeguards sidecar reads transcripts and whose config and reports cross outside any enclave; covers the model enclaves it forwards to), `tinfoil-inference` (Tinfoil's model enclaves alone; nothing reaches one directly yet), `maple-routing` (Maple's enclave on AWS Nitro, which picks the provider), `maple-inference` (Maple's own GPU guests), `continuum` (Edgeless Privatemode, through Maple's image). An unknown name is an error |
 | `--rc TARGET` | mirror each turn to a Marmot chat (npub/nprofile/NIP-05 starts one; a chat name or group id joins one) |
 | `--worker-model M` | model for sub-agents: a `vendor/name` slug, `llama`, or `inherit` |
 | `--effort off\|low\|medium\|high\|default` | reasoning effort (also `OPERANDI_EFFORT`) |
@@ -187,6 +187,37 @@ the `/effort` command.
 
 `bin/operandi-acp` and `bin/operandi-nostr.lisp` have their own variables
 (`OPERANDI_ACP_MODEL`, `OPERANDI_NOSTR_*`); see their sections below.
+
+### Confidential inference
+
+`--confidential` seals each request to a key in a hardware attestation that operandi checks itself. `--trust` names whoever can read the request after that. The seal proves where the request goes, not what happens there.
+
+| path | `--trust` |
+|---|---|
+| `--tinfoil`, `--ppq private/MODEL`, `--routstr tinfoil-MODEL` | `tinfoil-untrusted` |
+| `--maple MODEL` | per model, below |
+
+PPQ and Routstr relay the sealed body without being able to read it, so they need no name.
+
+#### Maple: where each model goes
+
+Maple's enclave decrypts your request and forwards it to a GPU provider. Maple's pages say only that "the model runs in its own attested enclave". The route table compiled into its enclave says this. The table is from [`provider_registry.rs`](https://github.com/MaplePrivacyLabs/Maple/blob/4984a12f37c3ae93ec1b6ffbe0e6465114ac2e27/services/opensecret/src/provider_registry.rs) at `4984a12f`, the source Maple approved for PCR0 `832b7d6d…` (commit `87b7c49d`), which is what `enclave.trymaple.ai` attests to today.
+
+| model | goes to | `--trust` |
+|---|---|---|
+| gpt-oss-120b, gemma4-31b, kimi-k3, llama3-3-70b, gpt-oss-safeguard-120b | Tinfoil | `maple-routing,tinfoil-untrusted` |
+| glm-5-3 | Continuum 75%, Tinfoil 25% | `maple-routing,continuum,tinfoil-untrusted` |
+| glm-5-3-flash | Continuum | `maple-routing,continuum` |
+| deepseek-v4-1-flash | Maple's i01 95%, Tinfoil 5%, and Tinfoil whenever i01 is unavailable | `maple-routing,maple-inference,tinfoil-untrusted` |
+| deepseek-v4-1-flash-1017-uncensored | Maple's i02 only, no fallback; enabled per account | `maple-routing,maple-inference` |
+
+Why a pinned image fixes this, from the same source:
+- **The routes are compile-time constants.** Fallback stays within the model's own routes.
+- **Sticky routing** only repeats a route the table already chose, for up to an hour per account.
+- **The remote feature-flag service** only shows or hides models.
+- **The upstream addresses are set by the image's own entrypoint.** Continuum is reached through a `continuum-proxy` binary shipped prebuilt in the image, and Tinfoil through the Tinfoil SDK, which accepts any signed release of Tinfoil's router.
+
+operandi refuses an enclave whose PCR0, PCR1 and PCR2 aren't a pinned release (`OPERANDI.MAPLE:*RELEASES*`). Maple's approval says that source builds to those PCRs; we haven't rebuilt this release ourselves yet. We did rebuild an earlier one, `7820f27c`, bit-for-bit.
 
 ### Configuration
 

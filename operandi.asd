@@ -23,6 +23,7 @@
                "cl-sev-snp"     ; AMD SEV-SNP / AWS Nitro attestation verification, pure CL --
                                 ; what makes :PPQ --confidential-tinfoil a local trust decision, not a promise
                "cl-sev-snp/kds" ; ...plus the AMD KDS fetch for the ARK/ASK chain
+               "natrium"        ; X25519 and ChaCha20-Poly1305 for Maple's enclave sessions
                "babel"
                "quri"
                "cl-base64"
@@ -40,7 +41,8 @@
      (:file "http")                                           ; operandi.http
      (:file "payments" :depends-on ("http"))                  ; operandi.payments
      (:file "ppq"      :depends-on ("http"))                  ; operandi.ppq
-     (:file "llm"      :depends-on ("http" "ppq"))            ; operandi.llm
+     (:file "maple"    :depends-on ("http"))                  ; operandi.maple (attested OpenSecret transport)
+     (:file "llm"      :depends-on ("http" "ppq" "maple"))    ; operandi.llm
      (:file "actor")                                          ; operandi.actor
      (:file "store")                                          ; operandi.store
      (:file "search"   :depends-on ("http" "llm"))            ; operandi.search

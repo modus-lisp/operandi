@@ -67,20 +67,17 @@
     (handler-case (progn (llm:require-confidential!) nil)
       (error () t))))
 
-(defparameter *tinfoil-trust* '("tinfoil-untrusted" "tinfoil-inference"))
+(defparameter *tinfoil-trust* '("tinfoil-untrusted"))
 
 (check "--confidential + :openrouter is refused, whatever --trust says"
        (and (claim-refused-p :openrouter "deepseek/deepseek-v4-flash" nil)
-            (claim-refused-p :openrouter "deepseek/deepseek-v4-flash" '("maple-routing" "tinfoil-untrusted" "tinfoil-inference"))))
+            (claim-refused-p :openrouter "deepseek/deepseek-v4-flash" '("maple-routing" "tinfoil-untrusted" "continuum"))))
 
 (check "--confidential on :tinfoil with no --trust is refused: sealed is not trusted"
        (claim-refused-p :tinfoil "gpt-oss-120b" nil))
 
-(check "--confidential --trust=tinfoil-untrusted,tinfoil-inference on :tinfoil is allowed"
+(check "--confidential --trust=tinfoil-untrusted on :tinfoil is allowed"
        (not (claim-refused-p :tinfoil "gpt-oss-120b" *tinfoil-trust*)))
-
-(check "tinfoil-untrusted without tinfoil-inference is refused: the router hands cleartext on"
-       (claim-refused-p :tinfoil "gpt-oss-120b" '("tinfoil-untrusted")))
 
 (check "tinfoil-inference alone enables nothing: nothing reaches it directly"
        (claim-refused-p :tinfoil "gpt-oss-120b" '("tinfoil-inference")))
@@ -95,8 +92,15 @@
        (and (claim-refused-p :routstr "gemini-3-6-flash" *tinfoil-trust*)
             (not (claim-refused-p :routstr "tinfoil-gemma4-31b" *tinfoil-trust*))))
 
-(check "--confidential on :maple (through maple-proxy) is refused, even trusting maple"
-       (claim-refused-p :maple "gpt-oss-120b" '("maple-routing" "tinfoil-untrusted" "tinfoil-inference")))
+(check "--confidential on :maple through maple-proxy is refused, whatever --trust says"
+       (let ((llm:*maple-mode* :proxy))
+         (claim-refused-p :maple "gpt-oss-120b" '("maple-routing" "tinfoil-untrusted" "continuum"))))
+
+(check "--confidential on Maple's enclave: per model, from the pinned route table"
+       (let ((llm:*maple-mode* :enclave))
+         (and (not (claim-refused-p :maple "gpt-oss-120b" '("maple-routing" "tinfoil-untrusted")))
+              (claim-refused-p :maple "gpt-oss-120b" '("maple-routing"))
+              (not (claim-refused-p :maple "deepseek-v4-1-flash-1017-uncensored" '("maple-routing" "maple-inference"))))))
 
 (check "no --confidential means no check at all"
        (let ((llm:*llm-backend* :openrouter) (llm:*confidential* nil) (llm:*trust* nil))
@@ -184,7 +188,7 @@
                (let ((llm:*llm-backend* :routstr)
                      (llm:*llm-model* model)
                      (llm:*confidential* t)
-                     (llm:*trust* '("tinfoil-untrusted" "tinfoil-inference")))
+                     (llm:*trust* '("tinfoil-untrusted")))
                  (llm:set-backend-routstr! :model model :url node :token-file keyfile)
                  (llm:require-confidential!)
                  (multiple-value-bind (text parsed)

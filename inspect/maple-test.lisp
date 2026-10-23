@@ -1,14 +1,16 @@
 ;;; inspect/maple-test.lisp
 ;;;
-;;; Oracle for the :MAPLE backend's refusals and request shape.  No network: the
-;;; backend is a switch plus a request body, so both are checked directly.
+;;; Oracle for the :MAPLE backend's two modes, its refusals and request shape.  No
+;;; network: the backend is a switch, a route table and a request body.
 ;;;
 ;;; What it pins down:
-;;;   - a non-loopback plaintext URL is refused, and the backend does not change
-;;;   - a loopback URL with no token file switches cleanly, with no Authorization key
-;;;   - --confidential is a claim checked at startup, not a setter refusal
+;;;   - proxy mode: a non-loopback plaintext URL is refused and the backend does not
+;;;     change; loopback with no token switches cleanly, with no Authorization key;
+;;;     --confidential refuses it whatever --trust says
+;;;   - enclave mode: needs a key; installs a sealer; --confidential requires exactly
+;;;     the trust names the pinned route table gives the model, and refuses a model
+;;;     no pinned release routes
 ;;;   - reasoning_effort is sent for low/medium/high and omitted for off/default
-;;;   - :MAPLE is a cloud backend and is never a confidential one
 ;;;
 ;;;   sbcl --non-interactive --load inspect/maple-test.lisp   (exits 0/1)
 
@@ -35,12 +37,30 @@
      (serious-condition (e)
        (incf *fail*) (format t "~&  FAIL ~A (~A)~%" ,name (type-of e)))))
 
+(defparameter *key-file*
+  (format nil "~A/operandi-maple-test.token" (uiop:temporary-directory)))
+
+(defun enclave-refused-p (model trust)
+  "True when --confidential with --trust TRUST refuses MODEL on Maple's enclave."
+  (let ((llm:*llm-backend* :maple) (llm:*maple-mode* :enclave) (llm:*llm-model* model)
+        (llm:*confidential* t) (llm:*trust* trust))
+    (handler-case (progn (llm:require-confidential!) nil)
+      (error () t))))
+
 (defparameter *no-token* "/nonexistent/operandi-test/maple.token"
   "A token file that is not there, so the backend has no key to send.")
 
 (defun run ()
   (setf *pass* 0 *fail* 0)
   (format t "~&maple backend~%")
+  (with-open-file (k *key-file* :direction :output :if-exists :supersede)
+    (write-line "test-key" k))
+  (unwind-protect (run-checks)
+    (ignore-errors (delete-file *key-file*)))
+  (format t "~&~D passed, ~D failed~%" *pass* *fail*)
+  (zerop *fail*))
+
+(defun run-checks ()
 
   (check "loopback: 127.0.0.1 with a path"
     (llm:maple-loopback-url-p "http://127.0.0.1:8080/v1/chat/completions"))
@@ -68,23 +88,20 @@
            (eq llm:*llm-backend* :llama)
            (equal llm:*llm-url* "http://localhost:9931/v1/chat/completions"))))
 
-  (check "set-backend-maple!: under --confidential it switches, and startup refuses it"
-    (let ((llm:*llm-backend* :llama) (llm:*confidential* t) (llm:*trust* nil))
-      (and (eq t (llm:set-backend-maple! :token-file *no-token*))
+  (check "proxy: under --confidential it switches, and startup refuses it whatever --trust says"
+    (let ((llm:*llm-backend* :llama) (llm:*maple-mode* :enclave) (llm:*confidential* t)
+          (llm:*trust* '("maple-routing" "tinfoil-untrusted" "maple-inference" "continuum")))
+      (and (eq t (llm:set-backend-maple! :url llm:*maple-url* :token-file *no-token*))
            (eq llm:*llm-backend* :maple)
+           (eq llm:*maple-mode* :proxy)
            (handler-case (progn (llm:require-confidential!) nil)
              (error () t)))))
 
-  (check "--confidential on :maple is refused even with all three trusted: the proxy is unverified"
-    (let ((llm:*llm-backend* :maple) (llm:*llm-model* "gpt-oss-120b") (llm:*confidential* t)
-          (llm:*trust* '("maple-routing" "tinfoil-untrusted" "tinfoil-inference")))
-      (handler-case (progn (llm:require-confidential!) nil)
-        (error () t))))
-
-  (check "set-backend-maple!: loopback with no token file switches, with no key"
+  (check "proxy: loopback with no token file switches, with no key"
     (let ((llm:*llm-backend* :llama) (llm:*llm-url* nil) (llm:*llm-auth-token* "stale")
+          (llm:*maple-mode* :enclave)
           (llm:*llm-model* nil) (llm:*confidential* nil) (llm:*sealed-post* :unset))
-      (and (eq t (llm:set-backend-maple! :model "gpt-oss-120b" :token-file *no-token*))
+      (and (eq t (llm:set-backend-maple! :model "gpt-oss-120b" :url llm:*maple-url* :token-file *no-token*))
            (eq llm:*llm-backend* :maple)
            (equal llm:*llm-url* llm:*maple-url*)
            (null llm:*llm-auth-token*)
@@ -94,8 +111,48 @@
   (check "cloud-backend-p: :maple is hosted and metered"
     (llm:cloud-backend-p :maple))
   (check "sealable-p: :maple through the proxy is never sealed by operandi"
-    (and (not (llm:sealable-p :maple "gpt-oss-120b"))
-         (null (llm:path-trust :maple "gpt-oss-120b"))))
+    (let ((llm:*maple-mode* :proxy))
+      (and (not (llm:sealable-p :maple "gpt-oss-120b"))
+           (null (llm:path-trust :maple "gpt-oss-120b")))))
+
+  (check "enclave: no key file is refused, and the backend does not change"
+    (let ((llm:*llm-backend* :llama) (llm:*maple-mode* :proxy))
+      (and (null (llm:set-backend-maple! :token-file *no-token*))
+           (eq llm:*llm-backend* :llama)
+           (eq llm:*maple-mode* :proxy))))
+  (check "enclave: with a key it switches, sealed, to the enclave's endpoint"
+    (let ((llm:*llm-backend* :llama) (llm:*maple-mode* :proxy) (llm:*llm-url* nil)
+          (llm:*llm-auth-token* nil) (llm:*llm-model* nil) (llm:*sealed-post* nil))
+      (and (eq t (llm:set-backend-maple! :model "deepseek-v4-1-flash" :token-file *key-file*))
+           (eq llm:*maple-mode* :enclave)
+           (functionp llm:*sealed-post*)
+           (equal llm:*llm-url* "https://enclave.trymaple.ai/v1/chat/completions")
+           (equal llm:*llm-auth-token* "test-key")
+           (llm:sealable-p :maple "deepseek-v4-1-flash"))))
+
+  (check "route table: trust names per model"
+    (and (equal (operandi.maple:model-trust "gpt-oss-120b") '("maple-routing" "tinfoil-untrusted"))
+         (equal (operandi.maple:model-trust "glm-5-3-flash") '("maple-routing" "continuum"))
+         (equal (operandi.maple:model-trust "glm-5-3") '("maple-routing" "continuum" "tinfoil-untrusted"))
+         (equal (operandi.maple:model-trust "deepseek-v4-1-flash")
+                '("maple-routing" "maple-inference" "tinfoil-untrusted"))
+         (equal (operandi.maple:model-trust "deepseek-v4-1-flash-1017-uncensored")
+                '("maple-routing" "maple-inference"))
+         (null (operandi.maple:model-trust "gpt-9"))))
+  (check "enclave + --confidential: the uncensored DeepSeek needs only Maple's two names"
+    (not (enclave-refused-p "deepseek-v4-1-flash-1017-uncensored" '("maple-routing" "maple-inference"))))
+  (check "enclave + --confidential: stock DeepSeek also needs tinfoil-untrusted (5% and fallback)"
+    (and (enclave-refused-p "deepseek-v4-1-flash" '("maple-routing" "maple-inference"))
+         (not (enclave-refused-p "deepseek-v4-1-flash" '("maple-routing" "maple-inference" "tinfoil-untrusted")))))
+  (check "enclave + --confidential: a Tinfoil-routed model is refused with only Maple's names"
+    (enclave-refused-p "gpt-oss-120b" '("maple-routing" "maple-inference")))
+  (check "enclave + --confidential: glm-5-3-flash needs continuum, not Tinfoil"
+    (and (enclave-refused-p "glm-5-3-flash" '("maple-routing"))
+         (not (enclave-refused-p "glm-5-3-flash" '("maple-routing" "continuum")))))
+  (check "enclave + --confidential: maple-routing is always needed"
+    (enclave-refused-p "deepseek-v4-1-flash-1017-uncensored" '("maple-inference")))
+  (check "enclave + --confidential: a model no pinned release routes is refused"
+    (enclave-refused-p "gpt-9" '("maple-routing" "maple-inference" "tinfoil-untrusted" "continuum")))
 
   (flet ((effort-body (effort)
            (let ((body (llm:ht "messages" #())))
@@ -112,7 +169,6 @@
                (null (gethash "reasoning" off))
                (null (gethash "chat_template_kwargs" off))
                (null (gethash "reasoning_effort" dflt)))))))
-  (format t "~&~D passed, ~D failed~%" *pass* *fail*)
-  (zerop *fail*))
+  nil)
 
 (sb-ext:exit :code (if (run) 0 1))

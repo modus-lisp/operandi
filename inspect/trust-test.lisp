@@ -7,8 +7,7 @@
 ;;;
 ;;; What it pins down:
 ;;;   - --trust names are validated; a typo is reported, not silently dropped
-;;;   - maple needs tinfoil-untrusted needs tinfoil-inference; a name without what
-;;;     it needs is refused
+;;;   - the Tinfoil router needs tinfoil-untrusted and nothing else
 ;;;   - an unsealed path is refused whatever --trust says
 ;;;   - a sealed path is used only when its operator is trusted
 ;;;   - with-ppq checks the claim at RUN time, and only when it is on (the
@@ -51,7 +50,7 @@
         (llm:*confidential* t) (llm:*trust* trust))
     (refused-p #'llm:require-confidential!)))
 
-(defparameter *tinfoil-trust* '("tinfoil-untrusted" "tinfoil-inference"))
+(defparameter *tinfoil-trust* '("tinfoil-untrusted"))
 
 (defparameter *token*
   (format nil "~A/operandi-trust-test.token" (uiop:temporary-directory))
@@ -65,25 +64,8 @@
   (check "parse-trust-list: an unknown name is reported as bad"
     (equal (nth-value 1 (llm:parse-trust-list "maple-routing,tinfoil")) '("tinfoil")))
 
-  (check "requirements: maple needs both Tinfoil names, tinfoil-untrusted needs inference, inference needs nothing"
-    (and (equal (llm:trust-requirements "maple-routing") '("tinfoil-untrusted" "tinfoil-inference"))
-         (equal (llm:trust-requirements "tinfoil-untrusted") '("tinfoil-inference"))
-         (null (llm:trust-requirements "tinfoil-inference"))))
-  (check "check-trust-list!: maple alone, or with only tinfoil-untrusted, is refused"
-    (and (refused-p (lambda () (llm:check-trust-list! '("maple-routing"))))
-         (refused-p (lambda () (llm:check-trust-list! '("maple-routing" "tinfoil-untrusted"))))
-         (refused-p (lambda () (llm:check-trust-list! '("tinfoil-untrusted"))))))
-  (check "check-trust-list!: each complete chain is accepted"
-    (and (llm:check-trust-list! '("maple-routing" "tinfoil-untrusted" "tinfoil-inference"))
-         (llm:check-trust-list! *tinfoil-trust*)
-         (llm:check-trust-list! '("tinfoil-inference"))
-         (llm:check-trust-list! nil)))
-  (check "startup: an incomplete --trust is refused even without --confidential"
-    (let ((llm:*llm-backend* :openrouter) (llm:*confidential* nil) (llm:*trust* '("maple-routing")))
-      (refused-p #'llm:require-confidential!)))
-
-  (check "confidential: the Tinfoil router path needs tinfoil-untrusted"
-    (equal (llm:path-trust :tinfoil "gpt-oss-120b") "tinfoil-untrusted"))
+  (check "confidential: the Tinfoil router path needs tinfoil-untrusted, and only that"
+    (equal (llm:path-trust :tinfoil "gpt-oss-120b") '("tinfoil-untrusted")))
   (check "confidential: allowed with the Tinfoil chain declared"
     (not (claim-refused-p :tinfoil "gpt-oss-120b" *tinfoil-trust*)))
   (check "confidential: a sealed path whose operator is not trusted is refused"
@@ -92,7 +74,7 @@
          (claim-refused-p :tinfoil "gpt-oss-120b" '("tinfoil-inference"))))
   (check "confidential: an unsealed path is refused whatever --trust says"
     (and (claim-refused-p :openrouter "x" *tinfoil-trust*)
-         (claim-refused-p :llama "x" '("maple-routing" "tinfoil-untrusted" "tinfoil-inference"))))
+         (claim-refused-p :llama "x" '("maple-routing" "tinfoil-untrusted" "tinfoil-inference" "maple-inference" "continuum"))))
   (check "no --confidential, no seal check"
     (let ((llm:*llm-backend* :openrouter) (llm:*confidential* nil) (llm:*trust* nil))
       (not (refused-p #'llm:require-confidential!))))
@@ -137,7 +119,7 @@
 
   (check "resume: confidential-flags restores the claim and its declarations"
     (let ((llm:*confidential* t) (llm:*trust* *tinfoil-trust*))
-      (equal (llm:confidential-flags) "--confidential --trust=tinfoil-untrusted,tinfoil-inference")))
+      (equal (llm:confidential-flags) "--confidential --trust=tinfoil-untrusted")))
   (check "resume: no claim and no declarations means no flags"
     (let ((llm:*confidential* nil) (llm:*trust* nil))
       (null (llm:confidential-flags))))

@@ -473,29 +473,41 @@
            ("--tinfoil [MODEL]" "Tinfoil's own enclave, sealed end to end"
             "inference.tinfoil.sh. There is no plaintext mode. MODEL is a bare"
             "Tinfoil id (gpt-oss-120b, ...). Key in ~/.operandi/tinfoil.token.")
-           ("--maple [ADDR] [MODEL]" "Maple, through a LOCAL maple-proxy"
-            "The proxy does Maple's attested enclave transport. operandi speaks plain"
-            "HTTP to the proxy and does NOT verify the enclave, so --confidential"
-            "refuses it. ADDR is the proxy's address, same grammar as --llama"
-            "(default 127.0.0.1:8080). MODEL is a Maple id (gpt-oss-120b, ...)."
-            "Optional key in ~/.operandi/maple.token; without it the proxy's own key is used.")
+           ("--maple [ADDR] [MODEL]" "Maple: its enclave directly, or a maple-proxy at ADDR"
+            "Without ADDR, operandi verifies the AWS Nitro attestation of Maple's"
+            "enclave, requires a pinned release, and encrypts every request to it."
+            "Maple decides per model who sees the cleartext next; under --confidential"
+            "the model's routes must be in --trust (see --trust below). Key in"
+            "~/.operandi/maple.token. With ADDR (same grammar as --llama), plain HTTP to"
+            "a maple-proxy that operandi does not verify; --confidential refuses it."
+            "MODEL is a Maple id (gpt-oss-120b, deepseek-v4-1-flash, ...).")
            ("--confidential" "seal every request to an attestation operandi verifies"
             "The endpoint's key must be bound into a hardware attestation checked here."
             "A path that cannot be sealed that way is refused; it FAILS rather than"
             "downgrading to plaintext. The endpoint's operator must also be named in"
             "--trust: the seal proves where the request goes, not what happens there."
             "Today that is Tinfoil's router: --tinfoil, --ppq private/MODEL, or"
-            "--routstr tinfoil-MODEL, with --trust=tinfoil-untrusted,tinfoil-inference.")
+            "--routstr tinfoil-MODEL, with --trust=tinfoil-untrusted; or Maple (--maple).")
            ("--trust=LIST" "the operators you trust with cleartext, comma-separated"
-            "tinfoil-inference  Tinfoil's model enclaves and their GPUs."
             "tinfoil-untrusted  Tinfoil's shared router: a safeguards sidecar reads the"
             "                   transcript, and config and reports cross outside any"
-            "                   enclave. Named for what it is; it forwards to the model"
-            "                   enclaves, so it needs tinfoil-inference."
-            "maple-routing      Maple's OpenSecret enclave; it routes some traffic to"
-            "                   Tinfoil's router, so it needs tinfoil-untrusted."
-            "A name without what it needs is an error, as is an unknown name. Nothing"
-            "reaches tinfoil-inference directly, so it never suffices alone.")))
+            "                   enclave. Named for what it is. Covers the model enclaves"
+            "                   it forwards to."
+            "tinfoil-inference  Tinfoil's model enclaves alone. Nothing reaches one"
+            "                   directly yet, so it enables no path."
+            "maple-routing      Maple's enclave on AWS Nitro, which picks the provider."
+            "maple-inference    Maple's own GPU guests (i01, i02)."
+            "continuum          Continuum (Edgeless Privatemode), via Maple's image."
+            "An unknown name is an error."
+            "Maple, per model (pinned release 4984a12f):"
+            "  gpt-oss-120b gemma4-31b kimi-k3 llama3-3-70b gpt-oss-safeguard-120b"
+            "      maple-routing,tinfoil-untrusted"
+            "  glm-5-3              maple-routing,continuum,tinfoil-untrusted"
+            "  glm-5-3-flash        maple-routing,continuum"
+            "  deepseek-v4-1-flash  maple-routing,maple-inference,tinfoil-untrusted"
+            "                       (95% to i01, 5% to Tinfoil, and Tinfoil when i01 fails)"
+            "  deepseek-v4-1-flash-1017-uncensored  maple-routing,maple-inference"
+            "                       (i02 only; Maple enables it per account)")))
          t)
 
    (list "session" "Session" :green
@@ -847,11 +859,12 @@
                         (setf acc (if is-model (rest tail) tail)))
                       (eng:apply-backend-defaults)))
                    ((and acc (string= (first acc) "--maple"))
-                    ;; A local maple-proxy.  ADDR takes --llama's grammar and is
-                    ;; recognised by a colon or a scheme with no space in it, so a
-                    ;; task that happens to contain a colon is still a task (Maple
-                    ;; model ids never contain one).  MODEL is a bare id followed by
-                    ;; the task, as for --tinfoil.  A bare --maple is the default proxy.
+                    ;; Maple.  With no ADDR, its enclave directly, attested and
+                    ;; encrypted here.  With ADDR, a maple-proxy there: ADDR takes
+                    ;; --llama's grammar and is recognised by a colon or a scheme with
+                    ;; no space in it, so a task that happens to contain a colon is
+                    ;; still a task (Maple model ids never contain one).  MODEL is a
+                    ;; bare id followed by the task, as for --tinfoil.
                     (let* ((tail (rest acc)) (next (first tail))
                            (addr (and next (not (uiop:string-prefix-p "-" next))
                                       (not (find #\Space next))
@@ -866,7 +879,7 @@
                                       (error (e)
                                         (format *error-output* "operandi: --maple: ~A~%" e)
                                         (sb-ext:exit :code 2)))
-                                    llm:*maple-url*)))
+                                    nil)))
                       ;; A refused switch (non-loopback plaintext, or under
                       ;; --confidential) must not fall through to the backend
                       ;; configured before it: that would be a silent downgrade.
@@ -880,7 +893,7 @@
                     ;; Replaced, not renamed: the seal and the operator are now two
                     ;; flags.  The old flag errors rather than being accepted.
                     (format *error-output*
-                            "~&operandi: --confidential-tinfoil was replaced by --confidential --trust=tinfoil-untrusted,tinfoil-inference.~%")
+                            "~&operandi: --confidential-tinfoil was replaced by --confidential --trust=tinfoil-untrusted.~%")
                     (sb-ext:exit :code 2))
                    ((and acc (string= (first acc) "--confidential"))
                     ;; Every request sealed to a verified attestation, whose operator is
@@ -898,7 +911,7 @@
                     (let* ((inline (uiop:string-prefix-p "--trust=" (first acc)))
                            (spec (if inline (subseq (first acc) (length "--trust=")) (second acc))))
                       (unless (and spec (plusp (length spec)) (not (uiop:string-prefix-p "--" spec)))
-                        (format *error-output* "operandi: --trust needs a list of names, e.g. --trust=tinfoil-untrusted,tinfoil-inference~%")
+                        (format *error-output* "operandi: --trust needs a list of names, e.g. --trust=tinfoil-untrusted~%")
                         (sb-ext:exit :code 2))
                       (multiple-value-bind (names bad) (llm:parse-trust-list spec)
                         (when bad

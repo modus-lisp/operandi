@@ -34,11 +34,11 @@
            #:set-backend-openrouter! #:set-backend-llama! #:set-backend-routstr!
            #:set-backend-ppq! #:set-backend-tinfoil! #:set-backend-maple!
            #:with-llama #:with-openrouter #:with-routstr #:with-ppq #:with-maple
-           #:*routstr-url* #:*maple-url* #:*maple-token-file* #:maple-loopback-url-p #:maple-refusal
+           #:*routstr-url* #:*maple-url* #:*maple-mode* #:*maple-token-file* #:maple-loopback-url-p #:maple-refusal
            #:openrouter-credits
            #:cloud-backend-p #:*sealed-post* #:post-chat
            #:*confidential* #:*trust* #:*trust-parties* #:parse-trust-list
-           #:sealable-p #:path-trust #:trust-requirements #:check-trust-list! #:confidential-refusal
+           #:sealable-p #:path-trust #:confidential-refusal
            #:claim-check! #:confidential-flags
            #:enable-confidential! #:require-confidential!
            #:*usage-sink* #:usage #:make-usage #:copy-usage
@@ -148,10 +148,11 @@
    the HPKE key of an AMD-attested Tinfoil enclave verified locally against
    the pinned AMD ARK, and there is NO fallback — an unverifiable enclave or a
    plaintext answer is an error, not a downgrade.  See OPERANDI.PPQ.
-   :MAPLE = a local maple-proxy (127.0.0.1:8080 by default).  The proxy does
-   Maple's attested transport itself; operandi speaks plain OpenAI-compatible
-   HTTP to it and does NOT verify the enclave, so :MAPLE is never confidential
-   (see CONFIDENTIAL-BACKEND-P) and refuses a non-loopback plaintext URL.")
+   :MAPLE = Maple.  In enclave mode (*MAPLE-MODE*, the default) operandi attests
+   Maple's OpenSecret enclave and encrypts to it itself (OPERANDI.MAPLE).  In
+   proxy mode it speaks plain HTTP to a local maple-proxy, which does that and
+   which operandi does not verify; proxy mode is never confidential and refuses
+   a non-loopback plaintext URL.")
 
 (defun cloud-backend-p (&optional (backend *llm-backend*))
   "True for hosted backends that speak OpenRouter's request dialect
@@ -174,23 +175,28 @@
    passed.")
 
 (defparameter *trust-parties*
-  '(("tinfoil-inference" nil
+  '(("tinfoil-inference"
      "Tinfoil's model enclaves: the inference container and the GPUs under it.
      Nothing in operandi can reach one directly, so on its own this enables no path.")
-    ("tinfoil-untrusted" ("tinfoil-inference")
+    ("tinfoil-untrusted"
      "Tinfoil's shared router (inference.tinfoil.sh): its image, the safeguards
      sidecar that reads transcripts, the runtime config it fetches, and its choice of
      model enclave.  Its violation reports go to api.tinfoil.sh, outside any
      enclave.  The name is a contradiction on purpose: declaring it should feel
-     like what it is.  The router hands cleartext to Tinfoil's model enclaves, so
-     this needs tinfoil-inference.")
-    ("maple-routing" ("tinfoil-untrusted")
-     "Maple's OpenSecret enclave on AWS Nitro and the providers it routes to.  Some
-     of every model's traffic can reach Tinfoil's shared router, so this needs
-     tinfoil-untrusted."))
-  "Every name --trust accepts: (NAME REQUIRES DESCRIPTION).  A name can be declared
-   only together with everything it REQUIRES, because its operator hands cleartext
-   on to them.")
+     like what it is.  It covers the model enclaves the router forwards to; having
+     declared this much, naming them separately would be pedantry.")
+    ("maple-routing"
+     "Maple's OpenSecret enclave on AWS Nitro: AWS as operator and verifier, and the
+     code at the pinned source, which decrypts the request and picks the provider.
+     Which providers a model can reach is in OPERANDI.MAPLE:*RELEASES*, so the other
+     names a --maple model needs come from there, not from here.")
+    ("maple-inference"
+     "Maple's own GPU guests (i01, i02): SEV-SNP machines whose measurement Maple's
+     enclave pins, running an inference container, on GPUs nobody appraises.")
+    ("continuum"
+     "Continuum (Edgeless Systems' Privatemode), reached through the continuum-proxy
+     binary shipped prebuilt inside Maple's image.  Not examined here."))
+  "Every name --trust accepts: (NAME DESCRIPTION).")
 
 (defun parse-trust-list (spec)
   "Split a --trust value (\"a,b,c\") into lower-case names.  Returns
@@ -203,59 +209,54 @@
          (bad (remove-if (lambda (n) (assoc n *trust-parties* :test #'string=)) names)))
     (values names bad)))
 
-(defun trust-requirements (name)
-  "The names NAME requires, directly or through what they require."
-  (let ((direct (second (assoc name *trust-parties* :test #'string=))))
-    (remove-duplicates (append direct (mapcan #'trust-requirements (copy-list direct)))
-                       :test #'string= :from-end t)))
-
-(defun missing-trust-requirements (names)
-  "Alist (NAME . MISSING) for each of NAMES whose requirements NAMES lacks."
-  (loop for n in names
-        for missing = (remove-if (lambda (r) (member r names :test #'string=))
-                                 (trust-requirements n))
-        when missing collect (cons n missing)))
-
-(defun check-trust-list! (names)
-  "Signal unless every name in NAMES comes with what it requires."
-  (let ((gaps (missing-trust-requirements names)))
-    (when gaps
-      (error "--trust: ~{~a~^; ~}"
-             (loop for (n . m) in gaps
-                   collect (format nil "~a hands cleartext to ~{~a~^ and ~}, so declare ~:*~{~a~^,~} too"
-                                   n m))))
-    t))
+(defvar *maple-mode* :enclave
+  ":ENCLAVE when :MAPLE talks to Maple's enclave directly, attested and encrypted by
+   this process (OPERANDI.MAPLE); :PROXY when it goes through a local maple-proxy,
+   which does that itself and which operandi does not verify.")
 
 (defun sealable-p (&optional (backend *llm-backend*) (model *llm-model*))
   "True when BACKEND seals MODEL's request to a key bound into an attestation that
    this process verifies.  Those are :TINFOIL (always), a private/* model on :PPQ,
-   and a tinfoil-* model on :ROUTSTR, all sealed to Tinfoil's shared router.
-   Every other pair is sent in plaintext to whoever serves it."
+   and a tinfoil-* model on :ROUTSTR, all sealed to Tinfoil's shared router; and
+   :MAPLE in enclave mode, sealed to Maple's OpenSecret enclave.  Every other pair
+   is sent in plaintext to whoever serves it."
   (case backend
     (:tinfoil t)
     (:ppq (operandi.ppq:confidential-p model))
     (:routstr (operandi.ppq:routstr-confidential-p model))
+    (:maple (eq *maple-mode* :enclave))
     (t nil)))
 
 (defun path-trust (&optional (backend *llm-backend*) (model *llm-model*))
-  "The --trust name a confidential request on this path needs: the operator of the
-   attested endpoint it is sealed to.  NIL when the path cannot be sealed."
-  (and (sealable-p backend model) "tinfoil-untrusted"))
+  "The --trust names a confidential request on this path needs: the operator of the
+   attested endpoint it is sealed to, and everyone that operator can hand the
+   cleartext to.  NIL when the path cannot be sealed, or (for :MAPLE) when no
+   pinned release routes MODEL."
+  (cond ((not (sealable-p backend model)) nil)
+        ((eq backend :maple) (and model (operandi.maple:model-trust model)))
+        (t (list "tinfoil-untrusted"))))
 
 (defun confidential-refusal (&optional (backend *llm-backend*) (model *llm-model*))
   "NIL when --confidential allows BACKEND/MODEL, else the reason it does not."
-  (let ((need (path-trust backend model)))
-    (cond ((null need)
+  (let* ((need (path-trust backend model))
+         (missing (remove-if (lambda (n) (member n *trust* :test #'string=)) need)))
+    (cond ((and (eq backend :maple) (sealable-p backend model) (null need))
+           (format nil "no pinned Maple release routes model ~s; known: ~{~a~^, ~}"
+                   model (remove-duplicates
+                          (loop for r in operandi.maple:*releases*
+                                append (mapcar #'first (getf r :routes)))
+                          :test #'string= :from-end t)))
+          ((null need)
            (format nil "the ~(~a~) path~@[ with ~a~] is not sealed to an attestation operandi verifies~a"
                    backend model
                    (case backend
                      (:ppq "; use a private/* model")
                      (:routstr "; use a tinfoil-* model")
-                     (:maple "; --maple goes through maple-proxy, which operandi does not verify")
+                     (:maple "; --maple ADDR goes through maple-proxy, which operandi does not verify; use --maple MODEL")
                      (t ""))))
-          ((not (member need *trust* :test #'string=))
-           (format nil "the ~(~a~) path is sealed to ~a, which is not in --trust; declare --trust=~{~a~^,~}"
-                   backend need (cons need (trust-requirements need))))
+          (missing
+           (format nil "the ~(~a~) path~@[ with ~a~] can hand the cleartext to ~{~a~^, ~}, which --trust does not name; declare --trust=~{~a~^,~}"
+                   backend (and (eq backend :maple) model) missing need))
           (t nil))))
 
 (defun claim-check! (&optional (backend *llm-backend*) (model *llm-model*))
@@ -302,7 +303,6 @@
 (defun require-confidential! ()
   "Signal unless the current path satisfies --confidential.  Called at startup,
    after all flags are parsed, so the flags may come in any order."
-  (check-trust-list! *trust*)
   (let ((why (and *confidential* (confidential-refusal))))
     (when why (error "--confidential: ~a." why)))
   t)
@@ -743,16 +743,14 @@ call with :want-stream nil"))
 
 (defparameter *maple-url* "http://127.0.0.1:8080/v1/chat/completions"
   "Chat endpoint of a LOCAL maple-proxy (the proxy's default MAPLE_HOST and
-   MAPLE_PORT).  operandi does not talk to Maple's hosted enclave directly:
-   that wire is an OpenSecret-encrypted session after an attestation handshake,
-   which the proxy performs and this client does not implement.  Point --maple
-   at another address to reach a proxy elsewhere.")
+   MAPLE_PORT), used only when --maple is given an address.  Without one, operandi
+   talks to Maple's enclave itself (OPERANDI.MAPLE).")
 
 (defparameter *maple-token-file* (merge-pathnames ".operandi/maple.token"
                                                   (user-homedir-pathname))
-  "Optional.  The proxy's own API key, sent as a Bearer token.  With no file the
-   request carries no Authorization header, and the proxy uses the key it saved
-   (the Maple desktop app creates one), which is the usual setup.")
+  "A Maple API key, sent as a Bearer token.  Required for the enclave.  Optional
+   through a proxy: with no file the request carries no Authorization header, and
+   the proxy uses the key it saved (the Maple desktop app creates one).")
 
 (defun maple-loopback-url-p (url)
   "True when URL's host is this machine.  The proxy speaks plaintext HTTP and
@@ -776,23 +774,43 @@ call with :want-stream nil"))
         (t nil)))
 
 (defun set-backend-maple! (&key (model "gpt-oss-120b")
-                                (url *maple-url*)
+                                url
                                 (token-file *maple-token-file*))
-  "Switch the LLM client to a local Maple proxy (see *MAPLE-URL*).  The token is
-   OPTIONAL: with no token file the proxy supplies its own saved key.  Returns T
-   on success, NIL (after saying why) when refused.
+  "Switch the LLM client to Maple.  Returns T on success, NIL (after saying why) when
+   refused.
 
-   This path is not sealed by operandi, so --confidential refuses it
-   (REQUIRE-CONFIDENTIAL!), whatever --trust says.  A non-loopback http:// URL is refused for the reason in
-   MAPLE-REFUSAL."
-  (let* ((token (read-token-file token-file))
-         (refusal (maple-refusal url)))
+   With no URL, talk to Maple's enclave directly (OPERANDI.MAPLE): every request is
+   encrypted to a session key agreed with a key in an AWS Nitro attestation verified
+   here, and the enclave must be a pinned release.  This needs an API key.  It is
+   sealed, so --confidential accepts it once --trust covers the model's routes.
+
+   With URL, go through a maple-proxy there.  The token is optional and the path is
+   not verified by operandi, so --confidential refuses it whatever --trust says.  A
+   non-loopback http:// URL is refused for the reason in MAPLE-REFUSAL."
+  (let ((token (read-token-file token-file)))
     (cond
-      (refusal
-       (format *error-output* "~&set-backend-maple!: ~A~%" refusal)
+      ((null url)
+       (cond
+         ((or (null token) (zerop (length token)))
+          (format *error-output* "~&set-backend-maple!: Maple's enclave needs an API key in ~A~%"
+                  token-file)
+          nil)
+         (t
+          (setf *llm-backend*    :maple
+                *maple-mode*     :enclave
+                *llm-url*        (format nil "~A/v1/chat/completions" operandi.maple:*enclave-base*)
+                *llm-auth-token* token
+                *llm-model*      model
+                *llm-read-timeout* 300
+                *sealed-post*    (lambda (url body headers)
+                                   (operandi.maple:enclave-post url body headers)))
+          t)))
+      ((maple-refusal url)
+       (format *error-output* "~&set-backend-maple!: ~A~%" (maple-refusal url))
        nil)
       (t
        (setf *llm-backend*    :maple
+             *maple-mode*     :proxy
              *llm-url*        url
              *llm-auth-token* (and token (plusp (length token)) token)
              *llm-model*      model

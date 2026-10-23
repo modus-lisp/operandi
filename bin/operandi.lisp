@@ -468,17 +468,32 @@
             "sk- key from chat.routstr.com.")
            ("--ppq [MODEL]" "PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/Lightning"
             "Any PPQ id (gpt-6.1-sol, private/gpt-oss-120b, ...). Requests go out in"
-            "the clear unless --confidential-tinfoil is also given. Key in"
-            "~/.operandi/ppq.token.")
+            "the clear unless --confidential is also given; then only a private/"
+            "model is allowed, sealed to Tinfoil's router. Key in ~/.operandi/ppq.token.")
            ("--tinfoil [MODEL]" "Tinfoil's own enclave, sealed end to end"
             "inference.tinfoil.sh. There is no plaintext mode. MODEL is a bare"
             "Tinfoil id (gpt-oss-120b, ...). Key in ~/.operandi/tinfoil.token.")
-           ("--confidential-tinfoil" "require every request to be EHBP-sealed to a verified enclave"
-            "The enclave's key must be bound into an attestation report verified"
-            "locally against the pinned AMD ARK. This is a claim about the SEAL, not"
-            "about the whole exchange. It FAILS rather than downgrading to plaintext."
-            "Valid with --ppq private/MODEL, --tinfoil, and --routstr tinfoil-MODEL;"
-            "on any other backend it is a configuration error."))
+           ("--maple [ADDR] [MODEL]" "Maple, through a LOCAL maple-proxy"
+            "The proxy does Maple's attested enclave transport. operandi speaks plain"
+            "HTTP to the proxy and does NOT verify the enclave, so --confidential"
+            "refuses it. ADDR is the proxy's address, same grammar as --llama"
+            "(default 127.0.0.1:8080). MODEL is a Maple id (gpt-oss-120b, ...)."
+            "Optional key in ~/.operandi/maple.token; without it the proxy's own key is used.")
+           ("--confidential" "seal every request to an attestation operandi verifies"
+            "The endpoint's key must be bound into a hardware attestation checked here."
+            "A path that cannot be sealed that way is refused; it FAILS rather than"
+            "downgrading to plaintext. The endpoint's operator must also be named in"
+            "--trust: the seal proves where the request goes, not what happens there."
+            "Today that is Tinfoil's router: --tinfoil, --ppq private/MODEL, or"
+            "--routstr tinfoil-MODEL, with --trust=tinfoil-shared,tinfoil-inference.")
+           ("--trust=LIST" "the operators you trust with cleartext, comma-separated"
+            "tinfoil-inference  Tinfoil's model enclaves and their GPUs."
+            "tinfoil-shared     Tinfoil's shared router; it forwards to the model"
+            "                   enclaves, so it needs tinfoil-inference."
+            "maple              Maple's OpenSecret enclave; it routes some traffic to"
+            "                   Tinfoil's router, so it needs tinfoil-shared."
+            "A name without what it needs is an error, as is an unknown name. Nothing"
+            "reaches tinfoil-inference directly, so it never suffices alone.")))
          t)
 
    (list "session" "Session" :green
@@ -516,9 +531,6 @@
             "\"synthesize\": bool?, \"worker_model\": ...?}. For harnesses (mcp/server.js).")
            ("--help, -h [TOPIC]" "this text, or one topic of it"
             "Topics: modes, backends, session, agent, env, files, diagnostics.")
-           ("--confidential" "REMOVED — renamed to --confidential-tinfoil"
-            "The old name overclaimed, so it errors rather than being accepted"
-            "silently."))
          t)
 
    (list "env" "Environment" :blue
@@ -629,7 +641,7 @@
 ;; Apply the configured default model unless the command line names a backend
 ;; explicitly (--openrouter, with or without a model; a bare --openrouter also
 ;; reads the config, below). Doing both would announce the backend twice.
-(let ((m (and (not (member-if (lambda (a) (member a '("--llama" "--openrouter" "--routstr" "--ppq" "--tinfoil") :test #'string=))
+(let ((m (and (not (member-if (lambda (a) (member a '("--llama" "--openrouter" "--routstr" "--ppq" "--tinfoil" "--maple") :test #'string=))
                                  (uiop:command-line-arguments)))
               (config-default-model))))
   (when m
@@ -760,7 +772,7 @@
                     ;; come first, then a model.  A model is any token that is
                     ;; not a flag and is followed by the task, or that carries a
                     ;; slash (vendor/model ids); a bare flag takes the library
-                    ;; default.  Under --confidential-tinfoil the backend refuses
+                    ;; default.  Under --confidential the backend refuses
                     ;; anything that is not a tinfoil-* model, so a typo cannot
                     ;; silently become a plaintext request to a node that
                     ;; terminates it itself.
@@ -770,13 +782,13 @@
                                       (first tail)))
                            (tail (if node (rest tail) tail))
                            (next (first tail))
-                           (is-model (and next (not (uiop:string-prefix-p "--" next))
+                           (is-model (and next (not (uiop:string-prefix-p "-" next))
                                           (or (find #\/ next) (rest tail)))))
                       (let ((ok (if is-model
                                     (llm:set-backend-routstr! :model next :url (or node llm:*routstr-url*))
                                     (llm:set-backend-routstr! :url (or node llm:*routstr-url*)))))
                         ;; A refused switch (no key, or a non-tinfoil model
-                        ;; under --confidential-tinfoil) must not fall through to
+                        ;; under --confidential) must not fall through to
                         ;; whatever backend was configured before — that is
                         ;; exactly the silent downgrade this flag exists to
                         ;; prevent.
@@ -786,7 +798,7 @@
                    ((and acc (string= (first acc) "--ppq"))
                     ;; PPQ, in one of two modes. A model here is any PPQ id
                     ;; (gpt-6.1-sol, private/gpt-oss-120b, ...); a bare flag
-                    ;; takes the library default. Under --confidential-tinfoil the
+                    ;; takes the library default. Under --confidential the
                     ;; backend refuses anything that is not private/*, so a
                     ;; typo cannot silently become a plaintext Path B request.
                     ;;
@@ -796,12 +808,13 @@
                     ;; it has a slash, or when something follows it (the task).
                     (let* ((tail (rest acc)) (next (first tail))
                            (is-model (and next (not (find #\Space next))
+                                          (not (uiop:string-prefix-p "-" next))
                                           (or (find #\/ next) (rest tail)))))
                       (let ((ok (if is-model
                                     (llm:set-backend-ppq! :model next)
                                     (llm:set-backend-ppq!))))
                         ;; A refused switch (no key, or a non-private model
-                        ;; under --confidential-tinfoil) must not fall through to
+                        ;; under --confidential) must not fall through to
                         ;; whatever backend was configured before — that is
                         ;; exactly the silent downgrade this flag exists to
                         ;; prevent.
@@ -811,7 +824,7 @@
                    ((and acc (string= (first acc) "--tinfoil"))
                     ;; Tinfoil's OWN enclave (inference.tinfoil.sh), sealed end
                     ;; to end. There is only one path here, so there is no
-                    ;; --confidential-tinfoil to ask for: every request is EHBP-sealed
+                    ;; --confidential to ask for: every request is EHBP-sealed
                     ;; to a locally verified AMD SEV-SNP enclave, and a
                     ;; plaintext answer is an error. A model is a bare Tinfoil
                     ;; id (gpt-oss-120b, glm-5-3, ...); a bare flag takes the
@@ -823,7 +836,7 @@
                            ;; `--tinfoil M "task"` vs `--tinfoil "task"`.  A
                            ;; leading --flag is never a model, so a typo still
                            ;; reaches the unknown-option branch below.
-                           (is-model (and next (not (uiop:string-prefix-p "--" next))
+                           (is-model (and next (not (uiop:string-prefix-p "-" next))
                                           (rest tail))))
                       (let ((ok (if is-model
                                     (llm:set-backend-tinfoil! :model next)
@@ -831,34 +844,68 @@
                         (unless ok (sb-ext:exit :code 2))
                         (setf acc (if is-model (rest tail) tail)))
                       (eng:apply-backend-defaults)))
+                   ((and acc (string= (first acc) "--maple"))
+                    ;; A local maple-proxy.  ADDR takes --llama's grammar and is
+                    ;; recognised by a colon or a scheme with no space in it, so a
+                    ;; task that happens to contain a colon is still a task (Maple
+                    ;; model ids never contain one).  MODEL is a bare id followed by
+                    ;; the task, as for --tinfoil.  A bare --maple is the default proxy.
+                    (let* ((tail (rest acc)) (next (first tail))
+                           (addr (and next (not (uiop:string-prefix-p "-" next))
+                                      (not (find #\Space next))
+                                      (or (find #\: next) (uiop:string-prefix-p "http" next))
+                                      next))
+                           (tail (if addr (rest tail) tail))
+                           (next (first tail))
+                           (is-model (and next (not (uiop:string-prefix-p "-" next))
+                                          (rest tail)))
+                           (url (if addr
+                                    (handler-case (llm:llama-chat-url addr)
+                                      (error (e)
+                                        (format *error-output* "operandi: --maple: ~A~%" e)
+                                        (sb-ext:exit :code 2)))
+                                    llm:*maple-url*)))
+                      ;; A refused switch (non-loopback plaintext, or under
+                      ;; --confidential) must not fall through to the backend
+                      ;; configured before it: that would be a silent downgrade.
+                      (let ((ok (if is-model
+                                    (llm:set-backend-maple! :url url :model next)
+                                    (llm:set-backend-maple! :url url))))
+                        (unless ok (sb-ext:exit :code 2))
+                        (setf acc (if is-model (rest tail) tail)))
+                      (eng:apply-backend-defaults)))
                    ((and acc (string= (first acc) "--confidential-tinfoil"))
-                    ;; Require that the exchange be sealed to a Tinfoil enclave.
-                    ;; The name is deliberately narrow: it does NOT claim the
-                    ;; request is confidential in general, only that it is
-                    ;; EHBP-sealed to a key bound into a Tinfoil attestation
-                    ;; report we verify locally.  This is a session-wide claim,
-                    ;; not a backend: it is checked at startup (below) and again
-                    ;; on every request, and it FAILS rather than downgrading to
-                    ;; plaintext.
+                    ;; Replaced, not renamed: the seal and the operator are now two
+                    ;; flags.  The old flag errors rather than being accepted.
+                    (format *error-output*
+                            "~&operandi: --confidential-tinfoil was replaced by --confidential --trust=tinfoil-shared,tinfoil-inference.~%")
+                    (sb-ext:exit :code 2))
+                   ((and acc (string= (first acc) "--confidential"))
+                    ;; Every request sealed to a verified attestation, whose operator is
+                    ;; in --trust.  Checked once every flag is parsed (see the startup
+                    ;; check below), so the order of the flags does not matter.
                     (setf acc (rest acc))
-                    ;; A backend already chosen may not be able to honour it
-                    ;; (e.g. --routstr with a model the node terminates itself).
-                    ;; That is a configuration error, so say so and stop — do
-                    ;; not fall through to a plaintext session.
                     (handler-case (llm:enable-confidential!)
                       (error (e)
                         (format *error-output* "~&operandi: ~A~%" e)
                         (sb-ext:exit :code 2))))
-                   ((and acc (string= (first acc) "--confidential"))
-                    ;; The old name.  It overclaimed — it read as a promise
-                    ;; about the whole exchange when all it ever meant was
-                    ;; "sealed to a Tinfoil enclave" — so it is not accepted
-                    ;; silently.  Say what it became and stop.
-                    (format *error-output*
-                            "~&operandi: --confidential was renamed to --confidential-tinfoil.~%~
-                             ~&  It only ever meant \"sealed to a Tinfoil enclave\", and the old~%~
-                             ~&  name read as a broader promise than that.~%")
-                    (sb-ext:exit :code 2))
+                   ((and acc (or (string= (first acc) "--trust")
+                                 (uiop:string-prefix-p "--trust=" (first acc))))
+                    ;; --trust=a,b,c or --trust a,b,c.  Unknown names are an error: a typo
+                    ;; must not quietly declare nothing.
+                    (let* ((inline (uiop:string-prefix-p "--trust=" (first acc)))
+                           (spec (if inline (subseq (first acc) (length "--trust=")) (second acc))))
+                      (unless (and spec (plusp (length spec)) (not (uiop:string-prefix-p "--" spec)))
+                        (format *error-output* "operandi: --trust needs a list of names, e.g. --trust=tinfoil-shared,tinfoil-inference~%")
+                        (sb-ext:exit :code 2))
+                      (multiple-value-bind (names bad) (llm:parse-trust-list spec)
+                        (when bad
+                          (format *error-output* "operandi: --trust: unknown name~P ~{~A~^, ~}; known: ~{~A~^, ~}~%"
+                                  (length bad) bad (mapcar #'first llm:*trust-parties*))
+                          (sb-ext:exit :code 2))
+                        (setf llm:*trust* (remove-duplicates (append llm:*trust* names)
+                                                             :test #'string= :from-end t)))
+                      (setf acc (if inline (rest acc) (cddr acc)))))
                    ((and acc (string= (first acc) "--worker-model"))
                     (multiple-value-bind (m ok)
                         (funcall (find-symbol "PARSE-WORKER-MODEL" "OPERANDI.SUBAGENT") (second acc))

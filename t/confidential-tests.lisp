@@ -1,4 +1,4 @@
-;;;; confidential-tests.lisp — the invariants that make --confidential-tinfoil mean
+;;;; confidential-tests.lisp — the invariants that make --confidential mean
 ;;;; something.  Run with:
 ;;;;
 ;;;;   sbcl --non-interactive --load t/confidential-tests.lisp
@@ -56,53 +56,63 @@
        (and (ppq:confidential-p "private/glm-5-3")
             (not (ppq:confidential-p "glm-5-3"))))
 
-;;; ---- 2. --confidential-tinfoil on a backend that cannot seal ------------------------
+;;; ---- 2. --confidential seals; --trust names the operator of the sealed endpoint ----
 
-(format t "~&~%[2] --confidential-tinfoil must fail on a backend that cannot seal~%")
+(format t "~&~%[2] --confidential refuses an unsealed path, and a sealed one whose operator is not trusted~%")
 
-(check "--confidential-tinfoil + :openrouter is refused at startup"
-       (let ((llm:*llm-backend* :openrouter) (llm:*confidential* t))
-         (handler-case (progn (llm:require-confidential!) nil)
-           (error () t))))
+(defun claim-refused-p (backend model trust)
+  "True when --confidential on BACKEND/MODEL with --trust TRUST is refused at startup."
+  (let ((llm:*llm-backend* backend) (llm:*llm-model* model)
+        (llm:*confidential* t) (llm:*trust* trust))
+    (handler-case (progn (llm:require-confidential!) nil)
+      (error () t))))
 
-(check "--confidential-tinfoil + :routstr with a non-tinfoil model is refused at startup"
-       (let ((llm:*llm-backend* :routstr) (llm:*llm-model* "gemini-3-6-flash")
-             (llm:*confidential* t))
-         (handler-case (progn (llm:require-confidential!) nil)
-           (error () t))))
+(defparameter *tinfoil-trust* '("tinfoil-shared" "tinfoil-inference"))
 
-(check "--confidential-tinfoil + :routstr with a tinfoil-* model is allowed"
-       (let ((llm:*llm-backend* :routstr) (llm:*llm-model* "tinfoil-gemma4-31b")
-             (llm:*confidential* t))
+(check "--confidential + :openrouter is refused, whatever --trust says"
+       (and (claim-refused-p :openrouter "deepseek/deepseek-v4-flash" nil)
+            (claim-refused-p :openrouter "deepseek/deepseek-v4-flash" '("maple" "tinfoil-shared" "tinfoil-inference"))))
+
+(check "--confidential on :tinfoil with no --trust is refused: sealed is not trusted"
+       (claim-refused-p :tinfoil "gpt-oss-120b" nil))
+
+(check "--confidential --trust=tinfoil-shared,tinfoil-inference on :tinfoil is allowed"
+       (not (claim-refused-p :tinfoil "gpt-oss-120b" *tinfoil-trust*)))
+
+(check "tinfoil-shared without tinfoil-inference is refused: the router hands cleartext on"
+       (claim-refused-p :tinfoil "gpt-oss-120b" '("tinfoil-shared")))
+
+(check "tinfoil-inference alone enables nothing: nothing reaches it directly"
+       (claim-refused-p :tinfoil "gpt-oss-120b" '("tinfoil-inference")))
+
+(check "--confidential on :ppq private/ with the Tinfoil trust is allowed"
+       (not (claim-refused-p :ppq "private/gpt-oss-120b" *tinfoil-trust*)))
+
+(check "--confidential on :ppq with a plain model is refused, whatever --trust says"
+       (claim-refused-p :ppq "gpt-6.1-sol" *tinfoil-trust*))
+
+(check "--confidential on :routstr: only tinfoil-* models, with the Tinfoil trust"
+       (and (claim-refused-p :routstr "gemini-3-6-flash" *tinfoil-trust*)
+            (not (claim-refused-p :routstr "tinfoil-gemma4-31b" *tinfoil-trust*))))
+
+(check "--confidential on :maple (through maple-proxy) is refused, even trusting maple"
+       (claim-refused-p :maple "gpt-oss-120b" '("maple" "tinfoil-shared" "tinfoil-inference")))
+
+(check "no --confidential means no check at all"
+       (let ((llm:*llm-backend* :openrouter) (llm:*confidential* nil) (llm:*trust* nil))
          (llm:require-confidential!)))
 
-(check "the criterion is the hardware root, not the hop count"
-       ;; A blind relay cannot leak an opaque body, so it does not defeat the
-       ;; claim; a node that terminates the model itself does.
-       (and (llm:confidential-backend-p :routstr "tinfoil-gemma4-31b")
-            (not (llm:confidential-backend-p :routstr "gemma4-31b"))
-            (not (llm:confidential-backend-p :routstr "e2ee-kimi-k2-6"))))
+(check "sealable-p: only tinfoil, private/ PPQ and tinfoil-* Routstr are sealed"
+       (and (llm:sealable-p :tinfoil "gpt-oss-120b")
+            (llm:sealable-p :ppq "private/gpt-oss-120b")
+            (not (llm:sealable-p :ppq "gpt-6.1-sol"))
+            (llm:sealable-p :routstr "tinfoil-gemma4-31b")
+            (not (llm:sealable-p :routstr "gemma4-31b"))
+            (not (llm:sealable-p :openrouter "x"))))
 
-(check "the tinfoil- prefix is what marks a Routstr model as EHBP-relayed"
-       (and (ppq:routstr-confidential-p "tinfoil-gemma4-31b")
-            (not (ppq:routstr-confidential-p "gemma4-31b"))
-            (not (ppq:routstr-confidential-p "e2ee-kimi-k2-6"))
-            (not (ppq:routstr-confidential-p "tinfoil-"))))
-
-(check "the enclave gets the bare id, the node gets the prefixed one"
-       (string= (ppq:routstr-wire-model "tinfoil-gemma4-31b") "gemma4-31b"))
-
-(check "--confidential-tinfoil + :ppq is allowed"
-       (let ((llm:*llm-backend* :ppq) (llm:*confidential* t))
-         (llm:require-confidential!)))
-
-(check "--confidential-tinfoil + :tinfoil is allowed"
-       (let ((llm:*llm-backend* :tinfoil) (llm:*confidential* t))
-         (llm:require-confidential!)))
-
-(check "no --confidential-tinfoil means no check"
-       (let ((llm:*llm-backend* :openrouter) (llm:*confidential* nil))
-         (llm:require-confidential!)))
+(check "trust names are case- and space-tolerant; a typo is reported, not dropped"
+       (multiple-value-bind (names bad) (llm:parse-trust-list " Maple, Tinfoil-Shared ,wrong")
+         (and (equal names '("maple" "tinfoil-shared" "wrong")) (equal bad '("wrong")))))
 
 ;;; ---- 3. the transport refuses a plaintext answer ----------------------------
 ;;;
@@ -173,7 +183,8 @@
                (close s)
                (let ((llm:*llm-backend* :routstr)
                      (llm:*llm-model* model)
-                     (llm:*confidential* t))
+                     (llm:*confidential* t)
+                     (llm:*trust* '("tinfoil-shared" "tinfoil-inference")))
                  (llm:set-backend-routstr! :model model :url node :token-file keyfile)
                  (llm:require-confidential!)
                  (multiple-value-bind (text parsed)

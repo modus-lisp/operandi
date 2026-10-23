@@ -32,12 +32,14 @@
            #:image-file-p
            #:*llama-url* #:llama-chat-url #:llama-ask-model #:llama-resolve-model
            #:set-backend-openrouter! #:set-backend-llama! #:set-backend-routstr!
-           #:set-backend-ppq! #:set-backend-tinfoil!
-           #:with-llama #:with-openrouter #:with-routstr #:with-ppq
-           #:*routstr-url*
+           #:set-backend-ppq! #:set-backend-tinfoil! #:set-backend-maple!
+           #:with-llama #:with-openrouter #:with-routstr #:with-ppq #:with-maple
+           #:*routstr-url* #:*maple-url* #:*maple-token-file* #:maple-loopback-url-p #:maple-refusal
            #:openrouter-credits
            #:cloud-backend-p #:*sealed-post* #:post-chat
-           #:*confidential* #:confidential-backend-p
+           #:*confidential* #:*trust* #:*trust-parties* #:parse-trust-list
+           #:sealable-p #:path-trust #:trust-requirements #:check-trust-list! #:confidential-refusal
+           #:claim-check! #:confidential-flags
            #:enable-confidential! #:require-confidential!
            #:*usage-sink* #:usage #:make-usage #:copy-usage
            #:usage-calls #:usage-prompt-tokens #:usage-completion-tokens
@@ -141,132 +143,174 @@
    :PPQ = PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/Lightning.  By
    default it is an ordinary hosted provider: *llm-model* is any PPQ model id
    and the request goes out in the clear, exactly like OpenRouter.
-   With *CONFIDENTIAL* bound true (the --confidential-tinfoil flag) it becomes Path A
+   With *CONFIDENTIAL* bound true (the --confidential flag) it becomes Path A
    only: *llm-model* must be a private/* id, every request is EHBP-sealed to
    the HPKE key of an AMD-attested Tinfoil enclave verified locally against
    the pinned AMD ARK, and there is NO fallback — an unverifiable enclave or a
-   plaintext answer is an error, not a downgrade.  See OPERANDI.PPQ.")
+   plaintext answer is an error, not a downgrade.  See OPERANDI.PPQ.
+   :MAPLE = a local maple-proxy (127.0.0.1:8080 by default).  The proxy does
+   Maple's attested transport itself; operandi speaks plain OpenAI-compatible
+   HTTP to it and does NOT verify the enclave, so :MAPLE is never confidential
+   (see CONFIDENTIAL-BACKEND-P) and refuses a non-loopback plaintext URL.")
 
 (defun cloud-backend-p (&optional (backend *llm-backend*))
   "True for hosted backends that speak OpenRouter's request dialect
    (usage accounting, reasoning.effort): :OPENROUTER and :ROUTSTR — and
-   :PPQ and :TINFOIL, which are hosted and metered too (they just may seal
-   the body)."
-  (member backend '(:openrouter :routstr :ppq :tinfoil)))
+   :PPQ, :TINFOIL and :MAPLE, which are hosted and metered too (they just may
+   seal the body)."
+  (member backend '(:openrouter :routstr :ppq :tinfoil :maple)))
 
 (defvar *confidential* nil
-  "When true, the current backend must be able to prove it is talking to a
-   measured enclave, and every request must be sealed to it.  Set by the
-   --confidential-tinfoil flag (and by WITH-PPQ :CONFIDENTIAL T).
+  "The confidential requirement for this session (--confidential): every request
+   is sealed to a key that this process has just verified in a hardware
+   attestation.  A path that cannot be sealed that way is refused, whatever
+   --trust says.  What the attested endpoint does with the cleartext afterwards
+   is not proven here; that is what *TRUST* is for.")
 
-   This is a property of the SESSION, not of the backend: it is what turns
-   :PPQ from \"a hosted provider\" into \"Path A only, no fallback\".  It is
-   deliberately separate from the backend choice so that a caller can say
-   \"I do not care which provider, but I do care that it is attested\" and
-   have that be a checkable claim rather than a naming convention.")
+(defvar *trust* nil
+  "The operators this session trusts with cleartext, from --trust=a,b,c.  Under
+   --confidential a sealed path is used only when its endpoint's operator is
+   named here.  Naming one is a statement of trust, not a check that anything
+   passed.")
 
-(defun confidential-backend-p (&optional (backend *llm-backend*) (model *llm-model*))
-  "True when BACKEND can satisfy *CONFIDENTIAL* for MODEL.
+(defparameter *trust-parties*
+  '(("tinfoil-inference" nil
+     "Tinfoil's model enclaves: the inference container and the GPUs under it.
+     Nothing in operandi can reach one directly, so on its own this enables no path.")
+    ("tinfoil-shared" ("tinfoil-inference")
+     "Tinfoil's shared router (inference.tinfoil.sh): its image, the safeguards
+     sidecar that reads transcripts, the runtime config it fetches, and its choice of
+     model enclave.  The router hands cleartext to Tinfoil's model enclaves, so this
+     needs tinfoil-inference.")
+    ("maple" ("tinfoil-shared")
+     "Maple's OpenSecret enclave on AWS Nitro and the providers it routes to.  Some
+     of every model's traffic can reach Tinfoil's shared router, so this needs
+     tinfoil-shared."))
+  "Every name --trust accepts: (NAME REQUIRES DESCRIPTION).  A name can be declared
+   only together with everything it REQUIRES, because its operator hands cleartext
+   on to them.")
 
-   THE CRITERION.  --confidential-tinfoil is satisfied iff a cleartext leak would
-   require breaking the hardware TEE the request is sealed to, or leaking the
-   silicon vendor's key.  It is NOT a claim about how many parties sit on the
-   path, and it is NOT a claim that every hop is independently verified.  A
-   party that can only drop, delay, or observe the metadata of an opaque body
-   is not a party that can leak it, so its presence does not defeat the claim.
+(defun parse-trust-list (spec)
+  "Split a --trust value (\"a,b,c\") into lower-case names.  Returns
+   (values NAMES BAD): BAD is the names *TRUST-PARTIES* does not know, so a typo
+   fails loudly instead of quietly declaring nothing."
+  (let* ((names (remove ""
+                        (mapcar (lambda (p) (string-downcase (string-trim " " p)))
+                                (uiop:split-string spec :separator ","))
+                        :test #'string=))
+         (bad (remove-if (lambda (n) (assoc n *trust-parties* :test #'string=)) names)))
+    (values names bad)))
 
-   HOW EACH BACKEND MEETS IT.  In all three cases the client seals to a key
-   that is bound into an AMD SEV-SNP report we verify locally against the pinned
-   AMD ARK, so the body can only be opened by an enclave running the measured
-   image — a leak requires breaking SEV-SNP or AMD's key.
+(defun trust-requirements (name)
+  "The names NAME requires, directly or through what they require."
+  (let ((direct (second (assoc name *trust-parties* :test #'string=))))
+    (remove-duplicates (append direct (mapcan #'trust-requirements (copy-list direct)))
+                       :test #'string= :from-end t)))
 
-     :PPQ (Path A)  seal to api.ppq.ai/private's key.  That key is byte-identical
-                    to inference.tinfoil.sh's (b92b915f…): PPQ's private base IS
-                    the Tinfoil router, reached through PPQ's billing.
-     :TINFOIL       seal to inference.tinfoil.sh's key directly.
-     :ROUTSTR       seal to the same router key, for a `tinfoil-*` model.  The
-                    node is a BLIND RELAY and we have proved it: sealing to the
-                    model container's key instead makes the node answer 422
-                    \"failed to read decrypted request body\", so it cannot open
-                    what we send.  It forwards opaque bytes and relays the sealed
-                    answer.  It can drop the request or see the model and
-                    timing; it cannot read the body or forge the reply, because
-                    the response nonce is derived from our ephemeral key.
+(defun missing-trust-requirements (names)
+  "Alist (NAME . MISSING) for each of NAMES whose requirements NAMES lacks."
+  (loop for n in names
+        for missing = (remove-if (lambda (r) (member r names :test #'string=))
+                                 (trust-requirements n))
+        when missing collect (cons n missing)))
 
-   THE ONE UNVERIFIED HOP, WHICH ALL THREE SHARE.  The router terminates our
-   sealed body and re-seals to a per-model container (the response names it:
-   tinfoil-enclave: <model>-infN-M.tinfoil.containers.tinfoil.dev).  That
-   container is Intel TDX, and we cannot verify its quote against a pinned root
-   the way we verify the SEV-SNP one — ATC refuses it outright (\"only supports
-   sev-snp-guest/v2\").  So the container hop rests on the router's word.  This
-   is a real limit, but it is a limit of the TINFOIL ROUTER, not of Routstr:
-   --tinfoil and --confidential-tinfoil --ppq private/… go through the same router and
-   the same re-seal.  Refusing Routstr for it while accepting the other two
-   would be incoherent.  What the router's word buys an attacker is bounded by
-   the same hardware: to turn it into a cleartext leak they must still break the
-   TDX container, or the SEV-SNP router, or AMD's key.
+(defun check-trust-list! (names)
+  "Signal unless every name in NAMES comes with what it requires."
+  (let ((gaps (missing-trust-requirements names)))
+    (when gaps
+      (error "--trust: ~{~a~^; ~}"
+             (loop for (n . m) in gaps
+                   collect (format nil "~a hands cleartext to ~{~a~^ and ~}, so declare ~:*~{~a~^,~} too"
+                                   n m))))
+    t))
 
-   :OPENROUTER and :LLAMA cannot seal at all, so --confidential-tinfoil with either is a
-   configuration error, not a silent downgrade."
+(defun sealable-p (&optional (backend *llm-backend*) (model *llm-model*))
+  "True when BACKEND seals MODEL's request to a key bound into an attestation that
+   this process verifies.  Those are :TINFOIL (always), a private/* model on :PPQ,
+   and a tinfoil-* model on :ROUTSTR, all sealed to Tinfoil's shared router.
+   Every other pair is sent in plaintext to whoever serves it."
   (case backend
-    ((:ppq :tinfoil) t)
+    (:tinfoil t)
+    (:ppq (operandi.ppq:confidential-p model))
     (:routstr (operandi.ppq:routstr-confidential-p model))
     (t nil)))
 
-(defun enable-confidential! ()
-  "Turn on confidential mode for the current session (the --confidential-tinfoil flag).
+(defun path-trust (&optional (backend *llm-backend*) (model *llm-model*))
+  "The --trust name a confidential request on this path needs: the operator of the
+   attested endpoint it is sealed to.  NIL when the path cannot be sealed."
+  (and (sealable-p backend model) "tinfoil-shared"))
 
-   If the backend is already :PPQ or :ROUTSTR, this also (re)installs the sealer
-   and re-checks that the current model is one that can be served confidentially
-   — so `--ppq X --confidential-tinfoil` and `--confidential-tinfoil --ppq X` behave
-   identically.  On any other backend it just sets the flag;
-   REQUIRE-CONFIDENTIAL! then fails the run at startup rather than letting
-   plaintext out."
-  (setf *confidential* t)
+(defun confidential-refusal (&optional (backend *llm-backend*) (model *llm-model*))
+  "NIL when --confidential allows BACKEND/MODEL, else the reason it does not."
+  (let ((need (path-trust backend model)))
+    (cond ((null need)
+           (format nil "the ~(~a~) path~@[ with ~a~] is not sealed to an attestation operandi verifies~a"
+                   backend model
+                   (case backend
+                     (:ppq "; use a private/* model")
+                     (:routstr "; use a tinfoil-* model")
+                     (:maple "; --maple goes through maple-proxy, which operandi does not verify")
+                     (t ""))))
+          ((not (member need *trust* :test #'string=))
+           (format nil "the ~(~a~) path is sealed to ~a, which is not in --trust; declare --trust=~{~a~^,~}"
+                   backend need (cons need (trust-requirements need))))
+          (t nil))))
+
+(defun claim-check! (&optional (backend *llm-backend*) (model *llm-model*))
+  "Signal unless switching to BACKEND/MODEL keeps --confidential.  Startup has its
+   own check (REQUIRE-CONFIDENTIAL!); this is the same rule for a switch made while
+   a session runs: the TUI's /model, and the dynamic WITH-* forms that sub-agents
+   use.  Callers run it BEFORE they change any state, so a refused switch leaves
+   the session where it was."
+  (let ((why (and *confidential* (confidential-refusal backend model))))
+    (when why (error "--confidential: refusing to switch: ~a" why)))
+  t)
+
+(defun sync-sealer! ()
+  "Install the sealer for the CURRENT backend and model when the path is sealable
+   and the session is confidential.  Tinfoil installs its own sealer in
+   SET-BACKEND-TINFOIL!, unconditionally, because it has no plaintext mode."
   (case *llm-backend*
     (:ppq
-     (unless (operandi.ppq:confidential-p *llm-model*)
-       (error "confidential mode: ~s is not a private/* model — Path B (PPQ's own \
-enclave, plaintext upstream) is not allowed. Use --ppq private/<model>."
-              *llm-model*))
-     (setf *llm-url* (format nil "~A/v1/chat/completions" operandi.ppq:*ppq-private-base*)
-           *sealed-post* (lambda (url body headers)
-                           (operandi.ppq:sealed-post
-                            url body headers :base operandi.ppq:*ppq-private-base*
-                            :model (operandi.ppq:ppq-wire-model *llm-model*)))))
+     (when (and *confidential* (operandi.ppq:confidential-p *llm-model*))
+       (setf *llm-url* (format nil "~A/v1/chat/completions" operandi.ppq:*ppq-private-base*)
+             *sealed-post* (lambda (url body headers)
+                             (operandi.ppq:sealed-post
+                              url body headers :base operandi.ppq:*ppq-private-base*
+                              :model (operandi.ppq:ppq-wire-model *llm-model*))))))
     (:routstr
-     (unless (operandi.ppq:routstr-confidential-p *llm-model*)
-       (error "confidential mode: ~s is not a tinfoil-* model — a Routstr node \
-terminates every other model itself, so it is not sealed to an enclave at all. \
-Use --routstr tinfoil-<model> on a node that carries Tinfoil, or drop \
---confidential-tinfoil."
-              *llm-model*))
-     ;; *LLM-URL* already names the node (SET-BACKEND-ROUTSTR! set it); only the
-     ;; transport changes here, so a node chosen on the command line survives.
-     ;; The node is a blind relay: it cannot open this body (proved — sealing to
-     ;; the container key instead makes it answer 422), so it is on the path but
-     ;; not in the trust set.
-     (setf *sealed-post* (lambda (url body headers)
-                           (operandi.ppq:sealed-post
-                            url body headers
-                            :base operandi.ppq:*tinfoil-base*
-                            :attestation-url operandi.ppq:*tinfoil-attestation-url*
-                            :model (operandi.ppq:routstr-wire-model *llm-model*)
-                            :model-header "X-Routstr-Model")))))
+     (when (operandi.ppq:routstr-confidential-p *llm-model*)
+       (setf *sealed-post* (lambda (url body headers)
+                             (operandi.ppq:sealed-post
+                              url body headers
+                              :base operandi.ppq:*tinfoil-base*
+                              :attestation-url operandi.ppq:*tinfoil-attestation-url*
+                              :model (operandi.ppq:routstr-wire-model *llm-model*)
+                              :model-header "X-Routstr-Model")))))))
+
+(defun enable-confidential! ()
+  "Turn on --confidential.  This sets the flag and makes the transport match it for
+   the current backend.  It does NOT decide whether the session may start: --trust
+   and the backend may come later on the command line, so that is
+   REQUIRE-CONFIDENTIAL!'s job, run once every flag is parsed."
+  (setf *confidential* t)
+  (sync-sealer!)
   t)
 
 (defun require-confidential! ()
-  "Signal unless the current backend can honour *CONFIDENTIAL*.  Called at
-   startup so that `--confidential-tinfoil --openrouter ...` fails immediately and
-   loudly instead of quietly sending plaintext for the whole session."
-  (when (and *confidential* (not (confidential-backend-p)))
-    (error "confidential mode is not available on the ~(~a~) backend~@[ for model ~s~]: \
---confidential-tinfoil requires that a cleartext leak would need the hardware TEE broken \
-or the silicon vendor's key leaked. Use --confidential-tinfoil --ppq private/<model>, \
---tinfoil <model>, or --confidential-tinfoil --routstr tinfoil-<model> on a node that \
-carries Tinfoil, or drop --confidential-tinfoil."
-           *llm-backend* (and (eq *llm-backend* :routstr) *llm-model*)))
+  "Signal unless the current path satisfies --confidential.  Called at startup,
+   after all flags are parsed, so the flags may come in any order."
+  (check-trust-list! *trust*)
+  (let ((why (and *confidential* (confidential-refusal))))
+    (when why (error "--confidential: ~a." why)))
   t)
+
+(defun confidential-flags ()
+  "The command-line flags that restore --confidential and --trust, for a resume
+   command.  NIL when there are none."
+  (let ((parts (append (and *confidential* (list "--confidential"))
+                       (and *trust* (list (format nil "--trust=~{~a~^,~}" *trust*))))))
+    (and parts (format nil "~{~a~^ ~}" parts))))
 
 (defvar *llm-effort* nil
   "Reasoning effort for the AGENT LOOP: NIL (leave it to the provider/model
@@ -308,7 +352,14 @@ carries Tinfoil, or drop --confidential-tinfoil."
     ;; :PPQ and :TINFOIL speak the enclave's plain OpenAI dialect: no
     ;; reasoning field, no chat_template_kwargs.  An unknown field is a 400 we
     ;; would have to debug through a sealed channel, so send nothing.
-    ((:ppq :tinfoil) body))
+    ((:ppq :tinfoil) body)
+    ;; :MAPLE takes a top-level reasoning_effort, low|medium|high.  It has no
+    ;; "off": leaving the field out is the only way to get the model's own
+    ;; default, so :OFF sends nothing rather than a value Maple may reject.
+    (:maple
+     (when (member effort '(:low :medium :high))
+       (setf (gethash "reasoning_effort" body)
+             (string-downcase (symbol-name effort))))))
   body)
 
 (defvar *llm-auth-token* nil
@@ -465,7 +516,7 @@ carries Tinfoil, or drop --confidential-tinfoil."
         ;; Belt and braces: *CONFIDENTIAL* is a promise that the body is
         ;; sealed, so a plaintext POST while it is set is a bug in the caller,
         ;; not a request to send.  Fail here rather than leak the prompt.
-        (when *confidential*
+        (when (and *confidential* (sealable-p))
           (error "confidential mode is on but no sealer is installed — refusing to send ~
                   a plaintext request to ~A" url))
         (let ((attempt 0))
@@ -539,6 +590,10 @@ call with :want-stream nil"))
     ;; ASK-USAGE-COST-P: confidential PPQ does not get the field).
     (when (ask-usage-cost-p)
       (setf (gethash "usage" body-ht) (ht "include" t)))
+    ;; The Maple proxy's docs say "set stream to false for a single JSON
+    ;; response", so ask for one rather than depend on its default.
+    (when (eq *llm-backend* :maple)
+      (setf (gethash "stream" body-ht) nil))
     (loop for (k v) on extra by #'cddr
           do (setf (gethash (string-downcase (string k)) body-ht) v))
     (let* ((body (with-output-to-string (s)
@@ -644,28 +699,20 @@ call with :want-stream nil"))
    ~/.operandi/routstr.token, mode 600). Returns T on success, NIL if the
    token file is missing or empty.
 
-   With CONFIDENTIAL (or with *CONFIDENTIAL* already set by --confidential-tinfoil),
-   MODEL must be a `tinfoil-*` id and every request is EHBP-sealed to the HPKE
-   key of an AMD-attested Tinfoil enclave, verified locally against the pinned
-   AMD ARK before the first byte is sent.  The node then relays the sealed body
-   blind.  Any other model is refused HERE rather than at request time, so a
-   misconfiguration fails at startup instead of silently sending plaintext."
+   A `tinfoil-*` MODEL is sealed to the HPKE key of an AMD-attested Tinfoil
+   enclave, verified locally against the pinned AMD ARK before the first byte is
+   sent.  The node relays the sealed body blind.  Any other model is an ordinary
+   plaintext request to the node, which --confidential accepts only with
+   --trust=routstr."
   (let ((token (read-token-file token-file))
-        ;; --confidential-tinfoil may have been given BEFORE --routstr, so the session
-        ;; flag wins over the keyword: once confidential mode is on, choosing a
-        ;; backend must not silently turn it off.
+        ;; --confidential may have been given BEFORE --routstr, so the session flag
+        ;; wins over the keyword: choosing a backend must not silently drop the claim.
         (conf (or confidential *confidential*)))
     (cond
       ((or (null token) (zerop (length token)))
        (format *error-output*
                "~&set-backend-routstr!: token file ~A missing or empty~%"
                token-file)
-       nil)
-      ((and conf (not (operandi.ppq:routstr-confidential-p model)))
-       (format *error-output*
-               "~&operandi: ~s is not a tinfoil-* model — a Routstr node \
-terminates every other model itself, so it is not sealed to an enclave at all~%"
-               model)
        nil)
       (t
        (setf *llm-backend*    :routstr
@@ -680,7 +727,7 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
              ;; BLIND RELAY — sealing to the container's key instead makes it
              ;; answer 422, so it cannot open this body — and the key we seal to
              ;; is the router's, verified locally against the pinned AMD ARK.
-             ;; --confidential-tinfoil only decides whether an unattestable transport is
+             ;; --confidential only decides whether an unattestable transport is
              ;; an ERROR; see CONFIDENTIAL-BACKEND-P for the criterion.
              *sealed-post*    (and (operandi.ppq:routstr-confidential-p model)
                                    (lambda (url body headers)
@@ -692,13 +739,72 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
                                       :model-header "X-Routstr-Model"))))
        t))))
 
+(defparameter *maple-url* "http://127.0.0.1:8080/v1/chat/completions"
+  "Chat endpoint of a LOCAL maple-proxy (the proxy's default MAPLE_HOST and
+   MAPLE_PORT).  operandi does not talk to Maple's hosted enclave directly:
+   that wire is an OpenSecret-encrypted session after an attestation handshake,
+   which the proxy performs and this client does not implement.  Point --maple
+   at another address to reach a proxy elsewhere.")
+
+(defparameter *maple-token-file* (merge-pathnames ".operandi/maple.token"
+                                                  (user-homedir-pathname))
+  "Optional.  The proxy's own API key, sent as a Bearer token.  With no file the
+   request carries no Authorization header, and the proxy uses the key it saved
+   (the Maple desktop app creates one), which is the usual setup.")
+
+(defun maple-loopback-url-p (url)
+  "True when URL's host is this machine.  The proxy speaks plaintext HTTP and
+   may carry a key in its Authorization header, so an http:// URL to any other
+   host would send the prompts and the key across the network in the clear."
+  (let* ((s (string-downcase url))
+         (scheme-end (search "://" s))
+         (rest (if scheme-end (subseq s (+ scheme-end 3)) s))
+         (authority (subseq rest 0 (or (position #\/ rest) (length rest))))
+         (host (if (and (plusp (length authority)) (char= (char authority 0) #\[))
+                   (subseq authority 0 (1+ (or (position #\] authority) -1)))
+                   (subseq authority 0 (or (position #\: authority) (length authority))))))
+    (and (member host '("localhost" "127.0.0.1" "[::1]") :test #'string=) t)))
+
+(defun maple-refusal (url)
+  "Why the Maple proxy cannot be used at URL, or NIL if it can."
+  (cond ((and (not (uiop:string-prefix-p "https://" (string-downcase url)))
+              (not (maple-loopback-url-p url)))
+         (format nil "~A is plaintext HTTP to a non-loopback host; the proxy's key and your prompts would cross the network in the clear. Use a loopback address or https://."
+                 url))
+        (t nil)))
+
+(defun set-backend-maple! (&key (model "gpt-oss-120b")
+                                (url *maple-url*)
+                                (token-file *maple-token-file*))
+  "Switch the LLM client to a local Maple proxy (see *MAPLE-URL*).  The token is
+   OPTIONAL: with no token file the proxy supplies its own saved key.  Returns T
+   on success, NIL (after saying why) when refused.
+
+   This path is not sealed by operandi, so --confidential refuses it
+   (REQUIRE-CONFIDENTIAL!), whatever --trust says.  A non-loopback http:// URL is refused for the reason in
+   MAPLE-REFUSAL."
+  (let* ((token (read-token-file token-file))
+         (refusal (maple-refusal url)))
+    (cond
+      (refusal
+       (format *error-output* "~&set-backend-maple!: ~A~%" refusal)
+       nil)
+      (t
+       (setf *llm-backend*    :maple
+             *llm-url*        url
+             *llm-auth-token* (and token (plusp (length token)) token)
+             *llm-model*      model
+             *llm-read-timeout* 300
+             *sealed-post*    nil)
+       t))))
+
 (defun set-backend-tinfoil! (&key (model "gpt-oss-120b")
                                   (base operandi.ppq:*tinfoil-base*)
                                   (attestation-url operandi.ppq:*tinfoil-attestation-url*)
                                   (token-file operandi.ppq:*tinfoil-token-file*))
   "Switch the LLM client to Tinfoil's OWN enclave (inference.tinfoil.sh).
 
-   There is no plaintext mode here and no --confidential-tinfoil to ask for: this
+   There is no plaintext mode here and no --confidential to ask for: this
    backend exists only as the sealed one.  Every request is EHBP-sealed to the
    HPKE key of an AMD SEV-SNP enclave verified locally against the pinned AMD
    ARK, and a response without an Ehbp-Response-Nonce is refused rather than
@@ -717,10 +823,9 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
              *llm-auth-token* token
              *llm-model*      model
              *llm-read-timeout* 240
-             ;; Sealed always, and *CONFIDENTIAL* is set with it so that the
-             ;; plaintext guard in %LLM-POST holds even if the sealer were
-             ;; somehow cleared: on this backend there is no unsealed request.
-             *confidential*   t
+             ;; Sealed always: this backend has no plaintext mode, whether or
+             ;; not the session is confidential.  Whether the session CLAIMS
+             ;; confidentiality is *CONFIDENTIAL*, which this setter leaves alone.
              *sealed-post*    (lambda (url body headers)
                                 (operandi.ppq:sealed-post
                                  url body headers :base base
@@ -746,8 +851,8 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
 
    Returns T on success, NIL if the token file is missing or empty."
   (let ((token (read-token-file token-file))
-        ;; --confidential-tinfoil may have been given BEFORE --ppq (the natural order
-        ;; is `--confidential-tinfoil --ppq private/x`), so the session flag wins over
+        ;; --confidential may have been given BEFORE --ppq (the natural order
+        ;; is `--confidential --ppq private/x`), so the session flag wins over
         ;; the keyword: once confidential mode is on, choosing a backend must
         ;; not silently turn it off.
         (conf (or confidential *confidential*)))
@@ -756,15 +861,14 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
        (format *error-output* "~&set-backend-ppq!: token file ~A missing or empty~%"
                token-file)
        nil)
-      ((and conf (not (operandi.ppq:confidential-p model)))
-       (format *error-output*
-               "~&set-backend-ppq!: ~s is not a private/* model — Path B is not allowed under --confidential-tinfoil~%"
-               model)
-       nil)
       (t
        (setf *llm-backend*    :ppq
+             ;; Only a private/* model has a sealed endpoint.  Any other model under
+             ;; --confidential goes to BASE in plaintext, and REQUIRE-CONFIDENTIAL!
+             ;; decides whether that is allowed (it needs --trust=ppq).
              *llm-url*        (format nil "~A/v1/chat/completions"
-                                      (if conf private-base base))
+                                      (if (and conf (operandi.ppq:confidential-p model))
+                                          private-base base))
              *llm-auth-token* token
              *llm-model*      model
              *llm-read-timeout* 240
@@ -775,7 +879,7 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
              ;; the failure is loud, but the point is that the two must never
              ;; come apart.  (WITH-PPQ binds it dynamically; this is the
              ;; global/CLI path, so it is setf'd.)
-             *sealed-post*    (and conf
+             *sealed-post*    (and conf (operandi.ppq:confidential-p model)
                                     (lambda (url body headers)
                                       (operandi.ppq:sealed-post
                                        url body headers :base private-base
@@ -790,29 +894,29 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
                     &body body)
   "Run BODY with the LLM client switched to :PPQ.
 
-   With CONFIDENTIAL, MODEL must be a private/* id and the exchange is sealed
-   to a locally verified enclave; if the token is missing or MODEL is not
-   private/*, this SIGNALS — it does not fall through to the current backend,
-   because a silent downgrade to plaintext is exactly what confidential mode
-   exists to prevent.  Without CONFIDENTIAL it is an ordinary hosted call."
+   CONFIDENTIAL is a runtime form.  When it is true, MODEL must be a private/*
+   id and the exchange is sealed to a locally verified enclave whose operator
+   --trust names; that is checked here at run time, so a sub-agent on a
+   non-private model SIGNALS rather than sending in plaintext.
+   Without CONFIDENTIAL it is an ordinary hosted call, with no check at all."
   (let ((tok (gensym)) (tf (gensym)) (md (gensym)))
     `(let* ((,tf ,token-file)
             (,md ,model)
             (,tok (read-token-file ,tf)))
        (unless (and ,tok (plusp (length ,tok)))
          (error "with-ppq: no PPQ API key at ~A" ,tf))
-       ,@(when confidential
-           `((unless (operandi.ppq:confidential-p ,md)
-               (error "with-ppq: ~s is not a private/* model — Path B is not allowed under :confidential t"
-                      ,md))))
+       (let ((why (and ,confidential (confidential-refusal :ppq ,md))))
+         (when why (error "with-ppq: --confidential: ~a" why)))
        (let ((*llm-backend* :ppq)
              (*llm-url* (format nil "~A/v1/chat/completions"
-                                (if ,confidential ,private-base ,base)))
+                                (if (and ,confidential (operandi.ppq:confidential-p ,md))
+                                    ,private-base ,base)))
              (*llm-auth-token* ,tok)
              (*llm-model* ,md)
              (*llm-read-timeout* 240)
              (*confidential* (and ,confidential t))
              (*sealed-post* (and ,confidential
+                                 (operandi.ppq:confidential-p ,md)
                                  (lambda (url body headers)
                                    (operandi.ppq:sealed-post
                                     url body headers :base ,private-base
@@ -965,8 +1069,7 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
         ;; Leaving a sealer installed would EHBP-seal a request to a backend
         ;; that never asked for it.  The sealer belongs to confidential :PPQ
         ;; alone, so every other backend switch clears it.
-        *sealed-post*    nil
-        *confidential*   nil)
+        *sealed-post*    nil)
   t)
 
 (defmacro with-llama (&body body)
@@ -975,13 +1078,15 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
    work (paper-trader market evals) that shouldn't burn paid API
    credits even when operandi's cron tasks are running on a frontier
    backend."
-  `(let ((*llm-backend* :llama)
-         (*llm-url* *llama-url*)
-         (*llm-auth-token* nil)
-         (*llm-model* nil)
-         (*llm-read-timeout* 120)
-         (*sealed-post* nil))
-     ,@body))
+  `(progn
+     (claim-check! :llama nil)
+     (let ((*llm-backend* :llama)
+           (*llm-url* *llama-url*)
+           (*llm-auth-token* nil)
+           (*llm-model* nil)
+           (*llm-read-timeout* 120)
+           (*sealed-post* nil))
+       ,@body)))
 
 (defmacro with-openrouter ((&key (model "anthropic/claude-sonnet-4-5")
                                   (token-file (merge-pathnames
@@ -1000,6 +1105,7 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
                   ,tf)
           ,@body)
          (t
+          (claim-check! :openrouter ,model)
           (let ((*llm-backend* :openrouter)
                 (*llm-url* "https://openrouter.ai/api/v1/chat/completions")
                 (*llm-auth-token* ,tok)
@@ -1017,7 +1123,7 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
   "Run BODY with the LLM client temporarily switched to Routstr.  URL names the
    node; a `tinfoil-*` MODEL on a node that carries Tinfoil is relayed blind to
    the attested enclave, but this macro does NOT turn on confidential mode —
-   that is --confidential-tinfoil's job, and it is a property of the session."
+   that is --confidential's job, and it is a property of the session."
   (let ((tok (gensym))
         (tf  (gensym)))
     `(let* ((,tf ,token-file)
@@ -1029,6 +1135,7 @@ terminates every other model itself, so it is not sealed to an enclave at all~%"
                   ,tf)
           ,@body)
          (t
+          (claim-check! :routstr ,model)
           (let ((*llm-backend* :routstr)
                 (*llm-url* (routstr-chat-url ,url))
                 (*llm-auth-token* ,tok)

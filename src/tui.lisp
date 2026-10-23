@@ -442,6 +442,7 @@
     (:openrouter (or llm:*llm-model* "openrouter"))
     (:routstr (or llm:*llm-model* "routstr"))
     (:ppq (or llm:*llm-model* "ppq"))
+    (:maple (or llm:*llm-model* "maple"))
     (t "llama.cpp")))
 
 (defparameter *cut-off-note*
@@ -834,13 +835,21 @@
              (round eng:*context-token-budget* 1000)
              (paint (or operandi.subagent:*worker-model* "inherit (same as above)") :cyan)))
     ((find #\/ arg)                       ; vendor/model → OpenRouter
-     (llm:set-backend-openrouter! :model arg)
-     (eng:apply-backend-defaults)
-     (format t "~&→ OpenRouter ~A~%" (paint arg :cyan)))
+     ;; The claim is checked BEFORE the switch: a refused /model leaves the session
+     ;; on the backend it was on.
+     (handler-case
+         (progn (llm:claim-check! :openrouter arg)
+                (llm:set-backend-openrouter! :model arg)
+                (eng:apply-backend-defaults)
+                (format t "~&→ OpenRouter ~A~%" (paint arg :cyan)))
+       (error (e) (format t "~&~A~%" (paint (princ-to-string e) :yellow)))))
     ((string-equal arg "llama")
-     (llm:set-backend-llama!)
-     (eng:apply-backend-defaults)
-     (format t "~&→ local llama.cpp~%"))
+     (handler-case
+         (progn (llm:claim-check! :llama nil)
+                (llm:set-backend-llama!)
+                (eng:apply-backend-defaults)
+                (format t "~&→ local llama.cpp~%"))
+       (error (e) (format t "~&~A~%" (paint (princ-to-string e) :yellow)))))
     (t (format t "~&unknown model spec ~S — give a 'vendor/name' id or 'llama'.~%" arg))))
 
 (defun cmd-workers (arg)
@@ -882,6 +891,7 @@ to start a new chat with that person, or a chat name / group id for an existing 
               (case llm:*llm-backend*
                 ((:openrouter :routstr) "  (OpenRouter/Routstr: off → reasoning disabled; low/medium/high → reasoning.effort)")
                 (:ppq "  (ppq: reasoning is the provider model's own; this backend does not set it)")
+                (:maple "  (maple: low/medium/high → reasoning_effort; off/default → the model's own)")
                 (t "  (llama.cpp: off/default → no thinking; low/medium/high → thinking on)")))
       (multiple-value-bind (e ok) (llm:parse-effort arg)
         (if ok
@@ -1336,7 +1346,8 @@ input row and erased by the next repaint.  The echo goes through EMIT, which tak
   (format nil "· ~A~@[ · ~A~]" (model-label)
           (case llm:*llm-backend* (:openrouter "openrouter")
                                   (:routstr (if llm:*confidential* "routstr confidential" "routstr"))
-                                  (:ppq (if llm:*confidential* "ppq confidential" "ppq")))))
+                                  (:ppq (if llm:*confidential* "ppq confidential" "ppq"))
+                                  (:maple "maple"))))
 
 (defun ui-banner (sess)
   (emit (format nil "~A ~A~%~A~%~A~%"
@@ -1418,16 +1429,16 @@ input row and erased by the next repaint.  The echo goes through EMIT, which tak
                  :gray)))
 
 (defun resume-command (sess)
-  "The shell command that brings SESS back, model flag included — a bare
-   --resume would reopen it on the default backend, not the one it ran on."
-  (format nil "operandi~@[ ~A ~A~]~@[ --effort ~A~] --resume ~A tui"
+  "The shell command that brings SESS back: backend, model, the confidential
+   claim and its trust declarations, and effort.  A bare --resume would reopen
+   it on the default backend, and without the claim it would silently drop it."
+  (format nil "operandi~@[ ~A~]~@[ ~A~]~@[ ~A~]~@[ --effort ~A~] --resume ~A tui"
           (case llm:*llm-backend*
-            (:ppq (if llm:*confidential* "--confidential-tinfoil --ppq" "--ppq"))
-            (:tinfoil "--tinfoil")
-            (:routstr (if llm:*confidential* "--confidential-tinfoil --routstr" "--routstr"))
-            (:openrouter "--openrouter")
-            (t nil))
-          (and (member llm:*llm-backend* '(:openrouter :routstr :ppq :tinfoil)) llm:*llm-model*)
+            (:ppq "--ppq") (:tinfoil "--tinfoil") (:routstr "--routstr")
+            (:openrouter "--openrouter") (:maple "--maple") (t nil))
+          (and (member llm:*llm-backend* '(:openrouter :routstr :ppq :tinfoil :maple))
+               llm:*llm-model*)
+          (llm:confidential-flags)
           (and llm:*llm-effort* (effort-label))
           (gethash :id sess)))
 

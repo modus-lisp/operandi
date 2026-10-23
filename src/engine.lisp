@@ -1039,6 +1039,10 @@ another tool or give a final answer.")
       (setf (gethash "stream" body) t)
       ;; ask providers to send a final usage chunk in the stream
       (setf (gethash "stream_options" body) (ht "include_usage" t)))
+    ;; The Maple proxy streams only when asked for it; a blocking turn says so
+    ;; rather than depend on the proxy's default (see LLM-CHAT).
+    (when (and (not stream) (eq llm:*llm-backend* :maple))
+      (setf (gethash "stream" body) nil))
     ;; Reasoning: /effort, --effort, OPERANDI_EFFORT (see LLM:*LLM-EFFORT*);
     ;; the legacy *DO-CHAT-DISABLE-REASONING* still means :OFF if nothing
     ;; explicit was chosen.

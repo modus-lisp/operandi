@@ -23,7 +23,7 @@
 ;;;; `--ppq gpt-6.1-sol` posts to api.ppq.ai/v1/chat/completions in the clear,
 ;;;; exactly like OpenRouter.  What you must not be able to do is BELIEVE you
 ;;;; are confidential when you are not.  So confidentiality is a separate,
-;;;; explicit switch — `--confidential-tinfoil` — and when it is on this file refuses
+;;;; explicit switch — `--confidential` — and when it is on this file refuses
 ;;;; anything that is not Path A:
 ;;;;
 ;;;;   1. The model must be named `private/<tinfoil-model>`.  Anything else is
@@ -255,7 +255,7 @@
 ;;; cannot verify against a pinned root the way we verify the SEV-SNP one, and
 ;;; the manifest is served by the very enclave whose honesty is at issue.  So a
 ;;; Routstr request is ENCRYPTED, not ATTESTED.  Use --tinfoil for the attested
-;;; path; use --routstr without --confidential-tinfoil for the encrypted one.
+;;; path; use --routstr without --confidential for the encrypted one.
 ;;;
 ;;; The one thing the node DOES control is where the sealed body is forwarded
 ;;; (X-Tinfoil-Enclave-Url, restricted by the node to *.tinfoil.sh).  That is
@@ -541,7 +541,7 @@
    OPERANDI.LLM:LLM-CHAT with the :PPQ backend."
   (when (and confidential (not (confidential-p model)))
     (refuse :not-path-a
-            "~s is not a private/* model; Path B (PPQ's own enclave, plaintext upstream) is not allowed under --confidential-tinfoil"
+            "~s is not a private/* model; Path B (PPQ's own enclave, plaintext upstream) is not allowed under --confidential"
             model))
   (let* ((wire (ppq-wire-model model))
          (msgs (if system

@@ -137,7 +137,9 @@ always prompt text — `operandi tui` is a task whose text is "tui".
 | `--routstr [NODE-URL] [MODEL]` | use Routstr (Lightning-paid nodes); `NODE-URL` picks the node |
 | `--ppq [MODEL]` | use PPQ (ppq.ai), OpenAI-compatible, paid in Bitcoin/Lightning |
 | `--tinfoil [MODEL]` | use Tinfoil's own enclave, sealed end to end (no plaintext mode) |
-| `--confidential-tinfoil` | require every request to be EHBP-sealed to a locally verified Tinfoil enclave; fails rather than downgrading |
+| `--maple [ADDR] [MODEL]` | use Maple through a **local** `maple-proxy` at `ADDR` (default `127.0.0.1:8080`). The proxy does Maple's attested transport; operandi does **not** verify the enclave, so `--confidential` refuses it. Plaintext to a non-loopback host is refused. Optional key in `~/.operandi/maple.token` |
+| `--confidential` | seal every request to a key bound into a hardware attestation that operandi verifies, and refuse any path that can't be sealed that way. The sealed endpoint's operator must also be in `--trust`. Today that's Tinfoil's router: `--tinfoil`, `--ppq private/MODEL` or `--routstr tinfoil-MODEL` |
+| `--trust=LIST` | the operators trusted with the cleartext: `maple` (needs both Tinfoil names: it routes some traffic to Tinfoil's router), `tinfoil-shared` (Tinfoil's router; needs `tinfoil-inference`, the model enclaves it forwards to), `tinfoil-inference` (alone it enables nothing; nothing reaches the model enclaves directly). A name without what it needs is an error |
 | `--rc TARGET` | mirror each turn to a Marmot chat (npub/nprofile/NIP-05 starts one; a chat name or group id joins one) |
 | `--worker-model M` | model for sub-agents: a `vendor/name` slug, `llama`, or `inherit` |
 | `--effort off\|low\|medium\|high\|default` | reasoning effort (also `OPERANDI_EFFORT`) |

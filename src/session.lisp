@@ -41,6 +41,7 @@
     (:openrouter (or llm:*llm-model* "openrouter"))
     (:routstr (or llm:*llm-model* "routstr"))
     (:ppq (or llm:*llm-model* "ppq"))
+    (:maple (or llm:*llm-model* "maple"))
     (t "llama.cpp")))
 
 (defun session-id ()

@@ -142,12 +142,16 @@
         ((and (find #\/ model) (eq llm:*llm-backend* :routstr))
          (llm:with-routstr (:model model) (funcall thunk)))
         ;; A worker on :PPQ stays on it, and stays in the same mode: under
-        ;; --confidential-tinfoil it stays Path A, and a model that is not private/*
+        ;; --confidential it stays Path A, and a model that is not private/*
         ;; is refused by WITH-PPQ rather than quietly becoming a plaintext
-        ;; OpenRouter call.  Without --confidential-tinfoil it is an ordinary hosted
+        ;; OpenRouter call.  Without --confidential it is an ordinary hosted
         ;; call, so any PPQ model id is fine.
         ((eq llm:*llm-backend* :ppq)
          (llm:with-ppq (:model model :confidential llm:*confidential*) (funcall thunk)))
+        ;; A worker on the Maple proxy stays on it: a slashed model would
+        ;; otherwise fall through to WITH-OPENROUTER, a silent backend switch.
+        ;; Maple ids have no slash, so the session's own model is the one used.
+        ((eq llm:*llm-backend* :maple) (funcall thunk))
         ((find #\/ model) (llm:with-openrouter (:model model) (funcall thunk)))
         (t (funcall thunk))))
 

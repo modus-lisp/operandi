@@ -85,14 +85,17 @@ plainly; never fabricate a value to fill a hole."
   (or *agent-kp*
       (setf *agent-kp*
             (if (probe-file *key-file*)
-                (keys:keypair-from-secret
-                 (with-open-file (s *key-file*) (string-trim '(#\Space #\Newline) (read-line s))))
+                ;; into fixed memory; the heap copies of the hex are overwritten after
+                (let* ((line (with-open-file (s *key-file*) (read-line s)))
+                       (hex (string-trim '(#\Space #\Newline) line)))
+                  (unwind-protect (keys:keypair-from-secret hex) (fill hex #\0) (fill line #\0)))
                 (let ((kp (keys:generate-keypair)))
                   (ignore-errors
                     (ensure-directories-exist *key-file*)
                     (with-open-file (s *key-file* :direction :output
                                        :if-exists :supersede :if-does-not-exist :create)
-                      (format s "~a~%" (keys:secret-hex kp)))
+                      (let ((hex (keys:secret-hex kp)))      ; the explicit export, to the file
+                        (unwind-protect (format s "~a~%" hex) (fill hex #\0))))
                     #+sbcl (sb-posix:chmod (namestring *key-file*) #o600))
                   kp)))))
 (defun agent-pubkey () (keys:public-hex (ensure-agent-key)))

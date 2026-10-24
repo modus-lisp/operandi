@@ -14,7 +14,17 @@
 #   bin/operandi --openrouter deepseek/deepseek-v4-flash "task"
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Follow symlinks to find the real script, so ROOT is the repo even when this
+# is invoked through a link on PATH (e.g. ~/.local/bin/operandi-no-sandbox).
+SELF="$0"
+while [ -L "$SELF" ]; do
+  TARGET="$(readlink "$SELF")"
+  case "$TARGET" in
+    /*) SELF="$TARGET" ;;
+    *)  SELF="$(dirname "$SELF")/$TARGET" ;;
+  esac
+done
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd -P)"
 CORE="$ROOT/operandi.core"
 SBCL="${OPERANDI_SBCL:-sbcl}"
 

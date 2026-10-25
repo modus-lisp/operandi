@@ -139,3 +139,8 @@
 ;; Quicklisp local-projects targets (sibling checkouts, read-only). Rendered by
 ;; bin/operandi-sandbox-macos from the symlinks in ~/quicklisp/local-projects.
 __LOCAL_PROJECTS__
+
+;; Your own rules, last so they win over everything above. Rendered from
+;; ~/.operandi/sandbox.lisp and <project>/.operandi/sandbox.lisp — see the
+;; CUSTOMIZE section at the top of bin/operandi-sandbox-macos for the DSL.
+__EXTRA__

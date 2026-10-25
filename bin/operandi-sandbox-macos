@@ -1,98 +1,362 @@
-#!/usr/bin/env bash
-# Run operandi inside its macOS sandbox, with the directory you launched it from
-# opened up (read/write) as the project. bin/sandbox.sb is a TEMPLATE: this
-# script renders it for the current user and machine on every run, so nothing
-# about the home dir or per-user temp/cache paths is hardcoded.
-#
-# Meant to be symlinked onto PATH:
-#   ln -s ~/workspace/modus-lisp/operandi/bin/operandi-sandbox-macos ~/.local/bin/operandi
-#
-# Usage: operandi [operandi args...]
-set -euo pipefail
+#!/usr/bin/env -S sbcl --script
+;;;; operandi-sandbox-macos — run operandi inside its macOS sandbox, with the
+;;;; directory you launched it from opened up (read/write) as the project.
+;;;;
+;;;; This was a bash script. It is Lisp now so the sandbox can be customized
+;;;; per user and per project (see CUSTOMIZE) instead of by editing the
+;;;; template by hand.
+;;;;
+;;;; bin/sandbox.sb is a TEMPLATE: this renders it for the current user and
+;;;; machine on every run, so nothing about the home dir or the per-user
+;;;; temp/cache paths is hardcoded.
+;;;;
+;;;; Meant to be symlinked onto PATH:
+;;;;   ln -s ~/workspace/modus-lisp/operandi/bin/operandi-sandbox-macos ~/.local/bin/operandi
+;;;;
+;;;; Usage: operandi [operandi args...]
+;;;;
+;;;; CUSTOMIZE
+;;;;   ~/.operandi/sandbox.lisp            your rules, applied in every project
+;;;;   <project>/.operandi/sandbox.lisp    that project's rules
+;;;; Both are read in that order (project last, so it can narrow the user's
+;;;; rules — later rules win) and may contain any of:
+;;;;   (allow-read  "~/notes")            read a subtree (and its ancestors)
+;;;;   (allow-write "~/scratch/out")      read *and* write a subtree
+;;;;   (allow-connect "localhost:11434")  open a TCP connection
+;;;;   (allow-bind    "localhost:*")      listen on a TCP port
+;;;;   (deny-read "~/secrets")   (deny-write ...)   (deny-connect ...)   (deny-bind ...)
+;;;;   (raw "(allow mach-lookup (global-name \"com.apple.Foo\"))")
+;;;; Paths beginning with ~ are under $HOME; anything else is taken as given.
+;;;; Set OPERANDI_SANDBOX_DRYRUN_PROFILE=1 to print the whole rendered profile
+;;;; and run nothing, or OPERANDI_SANDBOX_DRYRUN=1 for just the rendered
+;;;; local-projects rules (what the bash version printed).
 
-# Follow symlinks to find the real script, so ROOT is the repo even when this
-# is invoked through ~/.local/bin/operandi.
-SELF="$0"
-while [ -L "$SELF" ]; do
-  TARGET="$(readlink "$SELF")"
-  case "$TARGET" in
-    /*) SELF="$TARGET" ;;
-    *)  SELF="$(dirname "$SELF")/$TARGET" ;;
-  esac
-done
-ROOT="$(cd "$(dirname "$SELF")/.." && pwd -P)"
-OPERANDI="$ROOT/bin/operandi"
-# The program to run inside the sandbox. operandi-acp-sandbox-macos sets this to
-# bin/operandi-acp; the core-build step below always goes through bin/operandi.
-PAYLOAD="${OPERANDI_SANDBOX_TARGET:-$OPERANDI}"
-TEMPLATE="$ROOT/bin/sandbox.sb"
+(declaim (sb-ext:muffle-conditions cl:style-warning sb-ext:compiler-note))
+(require :sb-posix)
 
-# Resolve a path to its physical form: sandbox rules match resolved paths.
-resolve() { (cd "$1" && pwd -P); }
+(defpackage #:sandbox-launcher (:use #:cl))
+(in-package #:sandbox-launcher)
 
-HOME_DIR="$(resolve "$HOME")"
-REPO="$(resolve "$ROOT")"
-TMP_DIR="$(resolve "$(getconf DARWIN_USER_TEMP_DIR)")"
-CACHE_DIR="$(resolve "$(getconf DARWIN_USER_CACHE_DIR)")"
+;;; ---------------------------------------------------------------------------
+;;; the small bit of libc we need
+;;;
+;;; sb-posix has no exec* and this SBCL's alien c-string return convention
+;;; mistranslates a malloc'd char* (it crashed the image), so paths are
+;;; resolved by shelling out to /bin/sh (`cd -- "$1" && pwd -P`, exactly what
+;;; the bash version did) and the final handoff uses execve, whose only output
+;;; is an errno.
 
-# Substitution goes into a quoted SBPL string, so refuse paths that would
-# break out of it (a quote or backslash in a directory name).
-for p in "$HOME_DIR" "$REPO" "$TMP_DIR" "$CACHE_DIR"; do
-  case "$p" in
-    *\"*|*\\*) echo "operandi: refusing path with quote/backslash: $p" >&2; exit 1 ;;
-  esac
-done
+(sb-alien:define-alien-routine ("execve" %execve) sb-alien:int
+  (path sb-alien:c-string)
+  (argv sb-alien:unsigned-long)
+  (envp sb-alien:unsigned-long))
 
-CWD="$(pwd -P)"
+(defvar *environ* (sb-alien:extern-alien "environ" sb-alien:unsigned-long))
+(defvar *errno* (sb-alien:extern-alien "errno" sb-alien:int))
 
-# Refuse to open up $HOME (or anything above it) — that would defeat the
-# sandbox. Fall back to running inside operandi's own tree instead.
-if [ "$CWD" = / ] || [[ "$HOME_DIR/" == "$CWD"/* ]]; then
-  echo "operandi: not exposing $CWD to the sandbox; running from $REPO instead" >&2
-  CWD="$REPO"
-  cd "$CWD"
-fi
+;;; ---------------------------------------------------------------------------
+;;; helpers
 
-# Quicklisp local-projects: each entry is a symlink to a project wherever it
-# lives on this machine. Those dirs can be anywhere (outside the repo), so the
-# grant is computed from the links on every launch, not hardcoded. Each link's
-# containing directory gets READ access. Read-only: loading needs the sources,
-# not write access to them.
-LOCAL_RULES=""
-LOCAL_SEEN=""
-for link in "$HOME_DIR"/quicklisp/local-projects/*; do
-  [ -L "$link" ] || continue
-  target="$(readlink "$link")"
-  case "$target" in
-    /*) ;;
-    *) echo "operandi: skipping relative local-projects link: $link" >&2; continue ;;
-  esac
-  dir="$(resolve "$(dirname "$target")" 2>/dev/null)" || continue
-  case "$dir" in
-    *\"*|*\\*) echo "operandi: refusing local-projects path with quote/backslash: $dir" >&2; continue ;;
-  esac
-  # de-duplicate (bash 3.2 has no associative arrays)
-  if printf '%s\n' "$LOCAL_SEEN" | grep -qxF "$dir"; then continue; fi
-  LOCAL_SEEN="$LOCAL_SEEN$dir"$'\n'
-  LOCAL_RULES="$LOCAL_RULES  (allow-ancestor-metadata \"$dir\")"$'\n'
-  LOCAL_RULES="$LOCAL_RULES  (allow file-read* (subpath \"$dir\"))"$'\n'
-done
+(defun note (&rest args)
+  (apply #'format *error-output* args)
+  (finish-output *error-output*))
 
-# Render the profile. Plain bash string replacement, no sed escaping issues.
-PROFILE="$(<"$TEMPLATE")"
-PROFILE="${PROFILE//__HOME__/$HOME_DIR}"
-PROFILE="${PROFILE//__REPO__/$REPO}"
-PROFILE="${PROFILE//__TMP__/$TMP_DIR}"
-PROFILE="${PROFILE//__CACHE__/$CACHE_DIR}"
-PROFILE="${PROFILE//__LOCAL_PROJECTS__/$LOCAL_RULES}"
+(defun die (code &rest args)
+  (when args (apply #'note args))
+  (sb-ext:exit :code code))
 
-if [ -n "${OPERANDI_SANDBOX_DRYRUN:-}" ]; then
-  printf '%s' "$LOCAL_RULES"
-  exit 0
-fi
+(defun env-set-p (name)
+  "bash's ${VAR:+x}: the variable is set and not empty."
+  (let ((v (sb-posix:getenv name))) (and v (plusp (length v)) v)))
 
-# Rebuild the core if sources changed — outside the sandbox, which can't see
-# ~/quicklisp or write the fasl cache.
-OPERANDI_BUILD_ONLY=1 "$OPERANDI"
+(defun unsafe-path-p (p)
+  "Would a quote or backslash in P break out of its SBPL string literal?"
+  (find-if (lambda (c) (member c '(#\" #\\))) p))
 
-exec /usr/bin/sandbox-exec -D CWD="$CWD" -p "$PROFILE" "$PAYLOAD" "$@"
+(defun sh (&rest args)
+  "Run /bin/sh ARGS for its newline-trimmed stdout; \"\" if it fails."
+  (string-trim
+   '(#\Newline)
+   (handler-case
+       (with-output-to-string (s)
+         (sb-ext:run-program "/bin/sh" args :output s :error nil :search nil))
+     (error () ""))))
+
+(defun %physical (p)
+  "P with every symlink resolved (cd && pwd -P), or NIL if not a directory."
+  (let ((out (sh "-c" "cd -- \"$1\" 2>/dev/null && pwd -P" "sh" p)))
+    (if (plusp (length out)) out nil)))
+
+(defun physical (p &optional (what "path"))
+  (or (%physical p) (die 1 "operandi: ~A does not exist: ~A~%" what p)))
+
+(defun getconf-dir (name)
+  (let ((v (sh "-c" "exec /usr/bin/getconf \"$1\"" "sh" name)))
+    (physical v (format nil "getconf ~A" name))))
+
+(defun symlink-p (p)
+  "Is P a symlink? S-IFLNK is one of several file-type codes, so the type bits
+have to be masked off before comparing — loganding the mode with S-IFLNK alone
+is nonzero for every regular file."
+  (handler-case (= sb-posix:s-iflnk
+                   (logand #o170000 (sb-posix:stat-mode (sb-posix:lstat p))))
+    (error () nil)))
+
+(defun read-link (p)
+  (handler-case (sb-posix:readlink p) (error () nil)))
+
+(defun dirname (p)
+  (let ((i (position #\/ p :from-end t)))
+    (cond ((null i) ".") ((zerop i) "/") (t (subseq p 0 i)))))
+
+(defun replace-all (text from to)
+  "TEXT with every occurrence of FROM (a plain string, not a regex) replaced
+by TO."
+  (with-output-to-string (out)
+    (let ((start 0) (flen (length from)))
+      (when (plusp flen)
+        (loop for hit = (search from text :start2 start)
+              while hit
+              do (write-string text out :start start :end hit)
+                 (write-string to out)
+                 (setf start (+ hit flen))))
+      (write-string text out :start start))))
+
+;;; ---------------------------------------------------------------------------
+;;; the customization DSL
+
+(defvar *extra* '())
+
+(defun emit (control &rest args)
+  (push (apply #'format nil control args) *extra*))
+
+(defun rule-path (p)
+  "Expand a leading ~ and resolve P; NIL (with a warning) if it is unusable."
+  (let* ((expanded (let ((home (sb-posix:getenv "HOME")))
+                     (cond ((string= p "~") home)
+                           ((and (> (length p) 1) (string= "~/" p :end1 2))
+                            (concatenate 'string home (subseq p 1)))
+                           (t p))))
+         (real (%physical expanded)))
+    (cond ((unsafe-path-p expanded)
+           (note "operandi: ignoring sandbox rule with quote/backslash in path: ~A~%" expanded)
+           nil)
+          ((null real)
+           (note "operandi: ignoring sandbox rule for missing path: ~A~%" expanded)
+           nil)
+          (t real))))
+
+(defun allow-read (path)
+  (let ((p (rule-path path)))
+    (when p
+      (emit "(allow-ancestor-metadata \"~A\")" p)
+      (emit "(allow file-read* (subpath \"~A\"))" p))))
+
+(defun allow-write (path)
+  (let ((p (rule-path path)))
+    (when p
+      (emit "(allow-ancestor-metadata \"~A\")" p)
+      (emit "(allow file-read* file-write* (subpath \"~A\"))" p))))
+
+(defun deny-read (path)
+  (let ((p (rule-path path))) (when p (emit "(deny file-read* (subpath \"~A\"))" p))))
+
+(defun deny-write (path)
+  (let ((p (rule-path path))) (when p (emit "(deny file-write* (subpath \"~A\"))" p))))
+
+(defun bad-host-port-p (host-port who)
+  (unless (unsafe-path-p host-port) (return-from bad-host-port-p nil))
+  (note "operandi: ignoring ~A rule with quote/backslash: ~A~%" who host-port)
+  t)
+
+(defun allow-connect (host-port)
+  (unless (bad-host-port-p host-port "allow-connect")
+    (emit "(allow network-outbound (remote tcp \"~A\"))" host-port)))
+
+(defun deny-connect (host-port)
+  (unless (bad-host-port-p host-port "deny-connect")
+    (emit "(deny network-outbound (remote tcp \"~A\"))" host-port)))
+
+(defun allow-bind (host-port)
+  (unless (bad-host-port-p host-port "allow-bind")
+    (emit "(allow network-bind    (local ip \"~A\"))" host-port)
+    (emit "(allow network-inbound (local ip \"~A\"))" host-port)))
+
+(defun deny-bind (host-port)
+  (unless (bad-host-port-p host-port "deny-bind")
+    (emit "(deny network-bind    (local ip \"~A\"))" host-port)
+    (emit "(deny network-inbound (local ip \"~A\"))" host-port)))
+
+(defun raw (text)
+  (emit "~A" text))
+
+(defun load-customization (file)
+  (unless (probe-file file) (return-from load-customization nil))
+  (with-open-file (in file)
+    (loop for form = (let ((*read-eval* nil)
+                           (*package* (find-package :sandbox-launcher)))
+                       (read in nil :eof))
+          until (eq form :eof)
+          do (handler-case (eval form)
+               (error (e) (die 1 "operandi: ~A: ~A: ~A~%" file (type-of e) e)))))
+  (note "operandi: sandbox rules from ~A~%" file))
+
+;;; ---------------------------------------------------------------------------
+;;; rendering
+
+(defun directory-names (dir)
+  "Non-dot entries of DIR, or NIL (empty list) if it cannot be read.
+NB: not sb-posix:opendir/readdir — this SBCL's DIRENT struct does not match
+macOS's, so dirent-name reads out of bounds and corrupts the image."
+  (let ((out (sh "-c" "ls -1 -- \"$1\" 2>/dev/null" "sh" dir)))
+    (with-input-from-string (in out)
+      (loop for line = (read-line in nil nil)
+            while line
+            unless (zerop (length line)) collect line))))
+
+(defun config-dir-rules (dir)
+  "One (allow-ancestor-metadata)/(allow file-read*) pair per symlink in DIR,
+deduplicated: Quicklisp puts several .asd links beside the same checkout."
+  (let ((rules "") (seen (make-hash-table :test #'equal)))
+    (dolist (name (directory-names dir))
+      (let ((link (format nil "~A/~A" dir name)))
+        (when (symlink-p link)
+          (let ((target (read-link link)))
+            (when (and target (plusp (length target)))
+              (if (char/= (char target 0) #\/)
+                  (note "operandi: skipping relative local-projects link: ~A~%" link)
+                  (let ((d (%physical (dirname target))))
+                    (cond ((null d) nil)
+                          ((unsafe-path-p d)
+                           (note "operandi: refusing local-projects path with quote/backslash: ~A~%" d))
+                          ((gethash d seen) nil)
+                          (t (setf (gethash d seen) t)
+                             (setf rules
+                                   (concatenate
+                                    'string rules
+                                    (format nil "  (allow-ancestor-metadata \"~A\")~%" d)
+                                    (format nil "  (allow file-read* (subpath \"~A\"))~%" d))))))))))))
+    rules))
+
+(defun token-char-p (c)
+  (or (char<= #\A c #\Z) (char= #\_ c)))
+
+(defun leftover-tokens (profile)
+  "The __UPPER__ tokens still present in PROFILE, as a list of strings. A token
+is `__' + one or more [A-Z_] + `__'; a lone `__' or a __lowercase__ word is
+ignored, so a stray underscore can't trip the check."
+  (let ((out '()) (n (length profile)) (i 0))
+    (loop while (and (< i n) (<= (+ i 4) n)) do
+      (if (and (char= #\_ (char profile i)) (char= #\_ (char profile (1+ i))))
+          (let ((end (search "__" profile :start2 (+ i 2))))
+            (if (and end (> end (+ i 2))
+                     (loop for k from (+ i 2) below end
+                           always (token-char-p (char profile k))))
+                (progn (pushnew (subseq profile i (+ end 2)) out :test #'string=)
+                       (setf i (+ end 2)))
+                (incf i)))
+          (incf i)))
+    (nreverse out)))
+
+(defun slurp (path)
+  (with-open-file (in path)
+    (let ((text (make-string (file-length in))))
+      (subseq text 0 (read-sequence text in)))))
+
+;;; ---------------------------------------------------------------------------
+;;; main
+
+(defun self-directory ()
+  "The directory holding this script, even when invoked through a symlink on
+PATH. `sbcl --script` puts the script in cl:*load-truename* (argv[0] is sbcl)."
+  (let* ((p (or cl:*load-truename*
+                (die 1 "operandi: cannot find my own path; run me as a script~%"))))
+    (or (%physical (dirname (namestring p))) (dirname (namestring p)))))
+
+(defun spawn-exec (path args)
+  "execve(PATH, ARGS) with our environment, so the sandboxed process *is* this
+process — no wrapper holding the tty or the exit status. Never returns."
+  (let* ((n (length args))
+         (strings (mapcar (lambda (s) (sb-alien:make-alien-string s)) args))
+         (vec (sb-alien:make-alien sb-alien:unsigned-long (1+ n))))
+    (loop for s in strings for i from 0
+          do (setf (sb-alien:deref vec i) (sb-sys:sap-int (sb-alien:alien-sap s))))
+    (setf (sb-alien:deref vec n) 0)
+    (%execve path (sb-sys:sap-int (sb-alien:alien-sap vec)) *environ*)
+    (die 1 "operandi: cannot exec ~A: ~A~%" path (sb-int:strerror *errno*))))
+
+(defun run (&optional (argv (cdr sb-ext:*posix-argv*)))
+  (let* ((self (self-directory))
+         (root (physical (dirname self) "operandi's own directory (the repo)"))
+         (operandi (format nil "~A/bin/operandi" root))
+         (payload (or (let ((v (sb-posix:getenv "OPERANDI_SANDBOX_TARGET")))
+                        (and v (plusp (length v)) v))
+                      operandi))
+         (template (format nil "~A/bin/sandbox.sb" root))
+         (home (physical (sb-posix:getenv "HOME") "$HOME"))
+         (repo root)
+         (tmp (getconf-dir "DARWIN_USER_TEMP_DIR"))
+         (cache (getconf-dir "DARWIN_USER_CACHE_DIR"))
+         (cwd (physical (sb-posix:getcwd) "the current directory")))
+
+    ;; Substitution lands inside a quoted SBPL string, so refuse paths that
+    ;; would break out of it (a quote or backslash in a directory name).
+    (dolist (p (list home repo tmp cache))
+      (when (unsafe-path-p p)
+        (die 1 "operandi: refusing path with quote/backslash: ~A~%" p)))
+
+    ;; Refuse to open up $HOME, or the root: either would expose the whole
+    ;; filesystem as writable and defeat the sandbox. Run from operandi's own
+    ;; tree instead. (Anything *inside* $HOME is fine — that's the normal case.)
+    (when (or (string= cwd "/") (string= cwd home))
+      (note "operandi: refusing to expose ~A to the sandbox; running from ~A instead~%" cwd repo)
+      (setf cwd repo)
+      (sb-posix:chdir cwd))
+
+    (load-customization (format nil "~A/.operandi/sandbox.lisp" home))
+    (load-customization (format nil "~A/.operandi/sandbox.lisp" cwd))
+
+    (let* ((extra (with-output-to-string (s)
+                    (dolist (r (nreverse *extra*)) (write-string r s) (terpri s))))
+           (local (config-dir-rules (format nil "~A/quicklisp/local-projects" home)))
+           (profile (slurp template)))
+      (dolist (pair (list (cons "__HOME__" home) (cons "__REPO__" repo)
+                          (cons "__TMP__" tmp) (cons "__CACHE__" cache)
+                          (cons "__EXTRA__" extra)
+                          (cons "__LOCAL_PROJECTS__" local)))
+        (setf profile (replace-all profile (car pair) (cdr pair))))
+
+      ;; A token that survives substitution would reach sandbox-exec as literal
+      ;; text and silently deny (or grant) the wrong thing — fail loudly instead.
+      (let ((left (leftover-tokens profile)))
+        (when left
+          (die 1 "operandi: unsubstituted ~A token(s): ~{~A~^ ~}~%" template left)))
+
+      (cond ((env-set-p "OPERANDI_SANDBOX_DRYRUN_PROFILE")
+             (write-string profile *standard-output*)
+             (finish-output *standard-output*)   ; sb-ext:exit does not flush
+             (sb-ext:exit :code 0))
+            ((env-set-p "OPERANDI_SANDBOX_DRYRUN")
+             (write-string local *standard-output*)
+             (finish-output *standard-output*)
+             (sb-ext:exit :code 0)))
+
+      ;; Rebuild the core if sources changed — outside the sandbox, which
+      ;; cannot see ~/quicklisp or the fasl cache.
+      (let ((code (sb-ext:process-exit-code
+                   (sb-ext:run-program "/bin/sh"
+                                       (list "-c" "OPERANDI_BUILD_ONLY=1 exec \"$0\"" operandi)
+                                       :search nil :output *standard-output*
+                                       :error *error-output*))))
+        (unless (zerop code) (sb-ext:exit :code code)))
+
+      (spawn-exec "/usr/bin/sandbox-exec"
+                  (append (list "/usr/bin/sandbox-exec"
+                                "-D" (format nil "CWD=~A" cwd)
+                                "-p" profile payload)
+                          argv)))))
+
+(handler-case (run)
+  (error (e)
+    (note "operandi: ~A: ~A~%" (type-of e) e)
+    (sb-ext:exit :code 1)))

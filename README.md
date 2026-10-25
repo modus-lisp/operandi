@@ -328,6 +328,9 @@ Things to know:
   falls back to running inside the repo.
 - The profile is a template. The launcher fills in the home, repo, temp and
   cache paths on every run, so nothing is hardcoded to one user.
+- The launcher is itself Lisp (`sbcl --script`), and it re-checks the rendered
+  profile for any `__TOKEN__` left unsubstituted, so a template typo fails
+  loudly instead of reaching `sandbox-exec` as literal text.
 - The core is rebuilt **before** the sandbox starts, since the sandbox can't
   see `~/quicklisp` or write the fasl cache.
 - A profile change takes effect only on the next launch. A session already
@@ -336,6 +339,48 @@ Things to know:
   an already-sandboxed session. Test it from a normal shell.
 - Paths are matched after symlink resolution (`/etc` is `/private/etc`), so
   rules written against the symlink names won't match.
+- The ACP shim (`bin/operandi-acp-sandbox-macos`) is still bash: it only
+  resolves its own path and re-execs the launcher, so there is nothing in it
+  worth porting.
+
+### Customizing the sandbox
+
+The launcher is a Lisp script precisely so you can extend the profile without
+editing `bin/sandbox.sb`. Two files are read on every launch and their rules
+appended at the end of the profile, where later rules win:
+
+- `~/.operandi/sandbox.lisp` — your rules, in every project
+- `<project>/.operandi/sandbox.lisp` — that project's rules
+
+Both may contain any of:
+
+```lisp
+(allow-read  "~/notes")              ; read a subtree (and its ancestors)
+(allow-write "~/scratch/out")        ; read *and* write a subtree
+(allow-connect "localhost:11434")    ; open a TCP connection
+(allow-bind    "localhost:*")        ; listen on a TCP port
+(deny-read "~/secrets")
+(deny-write "~/secrets")
+(deny-connect "localhost:9931")
+(deny-bind    "localhost:*")
+(raw "(allow mach-lookup (global-name \"com.apple.Foo\"))")
+```
+
+A leading `~` expands to `$HOME`; other paths are used as given. Paths are
+resolved with symlinks followed, and a rule naming a path that doesn't exist is
+dropped with a warning (so a project file can be shared between machines) —
+quote and backslash are rejected outright, since the path lands inside a quoted
+SBPL string.
+
+`raw` is the escape hatch: any SBPL the DSL doesn't cover goes straight into
+the profile.
+
+To see what a launch would produce without launching anything:
+
+```
+OPERANDI_SANDBOX_DRYRUN_PROFILE=1 operandi     # the whole rendered profile
+OPERANDI_SANDBOX_DRYRUN=1 operandi             # just the local-projects rules
+```
 
 ## TUI
 

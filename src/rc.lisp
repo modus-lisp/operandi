@@ -8,6 +8,11 @@
 ;;;; successful turn, MIRROR-TURN sends one chat message:  "> prompt" then a blank
 ;;;; line then the answer.
 ;;;;
+;;;; Inbound: a chat message drives a turn when it mentions this run's token
+;;;; (@op-xxxxxx) or our npub — EXCEPT in a DIRECT chat (just us and one other
+;;;; member, which is what CREATE-CHAT-WITH makes), where every message from the
+;;;; other member is a request and no mention is needed.  See %INBOUND-TEXT.
+;;;;
 ;;;; cl-marmot is loaded at run time (ql:quickload), not at build time, so operandi keeps
 ;;;; no dependency on it.  All marmot access goes through FIND-SYMBOL so this file
 ;;;; compiles whether or not cl-marmot is present.
@@ -15,7 +20,7 @@
 (defpackage #:operandi.rc
   (:use #:cl)
   (:export #:rc #:enable #:create-chat-with #:disable #:active-p #:status-chat #:mirror-turn
-           #:set-inbound #:*mention*))
+           #:set-inbound #:direct-p #:*mention*))
 
 (in-package #:operandi.rc)
 
@@ -47,12 +52,13 @@
 
 (defvar *on-inbound* nil
   "Called with the message text (the part after the @operandi mention is NOT stripped)
-when a chat member sends a message that mentions @operandi.  The TUI sets this to
-queue a turn.  NIL means inbound messages are ignored.")
+when a chat member sends a message that is a request (see %INBOUND-TEXT).  The TUI
+sets this to queue a turn.  NIL means inbound messages are ignored.")
 
 (defvar *mention* nil
   "The token a chat message must contain to drive a turn: \"@\" plus this run's
-ephemeral id (see %NEW-MENTION).  NIL when not mirroring.")
+ephemeral id (see %NEW-MENTION).  NIL when not mirroring.  Not needed in a direct
+chat (see *DIRECT-P*), where every message from the other member is a request.")
 
 (defun %new-mention ()
   "A fresh per-run mention token, e.g. \"@op-7k3q9z\".  Random, so each run's id is unique."
@@ -64,13 +70,32 @@ a typed @token into an @npub1… mention, so both forms count)."
   (or (and *mention* (search *mention* content :test #'char-equal))
       (and npub (search npub content :test #'char-equal))))
 
+(defvar *direct-p* nil
+  "True when *CHAT* is a direct chat: exactly two members, us and one other.  There
+the other member's messages are requests by construction, so no mention is needed.")
+
+(defun direct-p () (and *direct-p* t))
+
+(defun %direct-chat-p (chat)
+  "True when CHAT has exactly two members, one of them us — a one-to-one chat."
+  (handler-case
+      (let ((members (funcall (%marmot "CHAT-MEMBERS") chat))
+            (us (%call "PUBKEY" *client*)))
+        (and (= 2 (length members))
+             (member us members :test #'string-equal)
+             t))
+    (error () nil)))
+
 (defun %inbound-text (content &optional npub)
-  "The message CONTENT if it is an inbound request: it mentions us (see %MENTIONS-US-P)
-and is not one of our own '> prompt' mirrors.  NIL otherwise."
+  "The message CONTENT if it is an inbound request, NIL otherwise.  In a direct chat
+(see *DIRECT-P*) any message from the other member is a request; otherwise CONTENT
+must mention us (see %MENTIONS-US-P).  Our own '> prompt' mirrors are never requests,
+and neither is a blank message."
   (when (and (stringp content) *mention*
              (not (uiop:string-prefix-p ">" (string-left-trim '(#\Space #\Tab #\Newline) content)))
-             (%mentions-us-p content npub))
-    (string-trim '(#\Space #\Tab #\Newline) content)))
+             (or *direct-p* (%mentions-us-p content npub)))
+    (let ((text (string-trim '(#\Space #\Tab #\Newline) content)))
+      (and (plusp (length text)) text))))
 
 (defvar *pending-inbound* '()
   "Inbound requests that arrived before a consumer was attached (cl-marmot's sync
@@ -95,17 +120,23 @@ consumes a message once, so it must not be dropped).  Oldest first.")
     fn))
 
 (defun %on-event (event)
-  "cl-marmot handler: forward inbound chat messages that mention *MENTION* on.
-Our own messages are skipped (they are the mirrors)."
-  (let ((msg (funcall (%marmot "EVENT-MESSAGE") event)))
-    (when (and (eq (funcall (%marmot "EVENT-TYPE") event) :message)
-               msg
-               (not (funcall (%marmot "MESSAGE-OWN-P") msg)))
-      (let ((text (%inbound-text (funcall (%marmot "MESSAGE-CONTENT") msg)
-                                 (ignore-errors (%call "NPUB" *client*)))))
-        (when text
-          (%react-eyes msg)
-          (%deliver-inbound text))))))
+  "cl-marmot handler: forward inbound chat messages that are requests (see
+%INBOUND-TEXT) on.  Our own messages are skipped (they are the mirrors)."
+  (let ((type (funcall (%marmot "EVENT-TYPE") event)))
+    ;; A chat that gains or loses a member is no longer the chat we classified:
+    ;; re-decide whether it is still just the two of us.
+    (when (member type '(:member-added :member-removed :joined :removed))
+      (ignore-errors
+       (setf *direct-p* (%direct-chat-p (funcall (%marmot "EVENT-CHAT") event)))))
+    (let ((msg (funcall (%marmot "EVENT-MESSAGE") event)))
+      (when (and (eq type :message)
+                 msg
+                 (not (funcall (%marmot "MESSAGE-OWN-P") msg)))
+        (let ((text (%inbound-text (funcall (%marmot "MESSAGE-CONTENT") msg)
+                                   (ignore-errors (%call "NPUB" *client*)))))
+          (when text
+            (%react-eyes msg)
+            (%deliver-inbound text)))))))
 
 (defun %react-eyes (msg)
   "Acknowledge an accepted request with a :eyes: reaction (NIP-25 kind 7, content \"👀\")
@@ -139,7 +170,8 @@ on MSG, so the sender sees it was picked up.  Best-effort: a failure is ignored.
             (format *error-output* "~&rc: ~D Welcome~:P still undelivered; kept identity in ~A~%"
                     owed *ephemeral-home*)
             (ignore-errors (uiop:delete-directory-tree (pathname *ephemeral-home*) :validate t)))))
-    (setf *client* nil *chat* nil *chat-name* nil *ephemeral-home* nil *mention* nil)
+    (setf *client* nil *chat* nil *chat-name* nil *ephemeral-home* nil *mention* nil
+          *direct-p* nil)
     was))
 
 (defun enable (chat)
@@ -170,7 +202,8 @@ Returns the chat's display name."
             *chat* found
             *chat-name* (let ((n (%call "CHAT-NAME" found)))
                           (if (plusp (length n)) n (%call "CHAT-ID" found)))
-            *mention* (%new-mention))
+            *mention* (%new-mention)
+            *direct-p* (%direct-chat-p found))
       (%start-sync))
     *chat-name*))
 
@@ -203,7 +236,8 @@ chat's display name.  On failure the temp home is removed and an error is signal
                   *ephemeral-home* home
                   *chat* (%call "CHAT-ID" chat)
                   *chat-name* (if (plusp (length name)) name invitee)
-                  *mention* (%new-mention))
+                  *mention* (%new-mention)
+                  *direct-p* (%direct-chat-p chat))
             (%start-sync)
             *chat-name*))
       (error (e)

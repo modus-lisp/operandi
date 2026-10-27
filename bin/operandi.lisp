@@ -507,7 +507,8 @@
    (list "session" "Session" :green
          '(("--rc TARGET" "mirror each turn to a Marmot chat"
             "An npub, nprofile or NIP-05 starts a new chat; a chat name or group id"
-            "joins an existing one. Also /rc in the TUI.")
+            "joins an existing one. In a one-to-one chat every message drives a turn;"
+            "in a group, write the @op- token it prints. Also /rc in the TUI.")
            ("--tui" "an older name for --repl"
             "In the TUI, /help lists the /commands: /model, /effort, /workers,"
             "/sessions, /resume, /cost, /search, /paste, /swarm, /rc, /system,"
@@ -1015,9 +1016,12 @@
                     (handler-case
                         (let ((name (funcall (find-symbol "RC" "OPERANDI.RC") (second acc))))
                           (format t "~&→ rc: mirroring turns to ~A~%" name)
-                          ;; Same as /rc in the TUI: the invitee needs this token to drive a turn.
-                          (format t "~&  tell them to write ~A in the chat to drive a turn~%"
-                                  (symbol-value (find-symbol "*MENTION*" "OPERANDI.RC"))))
+                          ;; Same as /rc in the TUI: in a direct chat no token is needed;
+                          ;; otherwise the invitee needs this one to drive a turn.
+                          (if (funcall (find-symbol "DIRECT-P" "OPERANDI.RC"))
+                              (format t "~&  it is just the two of you there — every message you send drives a turn~%")
+                              (format t "~&  tell them to write ~A in the chat to drive a turn~%"
+                                      (symbol-value (find-symbol "*MENTION*" "OPERANDI.RC")))))
                       (error (e)
                         (format *error-output* "operandi: --rc: ~A~%" e)
                         (sb-ext:exit :code 2)))

@@ -876,9 +876,11 @@ to start a new chat with that person, or a chat name / group id for an existing 
      (handler-case
          (let ((name (operandi.rc:rc arg)))
            (format t "~&→ rc: mirroring turns to ~A~%" (paint name :cyan))
-           (when operandi.rc:*mention*
-             (format t "~&  tell them to write ~A in the chat to drive a turn~%"
-                     (paint operandi.rc:*mention* :cyan))))
+           (if (operandi.rc:direct-p)
+               (format t "~&  it is just the two of you there — every message you send drives a turn~%")
+               (when operandi.rc:*mention*
+                 (format t "~&  tell them to write ~A in the chat to drive a turn~%"
+                         (paint operandi.rc:*mention* :cyan)))))
        (error (e)
          (format t "~&~A~%" (paint (format nil "rc: ~A" e) :yellow)))))))
 
@@ -1222,8 +1224,9 @@ to start a new chat with that person, or a chat name / group id for an existing 
 ;;; --- submit + commands ---
 
 (defun rc-inbound (text)
-  "Called from the cl-marmot sync thread with a chat message that mentions this run's
-mention token (operandi.rc:*mention*, e.g. @op-7k3q9z).
+  "Called from the cl-marmot sync thread with a chat message that is a request: one
+that mentions this run's token (operandi.rc:*mention*, e.g. @op-7k3q9z), or — in a
+direct chat — any message from the other member.
 Queues it as the next turn (behind any in-flight turn), like typed input.  When idle,
 restores the agent cursor first (as UI-SUBMIT does) so the echo is not written onto the
 input row and erased by the next repaint.  The echo goes through EMIT, which takes
@@ -1376,7 +1379,7 @@ input row and erased by the next repaint.  The echo goes through EMIT, which tak
                            (format nil "no prior session to resume; starting fresh~%"))
                        (if resumed :br-cyan :yellow))))
         (setf *worker* (bt:make-thread (lambda () (worker-loop sess)) :name "operandi-turn"))
-        ;; /rc inbound: a chat message mentioning @operandi queues a turn, same as typed input.
+        ;; /rc inbound: a chat message that is a request queues a turn, same as typed input.
         (operandi.rc:set-inbound #'rc-inbound)
         (bt:with-lock-held (*ui-lock*) (go-idle))
         (loop
@@ -1507,7 +1510,7 @@ input row and erased by the next repaint.  The echo goes through EMIT, which tak
       ;; but corrupts output under some terminal/multiplexer combos (e.g. tmux
       ;; scroll-region + DECSC interactions), so it's OPT-IN via OPERANDI_FANCY_TUI=1.
       ;; An active --rc / /rc mirror needs the concurrent UI: only it attaches the
-      ;; inbound consumer (set-inbound), so an invitee's @op- message can queue a turn.
+      ;; inbound consumer (set-inbound), so a chat message can queue a turn.
       ((and (stdin-tty-p) (stdout-tty-p)
             (or (uiop:getenv "OPERANDI_FANCY_TUI") (operandi.rc:active-p))
             (raw-mode-available-p))

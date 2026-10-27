@@ -31,6 +31,7 @@
            #:image-part #:text-part #:user-content #:content-text #:content-images
            #:image-file-p
            #:*llama-url* #:llama-chat-url #:llama-ask-model #:llama-resolve-model
+           #:llama-context-length
            #:set-backend-openrouter! #:set-backend-llama! #:set-backend-routstr!
            #:set-backend-ppq! #:set-backend-tinfoil! #:set-backend-maple!
            #:with-llama #:with-openrouter #:with-routstr #:with-ppq #:with-maple
@@ -1066,6 +1067,29 @@ call with :want-stream nil"))
             (llama-pick-model data)
             (values nil "the server's /v1/models had no model list")))
     (error (e) (values nil (format nil "could not ask the server (~A)" (type-of e))))))
+
+(defun llama-context-length (chat-url &key (timeout 5))
+  "Ask the llama.cpp server at CHAT-URL how many tokens of context the model
+   it serves supports.  Returns the largest context_length reported among the
+   models it serves (preferring loaded ones, mirroring LLAMA-PICK-MODEL), or
+   NIL when the server does not say.  Never signals: a server without
+   /v1/models, or one that omits context_length, is not an error — it just
+   leaves the caller with its fallback."
+  (handler-case
+      (let* ((body (http:get (llama-models-url chat-url) :read-timeout timeout))
+             (parsed (json:parse body))
+             (data (and (hash-table-p parsed) (gethash "data" parsed))))
+        (when (or (vectorp data) (listp data))
+          (let* ((cands (coerce data 'list))
+                 (loaded (remove-if-not #'llama-model-loaded-p cands))
+                 (pool (if (= (length loaded) 1) loaded cands))
+                 (lens (remove-if-not (lambda (m) (let ((n (gethash "context_length" m)))
+                                                    (and (numberp n) (plusp n))))
+                                      pool)))
+            (when lens
+              (reduce (lambda (a b) (max a b)) lens
+                      :key (lambda (m) (gethash "context_length" m)))))))
+    (error () nil)))
 
 (defun llama-resolve-model (chat-url &key (timeout 5))
   "The model to send to the llama.cpp server at CHAT-URL, asked of the server

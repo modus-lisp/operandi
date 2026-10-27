@@ -703,11 +703,20 @@ completed). Do not shorten for brevity — nothing may be lost.")
 
 (defun apply-backend-defaults ()
   "Re-derive backend-dependent defaults after the model/backend changes:
-   the 24k compaction budget is sized for a local llama; a frontier model
-   through OpenRouter gets 96k. An explicit OPERANDI_CONTEXT_BUDGET wins."
+   the 24k compaction budget is sized for a small local llama; a frontier
+   model through OpenRouter gets 96k.  For a local llama we ask the server
+   what context it actually serves and budget half of it (the docstring's
+   'roughly half the model's context' rule), so a 128k model like ds4f gets
+   a 64k budget instead of thrashing at 24k.  An explicit
+   OPERANDI_CONTEXT_BUDGET wins."
   (unless (uiop:getenv "OPERANDI_CONTEXT_BUDGET")
     (setf *context-token-budget*
-          (if (llm:cloud-backend-p) 96000 24000))))
+          (if (llm:cloud-backend-p)
+              96000
+              (let ((ctx (llm:llama-context-length llm:*llama-url*)))
+                (if (and ctx (plusp ctx))
+                    (max 24000 (floor ctx 2))
+                    24000))))))
 
 (defvar *last-offload-path* nil
   "Set by OFFLOAD-MIDDLE for the *ON-COMPACT* hook; NIL after a tier-1-only pass.")

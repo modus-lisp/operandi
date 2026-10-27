@@ -848,7 +848,7 @@
          (progn (llm:claim-check! :llama nil)
                 (llm:set-backend-llama!)
                 (eng:apply-backend-defaults)
-                (format t "~&→ local llama.cpp~%"))
+                (format t "~&→ ~A~%" (paint (model-label) :cyan)))
        (error (e) (format t "~&~A~%" (paint (princ-to-string e) :yellow)))))
     (t (format t "~&unknown model spec ~S — give a 'vendor/name' id or 'llama'.~%" arg))))
 

@@ -171,7 +171,26 @@
     (and (handler-case (progn (llm::llama-chat-url "9931") nil)
            (error () t))
          (handler-case (progn (llm::llama-chat-url "localhost:") nil)
-           (error () t)))))
+           (error () t))))
+
+  (check "the port is read out of the chat URL, IPv6 brackets and all"
+    (and (string= "9931" (llm::%url-port "http://localhost:9931/v1/chat/completions"))
+         (string= "8080" (llm::%url-port "http://127.0.0.1:8080/v1/chat/completions"))
+         (string= "9931" (llm::%url-port "http://[::1]:9931/v1/chat/completions"))
+         (string= "443" (llm::%url-port "https://api.example.com:443/v1/chat/completions"))
+         (null (llm::%url-port "http://localhost/v1/chat/completions"))))
+
+  (check "the local label names the endpoint and the model that answered"
+    (flet ((label (url model)
+             (let ((llm:*llm-url* url) (llm:*llm-model* model))
+               (llm:local-model-label))))
+      (and (string= "local:9931:deepseek-v4-flash"
+                    (label "http://localhost:9931/v1/chat/completions" "deepseek-v4-flash"))
+           ;; Either half may be missing; neither is invented.
+           (string= "local:9931" (label "http://localhost:9931/v1/chat/completions" nil))
+           (string= "local:deepseek-v4-flash"
+                    (label "http://localhost/v1/chat/completions" "deepseek-v4-flash"))
+           (string= "local" (label "http://localhost/v1/chat/completions" nil))))))
 
 (defun run ()
   (setf *pass* 0 *fail* 0)

@@ -208,7 +208,10 @@ Returns the chat's display name."
     *chat-name*))
 
 (defparameter *ephemeral-relays*
-  '("wss://relay.damus.io" "wss://nos.lol" "wss://relay.primal.net"))
+  '("wss://relay.damus.io" "wss://nos.lol" "wss://relay.primal.net"
+    ;; White Noise only looks for a peer's relay lists on its own seed relays,
+    ;; so an RC identity that publishes nowhere else is invisible to it.
+    "wss://relay.eu.whitenoise.chat" "wss://relay.us.whitenoise.chat"))
 
 (defun %fresh-home ()
   (let ((dir (format nil "~A/operandi-rc-~36R-~36R/"

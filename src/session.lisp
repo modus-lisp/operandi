@@ -42,7 +42,7 @@
     (:routstr (or llm:*llm-model* "routstr"))
     (:ppq (or llm:*llm-model* "ppq"))
     (:maple (or llm:*llm-model* "maple"))
-    (t "llama.cpp")))
+    (t (llm:local-model-label))))
 
 (defun session-id ()
   (multiple-value-bind (s mi h d mo y) (decode-universal-time (get-universal-time))

@@ -31,6 +31,7 @@
            #:image-part #:text-part #:user-content #:content-text #:content-images
            #:image-file-p
            #:*llama-url* #:llama-chat-url #:llama-ask-model #:llama-resolve-model
+           #:local-model-label
            #:llama-context-length
            #:set-backend-openrouter! #:set-backend-llama! #:set-backend-routstr!
            #:set-backend-ppq! #:set-backend-tinfoil! #:set-backend-maple!
@@ -992,6 +993,27 @@ call with :want-stream nil"))
 ;;; ROUTER mode (several models behind one port, loaded on demand) 400s a
 ;;; request that omits one.  So when no model was named we ask the server:
 ;;; GET <base>/v1/models, and pick from what comes back.
+
+(defun %url-port (url)
+  "The port in URL, or NIL when it has none.  Handles a bracketed IPv6 host."
+  (let* ((i (search "://" url))
+         (rest (if i (subseq url (+ i 3)) url))
+         (slash (position #\/ rest))
+         (authority (if slash (subseq rest 0 slash) rest))
+         (start (if (and (plusp (length authority)) (char= (char authority 0) #\[))
+                    (let ((close (position #\] authority))) (if close (1+ close) 0))
+                    0))
+         (colon (position #\: authority :start start)))
+    (when colon (subseq authority (1+ colon)))))
+
+(defun local-model-label ()
+  "A label for the local backend that names the endpoint AND the model actually
+   being served: \"local:9931:deepseek-v4-flash\".  The port comes from
+   *LLM-URL* and the model from *LLM-MODEL* — which SET-BACKEND-LLAMA! resolves
+   by asking the server — so the label says which engine answered, not merely
+   that the answer was local.  Either part is omitted when unknown, so a
+   single-model server that named no model still reads \"local:9931\"."
+  (format nil "local~@[:~A~]~@[:~A~]" (%url-port *llm-url*) *llm-model*))
 
 (defun llama-models-url (chat-url)
   "The /v1/models URL for a chat-completions URL — the sibling endpoint, so a

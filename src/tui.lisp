@@ -443,7 +443,7 @@
     (:routstr (or llm:*llm-model* "routstr"))
     (:ppq (or llm:*llm-model* "ppq"))
     (:maple (or llm:*llm-model* "maple"))
-    (t "llama.cpp")))
+    (t (llm:local-model-label))))
 
 (defparameter *cut-off-note*
   "[this turn was cut off — the session ended before it finished. The tool calls above did run and their effects stand; anything after them did not happen.]")

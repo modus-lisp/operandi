@@ -30,8 +30,10 @@ SBCL="${OPERANDI_SBCL:-sbcl}"
 
 needs_build() {
   [ ! -f "$CORE" ] && return 0
-  # any source or the .asd newer than the core → rebuild
+  # any source or the .asd newer than the core → rebuild; that includes
+  # illatio's, which the core also holds (--illatio), when it sits beside us
   [ -n "$(find "$ROOT/src" "$ROOT/operandi.asd" "$ROOT/bin/operandi.lisp" \
+            "$ROOT/../illatio/src" "$ROOT/../illatio/illatio.asd" \
             -newer "$CORE" 2>/dev/null | head -1)" ]
 }
 

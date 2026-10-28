@@ -501,7 +501,7 @@
             "An unknown name is an error."
             "Maple: everyone it can send to (maple-routing,maple-inference,"
             "tinfoil-untrusted,continuum), unless a `routed' statement from your web of"
-            "trust (OPERANDI_WOT_ROOTS) says where the live image sends your model.")))
+            "trust (OPERANDI_WOT_ROOTS) says where the live image sends your model."))
          t)
 
    (list "session" "Session" :green
@@ -539,7 +539,7 @@
             "Request: {\"question\": ..., \"hypotheses\": [...]?, \"context\": ...?,"
             "\"synthesize\": bool?, \"worker_model\": ...?}. For harnesses (mcp/server.js).")
            ("--help, -h [TOPIC]" "this text, or one topic of it"
-            "Topics: modes, backends, session, agent, env, files, diagnostics.")
+            "Topics: modes, backends, session, agent, env, files, diagnostics."))
          t)
 
    (list "env" "Environment" :blue

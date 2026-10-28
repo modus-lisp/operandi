@@ -33,6 +33,8 @@
            #:*llama-url* #:llama-chat-url #:llama-ask-model #:llama-resolve-model
            #:local-model-label
            #:llama-context-length
+           #:set-backend-illatio! #:in-image-p #:in-image-chunks #:illatio-context-length
+           #:default-illatio-model
            #:set-backend-openrouter! #:set-backend-llama! #:set-backend-routstr!
            #:set-backend-ppq! #:set-backend-tinfoil! #:set-backend-maple!
            #:with-llama #:with-openrouter #:with-routstr #:with-ppq #:with-maple
@@ -154,7 +156,9 @@
    Maple's OpenSecret enclave and encrypts to it itself (OPERANDI.MAPLE).  In
    proxy mode it speaks plain HTTP to a local maple-proxy, which does that and
    which operandi does not verify; proxy mode is never confidential and refuses
-   a non-loopback plaintext URL.")
+   a non-loopback plaintext URL.
+   :ILLATIO = the model runs in this image (illatio, pure Lisp).  *llm-url* is
+   illatio:PATH; requests are answered by a function call, not a socket.")
 
 (defun cloud-backend-p (&optional (backend *llm-backend*))
   "True for hosted backends that speak OpenRouter's request dialect
@@ -512,9 +516,11 @@
    attested enclave) and the retry policy is the sealer's business — it has
    its own, and it must not be retried here, because a refusal from the
    sealer is a trust decision, not a transient network fault."
-  (if *sealed-post*
-      (funcall *sealed-post* url body headers)
-      (progn
+  (cond
+    ((in-image-p url) (in-image-post url body))
+    (*sealed-post*
+      (funcall *sealed-post* url body headers))
+    (t
         ;; Belt and braces: *CONFIDENTIAL* is a promise that the body is
         ;; sealed, so a plaintext POST while it is set is a bug in the caller,
         ;; not a request to send.  Fail here rather than leak the prompt.
@@ -547,15 +553,21 @@
    WANT-STREAM asks for the raw response stream (SSE).  A sealer cannot
    stream — the whole body is one encrypted frame — so asking for a stream
    under a sealer is a programming error, not something to paper over."
-  (if *sealed-post*
-      (progn
+  (cond
+    ((in-image-p url)
+     ;; In-image streaming is IN-IMAGE-CHUNKS: chunk objects, no SSE text.
+     (when want-stream
+       (error "post-chat: an in-image model streams through in-image-chunks, not a stream"))
+     (in-image-post url body))
+    (*sealed-post*
         (when want-stream
           (error "post-chat: the sealed (confidential :ppq) transport cannot stream; \
 call with :want-stream nil"))
         (funcall *sealed-post* url body headers))
+    (t
       (http:post url :content body :headers headers
                      :read-timeout *llm-read-timeout*
-                     :want-stream want-stream)))
+                     :want-stream want-stream))))
 
 (defun llm-chat (prompt &key system
                              (max-tokens *llm-default-max-tokens*)
@@ -1123,6 +1135,66 @@ call with :want-stream nil"))
     (if model
         (values model reason)
         (values nil (format nil "~A; sending no model field" reason)))))
+
+;;; ---- illatio: the model in this image -------------------------------------
+;;; --illatio runs a GGUF model inside operandi's own Lisp image.  There is no
+;;; server and no socket: *LLM-URL* is illatio:PATH, and the two transport
+;;; doors (%LLM-POST, POST-CHAT) answer that scheme by calling illatio's
+;;; CHAT-COMPLETION on the request they would have sent.  Keying it on the URL
+;;; rather than on a special of its own means every other SET-BACKEND-*!,
+;;; which assigns an http URL, switches it off with nothing to remember.
+;;; Engines are kept per path, so /model away and back costs no reload.
+
+(defvar *illatio-engines* (make-hash-table :test 'equal)
+  "Loaded in-image models: GGUF path -> illatio engine.")
+
+(defun in-image-p (&optional (url *llm-url*))
+  "True when URL names a model in this image (illatio:PATH)."
+  (and (stringp url) (uiop:string-prefix-p "illatio:" url)))
+
+(defun %illatio-engine (url)
+  (or (gethash (subseq url (length "illatio:")) *illatio-engines*)
+      (error "no in-image model is loaded for ~A" url)))
+
+(defun in-image-post (url body)
+  "The response body CHAT-COMPLETION gives for request BODY (a JSON string)."
+  (json:stringify (illatio:chat-completion (%illatio-engine url) (json:parse body))))
+
+(defun in-image-chunks (body on-chunk &optional (url *llm-url*))
+  "Stream request BODY (a hash table) from the in-image model: ON-CHUNK gets
+   each chat.completion.chunk object, exactly what an SSE event would parse to."
+  (illatio:chat-completion-chunks (%illatio-engine url)
+                                   (json:parse (json:stringify body))
+                                   on-chunk))
+
+(defun default-illatio-model ()
+  "$ILLATIO_MODEL, else illatio's own default, ~/models/qwen2.5-0.5b-instruct-q8_0.gguf."
+  (or (uiop:getenv "ILLATIO_MODEL")
+      (namestring (merge-pathnames "models/qwen2.5-0.5b-instruct-q8_0.gguf"
+                                   (user-homedir-pathname)))))
+
+(defun illatio-context-length (&optional (url *llm-url*))
+  (and (in-image-p url)
+       (illatio:context-n-ctx (illatio:engine-context (%illatio-engine url)))))
+
+(defun set-backend-illatio! (&key (path (default-illatio-model)) (n-ctx 32768))
+  "Load the GGUF model at PATH into this image (once per path) and send every
+   request to it.  N-CTX is the context it serves, capped at what the model
+   was trained for."
+  (let* ((path (namestring (or (probe-file path)
+                               (error "no model at ~A (set ILLATIO_MODEL, or pass --illatio PATH)" path))))
+         (engine (or (gethash path *illatio-engines*)
+                     (let ((m (illatio:load-model path)))
+                       (setf (gethash path *illatio-engines*)
+                             (illatio:make-engine
+                              m :n-ctx (min n-ctx (illatio:model-context-length m))))))))
+    (setf *llm-backend*      :illatio
+          *llm-url*          (concatenate 'string "illatio:" path)
+          *llm-auth-token*   nil
+          *llm-model*        (illatio:model-name (illatio:engine-model engine))
+          *llm-read-timeout* 600
+          *sealed-post*      nil))
+  t)
 
 (defun set-backend-llama! (&key (url *llama-url*) model (ask t))
   "Switch the LLM client back to the local llama.cpp server.  URL defaults to

@@ -42,6 +42,7 @@
     (:routstr (or llm:*llm-model* "routstr"))
     (:ppq (or llm:*llm-model* "ppq"))
     (:maple (or llm:*llm-model* "maple"))
+    (:illatio (format nil "illatio:~A" (or llm:*llm-model* "?")))
     (t (llm:local-model-label))))
 
 (defun session-id ()

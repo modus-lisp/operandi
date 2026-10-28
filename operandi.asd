@@ -18,6 +18,7 @@
   :license "MIT"
   :version "0.1.0"
   :depends-on ("json-simple"
+               "illatio/openai" ; the model in this image, for --illatio (pure CL, sibling repo)
                "seal/http"      ; pure-CL HTTP/TLS (on natrium) -- replaced dexador, which was
                                 ; the only way FFI entered this stack (cl+ssl, iolib, static-vectors)
                "cl-sev-snp"     ; AMD SEV-SNP / AWS Nitro attestation verification, pure CL --

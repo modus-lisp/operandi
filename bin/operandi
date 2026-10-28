@@ -53,5 +53,6 @@ fi
 # Launch from the core. --no-userinit/--no-sysinit skips the init files (and
 # thus the whole-home ASDF tree scan); operandi is already in the image, so
 # bin/operandi.lisp's load is a no-op and only the CLI dispatch runs.
-exec "$SBCL" --core "$CORE" --noinform --no-userinit --no-sysinit --non-interactive \
+# The heap is sized for --illatio, whose weights live in it (reserved, not used, otherwise).
+exec "$SBCL" --core "$CORE" --dynamic-space-size "${OPERANDI_HEAP_MB:-16384}" --noinform --no-userinit --no-sysinit --non-interactive \
   --load "$ROOT/bin/operandi.lisp" -- "$@"

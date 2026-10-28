@@ -154,6 +154,16 @@
       (format t "~&interrupted.~%")
       (sb-ext:exit :code 130))))
 
+(defun %use-illatio (path)
+  "Switch to the in-image model at PATH, loading it, or exit 2 saying why not."
+  (format *error-output* "~&operandi: loading ~A into this image…~%" (file-namestring path))
+  (handler-case (llm:set-backend-illatio! :path path)
+    (error (e)
+      (format *error-output* "operandi: --illatio: ~A~%" e)
+      (sb-ext:exit :code 2)))
+  (format *error-output* "operandi: illatio — ~A, in this image (context ~D)~%"
+          llm:*llm-model* (llm:illatio-context-length)))
+
 (defun preflight-or-die ()
   "Confirm the configured model/backend can actually serve a request BEFORE
    entering the loop, so a bad model slug / provider-allowlist miss / unreachable
@@ -339,7 +349,8 @@
 
 (defun use-model! (m)
   "MODEL M on the configured backend (llama is always the local server)."
-  (cond ((string-equal m "llama") (llm:set-backend-llama! :ask nil))
+  (cond ((or (string-equal m "llama") (string-equal m "local")) (llm:set-backend-llama! :ask nil))
+        ((string-equal m "illatio") (%use-illatio (llm:default-illatio-model)))
         ((string= (config-backend) "ppq")
          ;; no account yet, but allowed to ask for credit: make one now, so the
          ;; first inference's 402 can be paid instead of failing for want of a key
@@ -443,11 +454,13 @@
          t)
 
    (list "backends" "Backends" :magenta
-         `(("--llama ADDR [-m MODEL]" "the local llama.cpp server (the default)"
+         `(("--local ADDR [-m MODEL]" "a local OpenAI-compatible server (the default)"
+            "llama.cpp, ds4, `illatio --serve' -- anything that speaks"
+            "/v1/chat/completions.  --llama is an older name for it."
             "ADDR is the server's address, not a model: [proto://][host][:port][/path]."
             "A missing scheme means http, a missing host means localhost, a missing"
             "path means /v1/chat/completions, and at least one component is required"
-            "— a bare --llama is an error, not a request for the default."
+            "— a bare --local is an error, not a request for the default."
             ""
             "A port must be COLON-PREFIXED: :9931, not 9931. A bare number is"
             "rejected rather than guessed at, because a forgotten colon is far"
@@ -458,6 +471,11 @@
             "one it already has loaded — naming an unloaded model makes the router"
             "load a multi-gigabyte file you did not ask for."
             ,(format nil "Default: ~A" llm:*llama-url*))
+           ("--illatio [PATH]" "run the model in this image: no server, no socket"
+            "illatio, a pure-Lisp inference engine (sibling repo), loads the GGUF at"
+            "PATH into operandi's own heap and answers each request by function call."
+            "PATH must end in .gguf; without it, $ILLATIO_MODEL, then"
+            "~/models/qwen2.5-0.5b-instruct-q8_0.gguf.  Q8_0 qwen2/llama models.")
            ("--openrouter [MODEL]" "OpenRouter; MODEL is a vendor/name slug"
             "Bare --openrouter uses the configured model. Token in"
             "~/.operandi/openrouter.token (mode 600)."
@@ -557,7 +575,7 @@
          nil)
 
    (list "files" "Files" :white
-         '(("~/.operandi/config.json" "default model: {\"model\": \"vendor/name\"} or \"llama\"")
+         '(("~/.operandi/config.json" "default model: {\"model\": \"vendor/name\"}, \"local\" or \"illatio\"")
            ("~/.operandi/operandi.db" "saved sessions; --resume continues one")
            ("~/.operandi/offload/" "raw conversation displaced by compaction")
            ("~/.operandi/*.token" "one bearer token per backend, mode 600"))
@@ -611,7 +629,8 @@
   (format t "~%~A~%" (%paint "Examples" :bold))
   (dolist (row '(("chat" "operandi")
                  ("one shot" "operandi \"summarize what's in this directory\"")
-                 ("local" "operandi --llama :9931 -m qwen3-32b \"task\"")
+                 ("local" "operandi --local :9931 -m qwen3-32b \"task\"")
+                 ("in-image" "operandi --illatio \"task\"")
                  ("frontier" "operandi --openrouter deepseek/deepseek-v4-flash \"task\"")
                  ("resume" "operandi --resume")
                  ("ask" "operandi --ask \"why does the build fail?\"")
@@ -650,17 +669,18 @@
 ;; Apply the configured default model unless the command line names a backend
 ;; explicitly (--openrouter, with or without a model; a bare --openrouter also
 ;; reads the config, below). Doing both would announce the backend twice.
-(let ((m (and (not (member-if (lambda (a) (member a '("--llama" "--openrouter" "--routstr" "--ppq" "--tinfoil" "--maple") :test #'string=))
+(let ((m (and (not (member-if (lambda (a) (member a '("--local" "--llama" "--illatio" "--openrouter" "--routstr" "--ppq" "--tinfoil" "--maple") :test #'string=))
                                  (uiop:command-line-arguments)))
               (config-default-model))))
   (when m
-    (if (string-equal m "llama")
-        ;; :ASK NIL — the model is resolved once, after parsing, for every path
-        ;; that reaches the local server.  Asking here too would be a second
-        ;; round-trip and would make the report below claim the model was
-        ;; "named with -m" when the server chose it.
-        (llm:set-backend-llama! :ask nil)
-        (llm:set-backend-openrouter! :model m))
+    (cond ((or (string-equal m "llama") (string-equal m "local"))
+           ;; :ASK NIL — the model is resolved once, after parsing, for every path
+           ;; that reaches the local server.  Asking here too would be a second
+           ;; round-trip and would make the report below claim the model was
+           ;; "named with -m" when the server chose it.
+           (llm:set-backend-llama! :ask nil))
+          ((string-equal m "illatio") (%use-illatio (llm:default-illatio-model)))
+          (t (llm:set-backend-openrouter! :model m)))
     (eng:apply-backend-defaults)))
 
 (let* ((raw (remove "--" (uiop:command-line-arguments) :test #'string=))
@@ -705,8 +725,20 @@
        (args (let ((acc raw))
                (loop
                  (cond
-                   ((and acc (string= (first acc) "--llama"))
-                    ;; The local llama.cpp server — the default backend, so this
+                   ((and acc (string= (first acc) "--illatio"))
+                    ;; The model in this image: illatio loads a GGUF into the
+                    ;; Lisp heap and answers requests by function call.  PATH is
+                    ;; optional; an argument is taken as it when it names a
+                    ;; .gguf, so `--illatio "task"` stays a task.
+                    (let* ((next (second acc))
+                           (path-p (and next (not (uiop:string-prefix-p "-" next))
+                                        (uiop:string-suffix-p (string-downcase next) ".gguf"))))
+                      (%use-illatio (if path-p next (llm:default-illatio-model)))
+                      (setf acc (if path-p (cddr acc) (rest acc)))
+                      (eng:apply-backend-defaults)))
+                   ((and acc (member (first acc) '("--local" "--llama") :test #'string=))
+                    ;; A local OpenAI-compatible server (llama.cpp, ds4, illatio
+                    ;; --serve) — the default backend, so this
                     ;; flag exists to name it explicitly (overriding the config's
                     ;; model) and to point at a server elsewhere.  The argument
                     ;; is the server's ADDRESS, not a model: it is
@@ -726,7 +758,8 @@
                     (let* ((tail (rest acc)) (next (first tail)))
                       (unless (and next (not (uiop:string-prefix-p "--" next)))
                         (format *error-output*
-                                "operandi: --llama needs an address: [proto://][host][:port][/path] (e.g. --llama :9931)~%")
+                                "operandi: ~A needs an address: [proto://][host][:port][/path] (e.g. --local :9931)~%"
+                                (first acc))
                         (sb-ext:exit :code 2))
                       (let ((url (handler-case (llm:llama-chat-url next)
                                    (error (e)
@@ -1083,9 +1116,9 @@
       ;; speaks up when it found something worth naming.
       (when (or llm:*llm-model* llama-explicit)
         (if llm:*llm-model*
-            (format t "~&operandi: llama ~A — model ~A (~A)~%"
+            (format t "~&operandi: local ~A — model ~A (~A)~%"
                     llm:*llm-url* llm:*llm-model* reason)
-            (format t "~&operandi: llama ~A — ~A~%" llm:*llm-url* reason)))))
+            (format t "~&operandi: local ~A — ~A~%" llm:*llm-url* reason)))))
   ;; Preflight the model on any path that will actually run a turn (not bare help,
   ;; and not topup, which talks to PPQ's billing API and needs no model).
   (unless (or help-p topup-args)

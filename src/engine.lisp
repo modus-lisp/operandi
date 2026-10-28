@@ -713,9 +713,15 @@ completed). Do not shorten for brevity — nothing may be lost.")
     (setf *context-token-budget*
           (if (llm:cloud-backend-p)
               96000
-              (let ((ctx (llm:llama-context-length llm:*llama-url*)))
+              ;; Ask the server actually selected (--local ADDR may name one
+              ;; other than the default), or the in-image model, its size.
+              (let ((ctx (if (llm:in-image-p)
+                             (llm:illatio-context-length)
+                             (llm:llama-context-length llm:*llm-url*))))
                 (if (and ctx (plusp ctx))
-                    (max 24000 (floor ctx 2))
+                    ;; half the context, but not more than it holds: a small
+                    ;; in-image context (8k) must still compact before it fills
+                    (if (< ctx 48000) (floor ctx 2) (max 24000 (floor ctx 2)))
                     24000))))))
 
 (defvar *last-offload-path* nil
@@ -1204,6 +1210,13 @@ another tool or give a final answer.")
     (return-from do-chat-stream
       (do-chat-blocking messages tools-vec :max-tokens max-tokens
                                             :temperature temperature)))
+  ;; A model in this image streams chunk objects, which are what each SSE
+  ;; event would have parsed to: fold them directly, no stream, no text.
+  (when (llm:in-image-p)
+    (let ((state (make-sse-state)))
+      (llm:in-image-chunks (build-chat-body messages tools-vec max-tokens temperature t)
+                           (lambda (evt) (sse-fold state evt)))
+      (return-from do-chat-stream (sse-finalize state))))
   (let ((stream (llm:post-chat llm:*llm-url*
                                (with-output-to-string (s)
                                  (json:stringify (build-chat-body messages tools-vec

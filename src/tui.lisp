@@ -443,6 +443,7 @@
     (:routstr (or llm:*llm-model* "routstr"))
     (:ppq (or llm:*llm-model* "ppq"))
     (:maple (or llm:*llm-model* "maple"))
+    (:illatio (format nil "illatio:~A" (or llm:*llm-model* "?")))
     (t (llm:local-model-label))))
 
 (defparameter *cut-off-note*
@@ -843,14 +844,24 @@
                 (eng:apply-backend-defaults)
                 (format t "~&→ OpenRouter ~A~%" (paint arg :cyan)))
        (error (e) (format t "~&~A~%" (paint (princ-to-string e) :yellow)))))
-    ((string-equal arg "llama")
+    ((let ((w (subseq arg 0 (position #\Space arg)))) (string-equal w "illatio"))
+     ;; /model illatio [PATH]: the model in this image
+     (let ((path (let ((sp (position #\Space arg)))
+                   (if sp (string-trim " " (subseq arg sp)) (llm:default-illatio-model)))))
+       (handler-case
+           (progn (llm:claim-check! :illatio nil)
+                  (llm:set-backend-illatio! :path path)
+                  (eng:apply-backend-defaults)
+                  (format t "~&→ ~A~%" (paint (model-label) :cyan)))
+         (error (e) (format t "~&~A~%" (paint (princ-to-string e) :yellow))))))
+    ((or (string-equal arg "llama") (string-equal arg "local"))
      (handler-case
          (progn (llm:claim-check! :llama nil)
                 (llm:set-backend-llama!)
                 (eng:apply-backend-defaults)
                 (format t "~&→ ~A~%" (paint (model-label) :cyan)))
        (error (e) (format t "~&~A~%" (paint (princ-to-string e) :yellow)))))
-    (t (format t "~&unknown model spec ~S — give a 'vendor/name' id or 'llama'.~%" arg))))
+    (t (format t "~&unknown model spec ~S — give a 'vendor/name' id, 'local' or 'illatio [PATH]'.~%" arg))))
 
 (defun cmd-workers (arg)
   (if (null arg)

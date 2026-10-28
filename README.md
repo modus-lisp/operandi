@@ -30,21 +30,23 @@ With no prompt at all, `bin/operandi` opens the TUI. The default backend is
 a local llama.cpp on `http://localhost:9931`; `--openrouter` switches to
 OpenRouter (token at `~/.operandi/openrouter.token`).
 
-`--llama ADDR` names that backend explicitly and points it at another server.
-ADDR is the server's address, not a model — a llama.cpp server usually has
-exactly one model loaded, so there is nothing to name:
+`--local ADDR` names that backend explicitly and points it at another server:
+llama.cpp, ds4, `illatio --serve`, anything that speaks `/v1/chat/completions`
+(`--llama` is an older name for it).  ADDR is the server's address, not a
+model — a local server usually has exactly one model loaded, so there is
+nothing to name:
 
 ```
-bin/operandi --llama :9931 "task"                   # localhost:9931
-bin/operandi --llama localhost:9931 "task"          # same thing, spelled out
-bin/operandi --llama http://box:9931 "task"         # another host
-bin/operandi --llama http://box:9931/v1/chat/completions "task"
-bin/operandi --llama :9931 -m qwen3-32b "task"      # multi-model server
+bin/operandi --local :9931 "task"                   # localhost:9931
+bin/operandi --local localhost:9931 "task"          # same thing, spelled out
+bin/operandi --local http://box:9931 "task"         # another host
+bin/operandi --local http://box:9931/v1/chat/completions "task"
+bin/operandi --local :9931 -m qwen3-32b "task"      # multi-model server
 ```
 
 It is `[proto://][host][:port][/path]`; a missing scheme means `http`, a
 missing host means `localhost`, and a missing path means `/v1/chat/completions`.
-At least one component is required — a bare `--llama` is an error, not a
+At least one component is required — a bare `--local` is an error, not a
 request for the default. **A port must be colon-prefixed**: `:9931`, not
 `9931`. A bare number is rejected rather than guessed at, because a forgotten
 colon is far more likely than a hostname that is all digits. For the rare
@@ -67,28 +69,50 @@ with the model and port you want, then point operandi at it:
 ```
 llama-server -m /path/to/model.gguf --host 127.0.0.1 --port 9931 \
              --alias my-model --jinja -c 65536 -ngl 99
-bin/operandi --llama :9931 "task"         # or: --llama :9931 -m my-model
+bin/operandi --local :9931 "task"         # or: --local :9931 -m my-model
 ```
 
 `--alias` is the name the server reports in `/v1/models` and accepts as the
 `model` field, so it is what `-m` should say. `-c` is the context size and
 `-ngl` the number of layers to offload to the GPU (`99` = all of them). The
-default port is 8080; this repo's default is 9931, which is why `--llama :9931`
+default port is 8080; this repo's default is 9931, which is why `--local :9931`
 is the usual spelling. Any localhost port works — the sandbox allows loopback
 outbound generally, so a server on 8080 or 12345 is reachable without touching
 `bin/sandbox.sb`. `--host 0.0.0.0` exposes the server to the LAN, which the
 sandbox does *not* reach.
 
 llama.cpp's **router** mode serves several models from one port, loading them
-on demand, and is what the `--llama :9931` default here talks to:
+on demand, and is what the `--local :9931` default here talks to:
 
 ```
 llama-server --models-preset ~/models.ini --host 127.0.0.1 --port 9931
 ```
 
-With a router, `--llama :9931` with no `-m` asks the server which model to use
+With a router, `--local :9931` with no `-m` asks the server which model to use
 (see above); `-m <id>` names one outright. Naming an unloaded model makes the
 router load it, which takes as long as loading a multi-gigabyte file does.
+
+### The model in this image: `--illatio`
+
+```
+bin/operandi --illatio "task"                        # $ILLATIO_MODEL, or the default below
+bin/operandi --illatio ~/models/model.gguf "task"
+```
+
+[illatio](../illatio) is a pure-Lisp inference engine.  With `--illatio`,
+operandi loads the GGUF into its own heap and answers each request by calling
+illatio's `chat-completion` on the body it would have POSTed: no server, no
+socket, nothing leaves the process.  PATH must end in `.gguf`; without one it is
+`$ILLATIO_MODEL`, then `~/models/qwen2.5-0.5b-instruct-q8_0.gguf` (illatio's
+README says where to get it).  Q8_0 qwen2 and llama models for now.  In the TUI,
+`/model illatio [PATH]` switches to it, and `{"model": "illatio"}` in the config
+makes it the default.
+
+It is a CPU engine in portable Lisp, so the first turn pays for prefilling
+operandi's whole system prompt (about 6k tokens: a few minutes on a laptop);
+later turns reuse the KV cache for the shared prefix and pay only for what is
+new.  illatio is a sibling repo, linked into `~/quicklisp/local-projects/` like
+the others.
 
 ### From source (no core)
 
@@ -131,7 +155,8 @@ always prompt text — `operandi tui` is a task whose text is "tui".
 
 | Flag | Meaning |
 |------|---------|
-| `--llama ADDR` | use the local llama.cpp server at `ADDR` = `[proto://][host][:port][/path]` (e.g. `:9931`, `http://box:9931`); at least one component required, and a port must be colon-prefixed |
+| `--local ADDR` | use the local OpenAI-compatible server (llama.cpp, ds4, `illatio --serve`) at `ADDR` = `[proto://][host][:port][/path]` (e.g. `:9931`, `http://box:9931`); at least one component required, and a port must be colon-prefixed |
+| `--illatio [PATH]` | run the GGUF model at `PATH` inside this image (no server); see above |
 | `-m MODEL` | model id to send; only for a multi-model llama.cpp server (without it, the model is asked of the server — see above) |
 | `--openrouter [MODEL]` | use OpenRouter; `MODEL` is a `vendor/name` slug. Bare `--openrouter` uses the configured model (see below) |
 | `--routstr [NODE-URL] [MODEL]` | use Routstr (Lightning-paid nodes); `NODE-URL` picks the node |

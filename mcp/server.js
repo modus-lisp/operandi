@@ -28,6 +28,8 @@
 //   OPERANDI_ROOT      repo root holding bin/operandi
 //                      (default: the repo root above this mcp/ dir)
 //   OPERANDI_MODEL     default OpenRouter model (default deepseek/deepseek-v4.1-flash)
+//   OPERANDI_BACKEND   provider flag the model is passed with: openrouter (default),
+//                      ppq, routstr, tinfoil -- run as `--<backend> <model>`
 //   OPERANDI_FAN_MAX   max parallel agents per operandi_fan call (default 8)
 //   OPERANDI_WAIT_MS   how long a call blocks before handing back a
 //                      job id (default 110000)
@@ -55,6 +57,9 @@ const ROOT = process.env.OPERANDI_ROOT || path.resolve(__dirname, "..");
 const LAUNCHER = path.join(ROOT, "bin", "operandi");
 const SBCL = process.env.OPERANDI_SBCL || "sbcl";
 const DEFAULT_MODEL = process.env.OPERANDI_MODEL || "deepseek/deepseek-v4.1-flash";
+const BACKEND = process.env.OPERANDI_BACKEND || "openrouter";
+if (!["openrouter", "ppq", "routstr", "tinfoil"].includes(BACKEND))
+  throw new Error(`OPERANDI_BACKEND: unknown backend ${BACKEND}`);
 const WAIT_MS = Number(process.env.OPERANDI_WAIT_MS || 110000);
 const MAX_MS = Number(process.env.OPERANDI_MAX_MS || 1800000);
 // A caller may ask for a longer (or shorter) kill per job, up to this.
@@ -150,6 +155,16 @@ function ensureCore() {
   }
   return corePromise;
 }
+
+// Spawn an operandi run as a tracked job. Returns the job record.
+// cwd defaults to ROOT (operandi loads its packages by absolute path from
+// *load-truename*, so cwd is free to point elsewhere); operandi_swarm passes a
+// per-worker isolated $WD so the worker's Read/Write/Edit/Bash default there.
+function startJob(task, model, cwd = ROOT) {
+  const id = randomUUID().slice(0, 8);
+  const args = ["--non-interactive", "--load", ENTRY, "--"];
+  if (model) args.push(`--${BACKEND}`, model);
+  args.push(task);
 
 // Spawn an operandi run as a tracked job. Returns the job record.
 // cwd defaults to ROOT (the launcher finds operandi by its own path, so cwd is

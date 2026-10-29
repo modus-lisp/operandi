@@ -352,7 +352,9 @@
        (:off (setf (gethash "reasoning" body) (ht "enabled" nil)))
        ((:low :medium :high)
         (setf (gethash "reasoning" body) (ht "effort" (string-downcase (symbol-name effort)))))))
-    (:llama
+    ;; illatio's renderer reads the same switch (DeepSeek V4 Flash thinks
+    ;; unless it is off)
+    ((:llama :illatio)
      (setf (gethash "chat_template_kwargs" body)
            (ht "enable_thinking" (and (member effort '(:low :medium :high)) t))))
     ;; :PPQ and :TINFOIL speak the enclave's plain OpenAI dialect: no

@@ -201,6 +201,38 @@ by TO."
                (error (e) (die 1 "operandi: ~A: ~A: ~A~%" file (type-of e) e)))))
   (note "operandi: sandbox rules from ~A~%" file))
 
+(defun allow-model-file (path)
+  "Read access to the model file PATH and every link on the way to it: SBCL's
+   PROBE-FILE stats each one, and illatio maps the last."
+  (loop repeat 16
+        for real-dir = (%physical (dirname path))
+        while (and real-dir (not (unsafe-path-p path)))
+        do (let ((p (format nil "~A/~A" real-dir (subseq path (1+ (or (position #\/ path :from-end t) -1))))))
+             (emit "(allow-ancestor-metadata \"~A\")" real-dir)
+             (emit "(allow file-read* (literal \"~A\"))" p)
+             (unless (symlink-p p) (return))
+             (let ((target (read-link p)))
+               (setf path (if (and target (plusp (length target)) (char= (char target 0) #\/))
+                              target
+                              (format nil "~A/~A" real-dir target)))))))
+
+(defun illatio-model-rules (argv)
+  "Read access to the GGUF that --illatio will load: the one ARGV names after
+   --illatio, else $ILLATIO_MODEL, else illatio's default."
+  (when (member "--illatio" argv :test #'string=)
+    (let* ((next (second (member "--illatio" argv :test #'string=)))
+           (home (sb-posix:getenv "HOME"))
+           (path (cond ((and next (> (length next) 5)
+                             (string-equal ".gguf" next :start2 (- (length next) 5)))
+                        next)
+                       ((env-set-p "ILLATIO_MODEL"))
+                       (t (format nil "~A/models/qwen2.5-0.5b-instruct-q8_0.gguf" home)))))
+      (cond ((char= (char path 0) #\/))
+            ((and (> (length path) 1) (string= "~/" path :end1 2))
+             (setf path (concatenate 'string home (subseq path 1))))
+            (t (setf path (format nil "~A/~A" (sb-posix:getcwd) path))))
+      (allow-model-file path))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; rendering
 
@@ -315,6 +347,7 @@ process — no wrapper holding the tty or the exit status. Never returns."
 
     (load-customization (format nil "~A/.operandi/sandbox.lisp" home))
     (load-customization (format nil "~A/.operandi/sandbox.lisp" cwd))
+    (illatio-model-rules argv)
 
     (let* ((extra (with-output-to-string (s)
                     (dolist (r (nreverse *extra*)) (write-string r s) (terpri s))))

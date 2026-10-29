@@ -123,6 +123,16 @@
 (allow network-bind   (local ip "localhost:*"))
 (allow network-inbound (local ip "localhost:*"))
 
+;; The GPU, for --illatio's models on Metal: the device's user client, and the
+;; service that compiles the shaders.  Without the first there is no Metal
+;; device; without the second, no kernels.  The model file itself is granted
+;; by bin/operandi-sandbox-macos (it knows the path); the KV snapshots illatio
+;; keeps between runs live here.
+(allow iokit-open (iokit-user-client-class "AGXDeviceUserClient"))
+(allow mach-lookup (xpc-service-name "com.apple.MTLCompilerService"))
+(allow-ancestor-metadata "__HOME__/.cache/illatio")
+(allow file-read* file-write* (subpath "__HOME__/.cache/illatio"))
+
 ;; Quicklisp install + its dists/cache. Writable across the whole tree:
 ;; system-index.txt and local-projects/ get rewritten on load, and quickload
 ;; downloads and unpacks new systems.

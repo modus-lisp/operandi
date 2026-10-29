@@ -475,7 +475,8 @@
             "illatio, a pure-Lisp inference engine (sibling repo), loads the GGUF at"
             "PATH into operandi's own heap and answers each request by function call."
             "PATH must end in .gguf; without it, $ILLATIO_MODEL, then"
-            "~/models/qwen2.5-0.5b-instruct-q8_0.gguf.  Q8_0 qwen2/llama models.")
+            "~/models/qwen2.5-0.5b-instruct-q8_0.gguf.  DeepSeek V4 Flash (Metal),"
+            "Q8_0 qwen2/llama models.")
            ("--openrouter [MODEL]" "OpenRouter; MODEL is a vendor/name slug"
             "Bare --openrouter uses the configured model. Token in"
             "~/.operandi/openrouter.token (mode 600)."

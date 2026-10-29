@@ -104,15 +104,17 @@ operandi loads the GGUF into its own heap and answers each request by calling
 illatio's `chat-completion` on the body it would have POSTed: no server, no
 socket, nothing leaves the process.  PATH must end in `.gguf`; without one it is
 `$ILLATIO_MODEL`, then `~/models/qwen2.5-0.5b-instruct-q8_0.gguf` (illatio's
-README says where to get it).  Q8_0 qwen2 and llama models for now.  In the TUI,
+README says where to get it).  It runs DeepSeek V4 Flash (ds4's GGUF, streamed
+from the SSD on Metal) and Q8_0 qwen2 and llama models.  In the TUI,
 `/model illatio [PATH]` switches to it, and `{"model": "illatio"}` in the config
 makes it the default.
 
-It is a CPU engine in portable Lisp, so the first turn pays for prefilling
-operandi's whole system prompt (about 6k tokens: a few minutes on a laptop);
-later turns reuse the KV cache for the shared prefix and pay only for what is
-new.  illatio is a sibling repo, linked into `~/quicklisp/local-projects/` like
-the others.
+The first turn pays for prefilling operandi's whole system prompt (about 6k
+tokens: about a minute for DeepSeek V4 Flash on an M4 Pro); later turns reuse
+the KV cache for the shared prefix and pay only for what is new.  DeepSeek V4
+Flash also keeps that cache on disk (`~/.cache/illatio/kv`), so the next run
+starts where the prompt ends.  illatio is a sibling repo, linked into
+`~/quicklisp/local-projects/` like the others.
 
 ### From source (no core)
 

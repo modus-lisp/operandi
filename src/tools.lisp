@@ -641,6 +641,125 @@ multiple steps — write the plan up front, mark items as you go."
               (format s "  ~A ~A: ~A~%"
                       mark (getf t- :id) (getf t- :subject)))))))
 
+;;; Glob, in Lisp: bash's rules (globstar, nullglob; `*' and `?' don't match
+;;; a leading dot, `**' doesn't follow symlinked directories), with braces
+;;; and space-separated patterns as bash's word splitting would give.
+
+(defparameter *glob-max-entries* 200000
+  "Directory entries one Glob looks at, at most: a `**' over a huge tree stops.")
+(defvar *glob-budget* 0)
+
+(defun %glob-braces (p)
+  "P with its first {a,b,...} expanded, recursively: a list of patterns."
+  (let ((open (position #\{ p)))
+    (if (null open)
+        (list p)
+        (let ((depth 0) (close nil) (commas '()))
+          (loop for i from open below (length p)
+                for c = (char p i)
+                do (case c
+                     (#\{ (incf depth))
+                     (#\} (when (zerop (decf depth)) (setf close i) (loop-finish)))
+                     (#\, (when (= depth 1) (push i commas)))))
+          (if (or (null close) (null commas))   ; no alternatives: a literal brace
+              (mapcar (lambda (rest) (concatenate 'string (subseq p 0 (1+ open)) rest))
+                      (%glob-braces (subseq p (1+ open))))
+              (let ((cuts (append (list open) (reverse commas) (list close))))
+                (loop for (a b) on cuts while b
+                      nconc (%glob-braces (concatenate 'string (subseq p 0 open)
+                                                       (subseq p (1+ a) b)
+                                                       (subseq p (1+ close)))))))))))
+
+(defun %glob-match-p (pat name &optional (i 0) (j 0))
+  "Does NAME match the one-component glob PAT (* ? [...] [!...])?"
+  (loop
+    (cond ((= i (length pat)) (return (= j (length name))))
+          ((char= (char pat i) #\*)
+           (return (loop for k from j to (length name)
+                         thereis (%glob-match-p pat name (1+ i) k))))
+          ((= j (length name)) (return nil))
+          ((char= (char pat i) #\?) (incf i) (incf j))
+          ((and (char= (char pat i) #\[) (position #\] pat :start (+ i 2)))
+           (let* ((end (position #\] pat :start (+ i 2)))
+                  (neg (find (char pat (1+ i)) "!^"))
+                  (set (subseq pat (if neg (+ i 2) (1+ i)) end))
+                  (c (char name j))
+                  (in (loop for k from 0 below (length set)
+                            thereis (if (and (< (+ k 2) (length set)) (char= (char set (1+ k)) #\-))
+                                        (prog1 (char<= (char set k) c (char set (+ k 2))) (incf k 2))
+                                        (char= (char set k) c)))))
+             (unless (if neg (not in) in) (return nil))
+             (setf i (1+ end)) (incf j)))
+          ((char= (char pat i) (char name j)) (incf i) (incf j))
+          (t (return nil)))))
+
+(defun %glob-entries (dir)
+  "DIR's (a native directory name, \"\" for the cwd) entries: (name . dir-p),
+   dir-p :link for a symlinked directory."
+  (let ((d (sb-ext:parse-native-namestring (if (string= dir "") "./" dir)
+                                           nil *default-pathname-defaults* :as-directory t))
+        (out '()))
+    (flet ((last-name (p)
+             (let* ((s (string-right-trim "/" (sb-ext:native-namestring p)))
+                    (k (position #\/ s :from-end t)))
+               (if k (subseq s (1+ k)) s))))
+      (dolist (p (ignore-errors (directory (merge-pathnames (make-pathname :name :wild :type :wild) d) :resolve-symlinks nil)))
+        (when (minusp (decf *glob-budget*)) (return))
+        (let ((dir-p (null (pathname-name p))))
+          (push (cons (last-name p)
+                      (and dir-p (if (ignore-errors (sb-posix:s-islnk (sb-posix:stat-mode (sb-posix:lstat (string-right-trim "/" (sb-ext:native-namestring p))))))
+                                     :link t)))
+                out))))
+    out))
+
+(defun %glob-walk (dir parts acc)
+  "Paths under DIR (a prefix ending in /, or \"\") matching PARTS, pushed on ACC."
+  (when (minusp *glob-budget*) (return-from %glob-walk acc))
+  (destructuring-bind (part &rest more) parts
+    (flet ((visible-p (name pat) (or (char= (char pat 0) #\.) (char/= (char name 0) #\.))))
+      (cond ((string= part "**")
+             ;; zero directories, then each subdirectory and below
+             (setf acc (if more (%glob-walk dir more acc) acc))
+             (loop for (name . dir-p) in (%glob-entries dir)
+                   when (and (eq dir-p t) (char/= (char name 0) #\.))
+                     do (setf acc (%glob-walk (concatenate 'string dir name "/") parts acc))
+                   when (and (null more) (null dir-p) (char/= (char name 0) #\.))
+                     do (push (concatenate 'string dir name) acc))
+             acc)
+            ((notany (lambda (c) (find c "*?[")) part)   ; a literal component
+             (let ((path (concatenate 'string dir part)))
+               (cond (more (if (ignore-errors (sb-posix:s-isdir (sb-posix:stat-mode (sb-posix:stat path))))
+                               (%glob-walk (concatenate 'string path "/") more acc)
+                               acc))
+                     ((ignore-errors (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:stat path))))
+                      (cons path acc))
+                     (t acc))))
+            (t
+             (loop for (name . dir-p) in (%glob-entries dir)
+                   when (and (visible-p name part) (%glob-match-p part name))
+                     do (cond (more (when dir-p
+                                      (setf acc (%glob-walk (concatenate 'string dir name "/") more acc))))
+                              ((not dir-p) (push (concatenate 'string dir name) acc))))
+             acc)))))
+
+(defun glob-files (pattern)
+  "The regular files PATTERN (glob words, space-separated) matches, newest first."
+  (let ((acc '()))
+    (dolist (word (uiop:split-string pattern :separator " "))
+      (dolist (p (%glob-braces word))
+        (when (plusp (length p))
+          (let* ((abs (char= (char p 0) #\/))
+                 (parts (remove "" (uiop:split-string p :separator "/") :test #'string=)))
+            (when parts
+              (setf acc (%glob-walk (if abs "/" "") parts acc)))))))
+    (let ((files (remove-duplicates
+                  (remove-if-not (lambda (f) (ignore-errors (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:stat f)))))
+                                 acc)
+                  :test #'string=)))
+      (mapcar #'car (sort (mapcar (lambda (f) (cons f (or (ignore-errors (sb-posix:stat-mtime (sb-posix:stat f))) 0)))
+                                  files)
+                          #'> :key #'cdr)))))
+
 (define-tool "Glob"
     (:description "List files matching PATTERN. Supports globstar (**).
 Examples: '*.lisp', 'src/**/*.lisp', 'test/*.lisp'.
@@ -656,21 +775,20 @@ Returns up to 200 paths, newest first."
       ((not (safe-glob-pattern-p pattern))
        "Glob: pattern must be a glob of letters, digits, and _-./*?[]{}, only (no shell metacharacters, no '..')")
       (t
-       ;; Pattern is validated injection-free above; globstar still needs
-       ;; bash, and coreutils `timeout` bounds a `**` over a huge tree.
-       (let* ((cmd (format nil "shopt -s globstar nullglob; for f in ~A; do [ -f \"$f\" ] && stat -c '%Y %n' \"$f\"; done | sort -rn | head -200 | cut -d' ' -f2-"
-                           pattern))
-              (out (with-output-to-string (s)
-                     (handler-case
-                         (uiop:run-program
-                          (list "timeout" "--signal=KILL"
-                                (format nil "~D" *bash-timeout*) "/bin/bash" "-c" cmd)
-                          :output s :error-output nil :ignore-error-status t)
-                       (error () nil)))))
+       ;; Matched here, not by bash: macOS's /bin/bash (3.2) has no globstar
+       ;; and its stat no -c, so the shell version found nothing there.
+       (let* ((*glob-budget* *glob-max-entries*)
+              (paths (handler-case (glob-files pattern) (error () '())))
+              (out (with-output-to-string (o)
+                     (loop for p in paths repeat 200 do (write-line p o)))))
          (cond
            ((zerop (length out)) "(no matches)")
-           ((>= (count #\Newline out) 200)
-            (format nil "~A~&… showing the newest 200 matches — refine the pattern to narrow." out))
+           ((minusp *glob-budget*)
+            (format nil "~A~&… stopped after looking at ~:D entries — narrow the pattern."
+                    out *glob-max-entries*))
+           ((> (length paths) 200)
+            (format nil "~A~&… showing the newest 200 of ~:D matches — refine the pattern to narrow."
+                    out (length paths)))
            (t out)))))))
 
 (define-tool "WebFetch"

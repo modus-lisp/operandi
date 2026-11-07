@@ -884,9 +884,10 @@ of titles + URLs + short descriptions."
 ;;; the schema.  The PNG goes to a file; the model gets its path, not its
 ;;; pixels.
 
-(operandi.env:defenv *images-url*
-  (let ((u (uiop:getenv "OPERANDI_IMAGES"))) (and u (plusp (length u)) (string-right-trim "/" u)))
-  "Base URL of an OpenAI-compatible image server, or NIL: no Imagine tool.")
+(defun images-url ()
+  "Base URL of an OpenAI-compatible image server (OPERANDI_IMAGES), or NIL: no Imagine tool.
+   Read when used, so a saved core follows the environment it runs in."
+  (let ((u (uiop:getenv "OPERANDI_IMAGES"))) (and u (plusp (length u)) (string-right-trim "/" u))))
 
 (defun %base64-octets (s)
   (let ((out (make-array (floor (* 3 (length s)) 4) :element-type '(unsigned-byte 8) :fill-pointer 0))
@@ -924,13 +925,13 @@ you see it after the tool results."
                             "seed" (llm:ht "type" "integer" "description" "Reproduce or vary a picture (default random)."))
               "required" (vector "prompt")))
   (block %imagine
-  (unless *images-url* (error "no image server: set OPERANDI_IMAGES"))
+  (unless (images-url) (error "no image server: set OPERANDI_IMAGES"))
   (let* ((prompt (gethash "prompt" args))
          (body (llm:ht "prompt" prompt "size" (or (gethash "size" args) "1024x1024")))
          (t0 (get-internal-real-time)))
     (when (gethash "seed" args) (setf (gethash "seed" body) (gethash "seed" args)))
     (let* ((reply (handler-case
-                      (json:parse (operandi.http:post (format nil "~A/v1/images/generations" *images-url*)
+                      (json:parse (operandi.http:post (format nil "~A/v1/images/generations" (images-url))
                                                       :content (json:stringify body)
                                                       :headers '(("Content-Type" . "application/json"))
                                                       :read-timeout 600))
@@ -1066,7 +1067,7 @@ large)."
    '("Eval" "Read" "Write" "Edit" "Bash" "Grep" "Glob" "WebFetch"
      "WebSearch" "Remember" "Findings" "Task" "Fan" "Spawn" "Investigate"
      "SendMessage" "TodoWrite")
-   (and *images-url* (list "Imagine"))
+   (and (images-url) (list "Imagine"))
    (copy-list *extra-default-tools*)))
 
 (defun read-notes-if-any (file)

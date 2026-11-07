@@ -933,8 +933,11 @@ of titles + URLs + short descriptions."
       (let ((token (or (operandi.ppq:ppq-token) (error "Imagine: no PPQ account (~~/.operandi/ppq.token)")))
             (body (llm:ht "model" (or *image-model* *ppq-image-model*) "prompt" prompt
                           "response_format" "b64_json")))
+        ;; both: models that take sizes (Flux, Qwen-Image) make exactly W x H; the rest
+        ;; (Nano Banana, GPT Image, Seedream) take the nearest ratio
         (multiple-value-bind (w h) (%parse-size size)
-          (when w (setf (gethash "aspect_ratio" body) (%aspect-ratio w h))))
+          (when w (setf (gethash "size" body) (llm:ht "width" w "height" h)
+                        (gethash "aspect_ratio" body) (%aspect-ratio w h))))
         (when seed (setf (gethash "seed" body) seed))
         (values (format nil "~A/v1/images/generations" operandi.ppq:*ppq-base*) body
                 (list '("Content-Type" . "application/json") (cons "Authorization" (format nil "Bearer ~A" token)))))
@@ -992,7 +995,7 @@ can show you pictures, you see it after the tool results."
                             "path" (llm:ht "type" "string"
                                            "description" "Where to save it (default generated/<prompt>[-<seed>].<ext>); the extension follows the format made.")
                             "size" (llm:ht "type" "string"
-                                           "description" "WIDTHxHEIGHT (default 1024x1024). A backend that takes aspect ratios gets the nearest one.")
+                                           "description" "WIDTHxHEIGHT (default 1024x1024). A model that takes only aspect ratios makes the nearest one; the result says what was made.")
                             "seed" (llm:ht "type" "integer" "description" "Reproduce or vary a picture (default random)."))
               "required" (vector "prompt")))
   (block %imagine

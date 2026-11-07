@@ -569,6 +569,7 @@
            ("OPERANDI_EFFORT" "same as --effort")
            ("OPERANDI_WORKER_MODEL" "same as --worker-model")
            ("OPERANDI_SEARCH" "web-search backend: openrouter, searxng, brave, auto")
+           ("OPERANDI_IMAGES" "an OpenAI image server (e.g. ex-nihilo's, http://127.0.0.1:9940): adds the Imagine tool")
            ("OPERANDI_SWARM_DEADLINE" "seconds a Fan/Investigate batch may run (default 900)")
            ("OPERANDI_NO_PREFLIGHT=1" "skip the model preflight")
            ("OPERANDI_FANCY_TUI=1" "opt in to the scroll-region TUI")

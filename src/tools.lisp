@@ -851,6 +851,80 @@ of titles + URLs + short descriptions."
                                   (subseq d 0 (min 300 (length d))))))))))
       (error (e) (format nil "SEARCH ERROR: ~A" e)))))
 
+;;; --- Imagine: pictures from an image server ---------------------------------
+;;; Any server with OpenAI's POST /v1/images/generations (ex-nihilo's
+;;; bin/ex-nihilo is one, on 127.0.0.1:9940).  The tool joins the default set
+;;; only when OPERANDI_IMAGES names one, so a run without it pays nothing for
+;;; the schema.  The PNG goes to a file; the model gets its path, not its
+;;; pixels.
+
+(operandi.env:defenv *images-url*
+  (let ((u (uiop:getenv "OPERANDI_IMAGES"))) (and u (plusp (length u)) (string-right-trim "/" u)))
+  "Base URL of an OpenAI-compatible image server, or NIL: no Imagine tool.")
+
+(defun %base64-octets (s)
+  (let ((out (make-array (floor (* 3 (length s)) 4) :element-type '(unsigned-byte 8) :fill-pointer 0))
+        (acc 0) (bits 0))
+    (loop for c across s
+          for v = (cond ((char<= #\A c #\Z) (- (char-code c) 65)) ((char<= #\a c #\z) (- (char-code c) 71))
+                        ((char<= #\0 c #\9) (+ (char-code c) 4)) ((char= c #\+) 62) ((char= c #\/) 63))
+          when v do (setf acc (logior (ash (logand acc #xffff) 6) v)) (incf bits 6)
+                    (when (>= bits 8) (decf bits 8) (vector-push (ldb (byte 8 bits) acc) out)))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
+(defun %slug (s)
+  (let ((w (with-output-to-string (o)
+             (loop for c across (string-downcase s) with dash = nil
+                   do (if (alphanumericp c) (progn (when dash (write-char #\- o)) (write-char c o) (setf dash nil))
+                          (setf dash t))))))
+    (string-trim "-" (if (<= (length w) 40) w (subseq w 0 (or (position #\- w :end 41 :from-end t) 40))))))
+
+(define-tool "Imagine"
+    (:description "Generate a picture from a text prompt and save it as a PNG.
+Describe what to show concretely: subject, setting, style (photograph, oil
+painting, flat illustration...), lighting, composition; quote any text the
+picture must contain exactly (\"a sign reading 'OPEN'\"). About 3 s at
+512x512, 10 s at 1024x1024. Returns the file's path and the seed; the same
+prompt and seed give the same picture. You do not see the picture."
+     :schema (llm:ht
+              "type" "object"
+              "properties" (llm:ht
+                            "prompt" (llm:ht "type" "string" "description" "What the picture shows.")
+                            "path" (llm:ht "type" "string"
+                                           "description" "Where to save the PNG (default generated/<prompt>-<seed>.png).")
+                            "size" (llm:ht "type" "string"
+                                           "description" "WIDTHxHEIGHT, multiples of 16 from 256 to 2048, at most 1536x1024's pixels (default 1024x1024).")
+                            "seed" (llm:ht "type" "integer" "description" "Reproduce or vary a picture (default random)."))
+              "required" (vector "prompt")))
+  (block %imagine
+  (unless *images-url* (error "no image server: set OPERANDI_IMAGES"))
+  (let* ((prompt (gethash "prompt" args))
+         (body (llm:ht "prompt" prompt "size" (or (gethash "size" args) "1024x1024")))
+         (t0 (get-internal-real-time)))
+    (when (gethash "seed" args) (setf (gethash "seed" body) (gethash "seed" args)))
+    (let* ((reply (handler-case
+                      (json:parse (operandi.http:post (format nil "~A/v1/images/generations" *images-url*)
+                                                      :content (json:stringify body)
+                                                      :headers '(("Content-Type" . "application/json"))
+                                                      :read-timeout 600))
+                    (operandi.http:http-request-failed (e)
+                      (return-from %imagine
+                        (format nil "IMAGE SERVER ERROR (~A): ~A" (operandi.http:response-status e)
+                                (let ((b (operandi.http:response-body e)))
+                                  (if (stringp b) (subseq b 0 (min 500 (length b))) "")))))))
+           (d (aref (gethash "data" reply) 0))
+           (seed (gethash "seed" d))
+           (path (or (gethash "path" args)
+                     (format nil "generated/~A~@[-~D~].png" (let ((x (%slug prompt))) (if (plusp (length x)) x "picture")) seed)))
+           (refusal (check-write-allowed path)))
+      (when refusal (return-from %imagine refusal))
+      (ensure-directories-exist (merge-pathnames path))
+      (with-open-file (o path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+        (write-sequence (%base64-octets (gethash "b64_json" d)) o))
+      (record-read path)
+      (format nil "Wrote ~A (~A PNG~@[, seed ~D~], ~,1F s)." path (or (gethash "size" reply) "") seed
+              (/ (- (get-internal-real-time) t0) internal-time-units-per-second))))))
+
 (defparameter *notes-file*
   (merge-pathnames ".operandi/operandi-notes.md" (user-homedir-pathname))
   "SYSTEM notes: facts about operandi itself and the machine, true in every
@@ -963,6 +1037,7 @@ large)."
    '("Eval" "Read" "Write" "Edit" "Bash" "Grep" "Glob" "WebFetch"
      "WebSearch" "Remember" "Findings" "Task" "Fan" "Spawn" "Investigate"
      "SendMessage" "TodoWrite")
+   (and *images-url* (list "Imagine"))
    (copy-list *extra-default-tools*)))
 
 (defun read-notes-if-any (file)

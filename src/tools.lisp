@@ -44,6 +44,7 @@
            #:*tool-gate*
            #:*tool-images*
            #:show-image
+           #:*images* #:*image-model* #:parse-images #:images-label
            #:define-tool
            #:register-tool
            #:unregister-tool
@@ -878,16 +879,86 @@ of titles + URLs + short descriptions."
       (error (e) (format nil "SEARCH ERROR: ~A" e)))))
 
 ;;; --- Imagine: pictures from an image server ---------------------------------
-;;; Any server with OpenAI's POST /v1/images/generations (ex-nihilo's
-;;; bin/ex-nihilo is one, on 127.0.0.1:9940).  The tool joins the default set
-;;; only when OPERANDI_IMAGES names one, so a run without it pays nothing for
-;;; the schema.  The PNG goes to a file; the model gets its path, not its
-;;; pixels.
+;;; *IMAGES* says where pictures come from, set by `--images`: a base URL of a
+;;; server with OpenAI's POST /v1/images/generations (ex-nihilo's
+;;; bin/ex-nihilo is one, on 127.0.0.1:9940), or :PPQ, PPQ's own image models
+;;; (`--image-model`, paid from the PPQ account).  NIL: no Imagine tool -- it
+;;; joins the default set only when there is somewhere to send it, so a run
+;;; without one pays nothing for the schema.  The picture goes to a file; the
+;;; model gets its path, not its pixels (but see SHOW-IMAGE).
 
-(defun images-url ()
-  "Base URL of an OpenAI-compatible image server (OPERANDI_IMAGES), or NIL: no Imagine tool.
-   Read when used, so a saved core follows the environment it runs in."
-  (let ((u (uiop:getenv "OPERANDI_IMAGES"))) (and u (plusp (length u)) (string-right-trim "/" u))))
+(defvar *images* nil
+  "Where Imagine gets pictures: NIL (no Imagine), a base URL, or :PPQ.")
+
+(defvar *image-model* nil
+  "The model Imagine asks for, or NIL for the backend's default: on PPQ,
+   *PPQ-IMAGE-MODEL*; a server like ex-nihilo serves one and ignores it.")
+
+(defparameter *ppq-image-model* "qwen-image-3"
+  "PPQ's image model when --image-model names none: strong at text in the
+   picture; about $0.05 and up to a minute a picture.")
+
+(defun parse-images (spec)
+  "--images SPEC: a base URL, or ppq.  (values value ok)."
+  (cond ((null spec) (values nil nil))
+        ((string-equal spec "ppq") (values :ppq t))
+        ((or (uiop:string-prefix-p "http://" spec) (uiop:string-prefix-p "https://" spec))
+         (values (string-right-trim "/" spec) t))
+        (t (values nil nil))))
+
+(defun images-label ()
+  (cond ((eq *images* :ppq) (format nil "PPQ ~A" (or *image-model* *ppq-image-model*)))
+        (*images* (format nil "~A~@[ (~A)~]" *images* *image-model*))))
+
+(defparameter +aspect-ratios+ '((1 1) (4 3) (3 4) (3 2) (2 3) (16 9) (9 16))
+  "The aspect ratios a size becomes for a backend that takes ratios, not sizes.")
+
+(defun %aspect-ratio (w h)
+  "The ratio in +ASPECT-RATIOS+ nearest W:H, as \"W:H\"."
+  (destructuring-bind (a b)
+      (first (sort (copy-list +aspect-ratios+) #'<
+                   :key (lambda (r) (abs (- (log (/ (first r) (second r))) (log (/ w h)))))))
+    (format nil "~D:~D" a b)))
+
+(defun %parse-size (size)
+  "(values w h) from \"WxH\", or NIL."
+  (let ((x (and (stringp size) (position #\x size :test #'char-equal))))
+    (when x
+      (let ((w (parse-integer size :end x :junk-allowed t)) (h (parse-integer size :start (1+ x) :junk-allowed t)))
+        (and w h (plusp w) (plusp h) (values w h))))))
+
+(defun %image-request (prompt size seed)
+  "(values url body headers) for one picture from *IMAGES*."
+  (if (eq *images* :ppq)
+      (let ((token (or (operandi.ppq:ppq-token) (error "Imagine: no PPQ account (~~/.operandi/ppq.token)")))
+            (body (llm:ht "model" (or *image-model* *ppq-image-model*) "prompt" prompt
+                          "response_format" "b64_json")))
+        (multiple-value-bind (w h) (%parse-size size)
+          (when w (setf (gethash "aspect_ratio" body) (%aspect-ratio w h))))
+        (when seed (setf (gethash "seed" body) seed))
+        (values (format nil "~A/v1/images/generations" operandi.ppq:*ppq-base*) body
+                (list '("Content-Type" . "application/json") (cons "Authorization" (format nil "Bearer ~A" token)))))
+      (let ((body (llm:ht "prompt" prompt "size" (or size "1024x1024"))))
+        (when seed (setf (gethash "seed" body) seed))
+        (when *image-model* (setf (gethash "model" body) *image-model*))
+        (values (format nil "~A/v1/images/generations" *images*) body
+                '(("Content-Type" . "application/json"))))))
+
+(defun %image-dims (octets)
+  "(values width height) from a PNG's or JPEG's header, or NIL."
+  (ignore-errors
+   (cond ((and (> (length octets) 24) (= (aref octets 0) 137) (= (aref octets 1) 80))
+          (flet ((be32 (i) (logior (ash (aref octets i) 24) (ash (aref octets (+ i 1)) 16)
+                                   (ash (aref octets (+ i 2)) 8) (aref octets (+ i 3)))))
+            (values (be32 16) (be32 20))))
+         ((and (> (length octets) 3) (= (aref octets 0) #xff) (= (aref octets 1) #xd8))
+          (pigment:jpeg-size octets)))))
+
+(defun %image-extension (content-type)
+  (cond ((search "jpeg" (or content-type "")) "jpg")
+        ((search "webp" (or content-type "")) "webp")
+        ((search "gif" (or content-type "")) "gif")
+        (t "png")))
 
 (defun %base64-octets (s)
   (let ((out (make-array (floor (* 3 (length s)) 4) :element-type '(unsigned-byte 8) :fill-pointer 0))
@@ -907,53 +978,62 @@ of titles + URLs + short descriptions."
     (string-trim "-" (if (<= (length w) 40) w (subseq w 0 (or (position #\- w :end 41 :from-end t) 40))))))
 
 (define-tool "Imagine"
-    (:description "Generate a picture from a text prompt and save it as a PNG.
+    (:description "Generate a picture from a text prompt and save it to a file.
 Describe what to show concretely: subject, setting, style (photograph, oil
 painting, flat illustration...), lighting, composition; quote any text the
-picture must contain exactly (\"a sign reading 'OPEN'\"). About 3 s at
-512x512, 10 s at 1024x1024. Returns the file's path and the seed; the same
-prompt and seed give the same picture. When this run can show you pictures,
-you see it after the tool results."
+picture must contain exactly (\"a sign reading 'OPEN'\"). Returns the file's
+path (its extension the format the backend made) and, when the backend reports
+one, the seed: the same prompt and seed give the same picture. When this run
+can show you pictures, you see it after the tool results."
      :schema (llm:ht
               "type" "object"
               "properties" (llm:ht
                             "prompt" (llm:ht "type" "string" "description" "What the picture shows.")
                             "path" (llm:ht "type" "string"
-                                           "description" "Where to save the PNG (default generated/<prompt>-<seed>.png).")
+                                           "description" "Where to save it (default generated/<prompt>[-<seed>].<ext>); the extension follows the format made.")
                             "size" (llm:ht "type" "string"
-                                           "description" "WIDTHxHEIGHT, multiples of 16 from 256 to 2048, at most 1536x1024's pixels (default 1024x1024).")
+                                           "description" "WIDTHxHEIGHT (default 1024x1024). A backend that takes aspect ratios gets the nearest one.")
                             "seed" (llm:ht "type" "integer" "description" "Reproduce or vary a picture (default random)."))
               "required" (vector "prompt")))
   (block %imagine
-  (unless (images-url) (error "no image server: set OPERANDI_IMAGES"))
-  (let* ((prompt (gethash "prompt" args))
-         (body (llm:ht "prompt" prompt "size" (or (gethash "size" args) "1024x1024")))
-         (t0 (get-internal-real-time)))
-    (when (gethash "seed" args) (setf (gethash "seed" body) (gethash "seed" args)))
-    (let* ((reply (handler-case
-                      (json:parse (operandi.http:post (format nil "~A/v1/images/generations" (images-url))
-                                                      :content (json:stringify body)
-                                                      :headers '(("Content-Type" . "application/json"))
-                                                      :read-timeout 600))
-                    (operandi.http:http-request-failed (e)
-                      (return-from %imagine
-                        (format nil "IMAGE SERVER ERROR (~A): ~A" (operandi.http:response-status e)
-                                (let ((b (operandi.http:response-body e)))
-                                  (if (stringp b) (subseq b 0 (min 500 (length b))) "")))))))
-           (d (aref (gethash "data" reply) 0))
-           (seed (gethash "seed" d))
-           (path (or (gethash "path" args)
-                     (format nil "generated/~A~@[-~D~].png" (let ((x (%slug prompt))) (if (plusp (length x)) x "picture")) seed)))
-           (refusal (check-write-allowed path)))
-      (when refusal (return-from %imagine refusal))
-      (ensure-directories-exist (merge-pathnames path))
-      (with-open-file (o path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
-        (write-sequence (%base64-octets (gethash "b64_json" d)) o))
-      (record-read path)
-      (format nil "Wrote ~A (~A PNG~@[, seed ~D~], ~,1F s).~:[ You do not see the picture.~; It is shown to you after this turn's tool results: check it against what was asked (text spelled right, nothing missing), and try again -- a better prompt, or another seed -- if it falls short.~]"
-              path (or (gethash "size" reply) "") seed
-              (/ (- (get-internal-real-time) t0) internal-time-units-per-second)
-              (show-image path))))))
+  (unless *images* (error "no image backend: start operandi with --images URL or --images ppq"))
+  (let ((prompt (gethash "prompt" args))
+        (t0 (get-internal-real-time)))
+    (multiple-value-bind (url body headers) (%image-request prompt (gethash "size" args) (gethash "seed" args))
+      (let* ((reply (handler-case
+                        (json:parse (operandi.http:post url :content (json:stringify body) :headers headers
+                                                            :read-timeout 600))
+                      (operandi.http:http-request-failed (e)
+                        (return-from %imagine
+                          (format nil "IMAGE SERVER ERROR (~A): ~A" (operandi.http:response-status e)
+                                  (let ((b (operandi.http:response-body e)))
+                                    (if (stringp b) (subseq b 0 (min 500 (length b))) "")))))))
+             (d (aref (gethash "data" reply) 0))
+             (seed (or (gethash "seed" d) (gethash "seed" args)))
+             (ext (%image-extension (gethash "content_type" d)))
+             (asked (gethash "path" args))
+             (path (if asked
+                       (if (string-equal (or (pathname-type (pathname asked)) "") ext)
+                           asked
+                           (namestring (make-pathname :type ext :defaults (pathname asked))))
+                       (format nil "generated/~A~@[-~D~].~A"
+                               (let ((x (%slug prompt))) (if (plusp (length x)) x "picture")) seed ext)))
+             (refusal (check-write-allowed path))
+             (dims nil))
+        (when refusal (return-from %imagine refusal))
+        (ensure-directories-exist (merge-pathnames path))
+        (let ((octets (%base64-octets (gethash "b64_json" d))))
+          (with-open-file (o path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+            (write-sequence octets o))
+          (multiple-value-bind (w h) (%image-dims octets)
+            (setf dims (and w h (format nil "~Dx~D" w h)))))
+        (record-read path)
+        (format nil "Wrote ~A (~A~@[ ~A~]~@[, seed ~D~]~@[, $~,4F~], ~,1F s).~@[ ~A~]~:[ You do not see the picture.~; It is shown to you after this turn's tool results: check it against what was asked (text spelled right, nothing missing), and try again -- a better prompt, or another seed -- if it falls short.~]"
+                path (string-upcase ext) dims seed (gethash "cost" reply)
+                (/ (- (get-internal-real-time) t0) internal-time-units-per-second)
+                (and asked (not (equal asked path))
+                     (format nil "(~A was asked for; the backend made ~A, so it is saved as ~A.)" asked (string-upcase ext) path))
+                (show-image path)))))))
 
 (defparameter *notes-file*
   (merge-pathnames ".operandi/operandi-notes.md" (user-homedir-pathname))
@@ -1067,7 +1147,7 @@ large)."
    '("Eval" "Read" "Write" "Edit" "Bash" "Grep" "Glob" "WebFetch"
      "WebSearch" "Remember" "Findings" "Task" "Fan" "Spawn" "Investigate"
      "SendMessage" "TodoWrite")
-   (and (images-url) (list "Imagine"))
+   (and *images* (list "Imagine"))
    (copy-list *extra-default-tools*)))
 
 (defun read-notes-if-any (file)

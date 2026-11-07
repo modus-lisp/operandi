@@ -34,6 +34,7 @@
                     (#:sf    #:operandi.safefetch))
   (:export #:run
            #:preflight-model
+           #:*tool-images-p*
            #:*payment-required-hook* #:payment-required-p #:handle-payment-required
            #:*max-iterations*
            #:*wrapup-iterations*
@@ -1481,10 +1482,9 @@ another tool or give a final answer.")
         (setf (gethash "reasoning_content" h) r)))
     h))
 
-(defun tool-images-p ()
+(defvar *tool-images-p* t
   "Whether pictures a tool opens or makes (Read of an image, Imagine) are
-   shown to the model.  OPERANDI_TOOL_IMAGES=0 for a model that takes none."
-  (not (member (uiop:getenv "OPERANDI_TOOL_IMAGES") '("0" "no" "off" "false") :test #'equalp)))
+   shown to the model.  --no-tool-images for a model that takes none.")
 
 (defvar *tool-image-side* 768
   "Longest side, in pixels, of a picture shown to the model from a tool.")
@@ -1775,7 +1775,7 @@ another tool or give a final answer.")
            ;; Execute every tool_call, append each result. If the budget
            ;; cap is hit, short-circuit with a synthetic result so the
            ;; model knows to stop searching and finalize.
-           (let ((tools:*tool-images* (if (tool-images-p) '() :off)))
+           (let ((tools:*tool-images* (if *tool-images-p* '() :off)))
            (loop for tc in tcs
                  for tcid = (gethash "id" tc)
                  for name = (tool-call-name tc)

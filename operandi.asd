@@ -34,6 +34,7 @@
                "bordeaux-threads"
                "lispqr"         ; pure-CL QR encoder (mare5x, MIT) -- for payment invoices; pulls zpng
                "png-pure"       ; pure-CL PNG encoder (cram's deflate) -- QR image for :open
+               "pigment"        ; pure-CL image decoders -- pictures shrunk before they go to a model
                "quill")         ; pure-CL line editor for the REPL prompt -- replaced linedit
   :serial nil
   :components

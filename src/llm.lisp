@@ -88,14 +88,44 @@
 
 (defun text-part (text) (ht "type" "text" "text" text))
 
-(defun image-part (path)
-  "An image_url content part carrying PATH's bytes as a data: URL."
-  (let ((mime (or (image-file-p path)
-                  (error "not an image file (png/jpg/gif/webp): ~A" path)))
-        (bytes (with-open-file (in path :element-type '(unsigned-byte 8))
-                 (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
-                   (read-sequence v in)
-                   v))))
+(defun shrink-image (bytes max-side)
+  "BYTES (any format pigment decodes) as a PNG no larger than MAX-SIDE on
+   either side, each pixel the mean of the box it covers, over white where
+   transparent; NIL when it is already small enough or will not decode.
+   (values png width height)."
+  (let ((img (ignore-errors (pigment:decode-image-bytes bytes))))
+    (when (and img (> (max (pigment:img-w img) (pigment:img-h img)) max-side))
+      (let* ((w (pigment:img-w img)) (h (pigment:img-h img)) (rgba (pigment:img-rgba img))
+             (k (/ max-side (max w h))) (nw (max 1 (round (* w k)))) (nh (max 1 (round (* h k))))
+             (out (make-array (* nw nh 3) :element-type '(unsigned-byte 8))))
+        (dotimes (y nh)
+          (let ((y0 (floor (* y h) nh)) (y1 (max (1+ (floor (* y h) nh)) (floor (* (1+ y) h) nh))))
+            (dotimes (x nw)
+              (let ((x0 (floor (* x w) nw)) (x1 (max (1+ (floor (* x w) nw)) (floor (* (1+ x) w) nw)))
+                    (r 0) (g 0) (b 0) (n 0))
+                (loop for yy from y0 below y1
+                      do (loop for xx from x0 below x1
+                               for i = (* 4 (+ (* yy w) xx))
+                               for a = (aref rgba (+ i 3))
+                               do (incf r (+ (* a (aref rgba i)) (* 255 (- 255 a))))
+                                  (incf g (+ (* a (aref rgba (+ i 1))) (* 255 (- 255 a))))
+                                  (incf b (+ (* a (aref rgba (+ i 2))) (* 255 (- 255 a))))
+                                  (incf n 255)))
+                (let ((o (* 3 (+ (* y nw) x))))
+                  (setf (aref out o) (round r n) (aref out (+ o 1)) (round g n) (aref out (+ o 2)) (round b n)))))))
+        (values (png-pure:encode-png out nw nh :channels 3) nw nh)))))
+
+(defun image-part (path &key max-side)
+  "An image_url content part carrying PATH's bytes as a data: URL -- shrunk
+   to MAX-SIDE pixels on its longer side first, when given and larger."
+  (let* ((mime (or (image-file-p path)
+                   (error "not an image file (png/jpg/gif/webp): ~A" path)))
+         (bytes (with-open-file (in path :element-type '(unsigned-byte 8))
+                  (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
+                    (read-sequence v in)
+                    v)))
+         (small (and max-side (shrink-image bytes max-side))))
+    (when small (setf bytes small mime "image/png"))
     (ht "type" "image_url"
         "image_url" (ht "url" (format nil "data:~A;base64,~A" mime
                                       (cl-base64:usb8-array-to-base64-string bytes))))))

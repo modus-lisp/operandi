@@ -42,6 +42,8 @@
            #:*edit-max-bytes*
            #:*read-max-total-bytes*
            #:*tool-gate*
+           #:*tool-images*
+           #:show-image
            #:define-tool
            #:register-tool
            #:unregister-tool
@@ -101,6 +103,23 @@
            (and last-read cur (> cur last-read)))
          (format nil "REFUSED: ~A has changed on disk since you last Read it (mtime advanced). Re-Read it before writing — your snapshot is stale." path))
         (t nil)))))
+
+;;; A tool that produces or opens a picture hands it to the model with
+;;; SHOW-IMAGE: the agent loop (operandi.engine) binds *TOOL-IMAGES* around a
+;;; turn's tool calls and, after their results, sends the pictures in a user
+;;; message -- tool messages carry only text on most providers.
+
+(defvar *tool-images* :off
+  "Paths the current turn's tools want the model to see, newest first; :OFF
+   when nothing will deliver them (no agent loop, or the model takes no
+   pictures).")
+
+(defun show-image (path)
+  "Ask for PATH (an image file) to be shown to the model after this turn's
+   tool results.  True when it will be."
+  (unless (eq *tool-images* :off)
+    (push (namestring (truename path)) *tool-images*)
+    t))
 
 (defmacro define-tool (name (&key description schema) &body body)
   "Register a tool. ARGS is bound to a hash-table of the LLM's
@@ -324,7 +343,8 @@
     (:description "Read a file. Returns lines with cat -n line numbers.  OFFSET
 (1-based) and LIMIT slice a large file.  Output is bounded to MAX_CHARS: over the
 budget you get the head, the tail, and the size of the elided middle — Read that
-range with OFFSET/LIMIT (or Grep) to see it."
+range with OFFSET/LIMIT (or Grep) to see it.  An image file (png, jpg, gif,
+webp) is shown to you as a picture instead."
      :schema (llm:ht
               "type" "object"
               "properties" (llm:ht
@@ -348,6 +368,12 @@ range with OFFSET/LIMIT (or Grep) to see it."
        ;; A directory / device / fifo isn't line-readable and, for endless
        ;; devices, would OOM before the byte ceiling matters. Refuse fast.
        (format nil "Read: not a regular file: ~A" path))
+      ((llm:image-file-p path)
+       ;; A picture is looked at, not read as bytes.
+       (record-read path)
+       (if (show-image path)
+           (format nil "~A is an image (~:D bytes); it is shown to you after this turn's tool results." path (file-byte-size path))
+           (format nil "~A is an image (~:D bytes); pictures cannot be shown to you in this run." path (file-byte-size path))))
       (t
        (record-read path)
        (with-open-file (s path)
@@ -885,7 +911,8 @@ Describe what to show concretely: subject, setting, style (photograph, oil
 painting, flat illustration...), lighting, composition; quote any text the
 picture must contain exactly (\"a sign reading 'OPEN'\"). About 3 s at
 512x512, 10 s at 1024x1024. Returns the file's path and the seed; the same
-prompt and seed give the same picture. You do not see the picture."
+prompt and seed give the same picture. When this run can show you pictures,
+you see it after the tool results."
      :schema (llm:ht
               "type" "object"
               "properties" (llm:ht
@@ -922,8 +949,10 @@ prompt and seed give the same picture. You do not see the picture."
       (with-open-file (o path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
         (write-sequence (%base64-octets (gethash "b64_json" d)) o))
       (record-read path)
-      (format nil "Wrote ~A (~A PNG~@[, seed ~D~], ~,1F s)." path (or (gethash "size" reply) "") seed
-              (/ (- (get-internal-real-time) t0) internal-time-units-per-second))))))
+      (format nil "Wrote ~A (~A PNG~@[, seed ~D~], ~,1F s).~:[ You do not see the picture.~; It is shown to you after this turn's tool results: check it against what was asked (text spelled right, nothing missing), and try again -- a better prompt, or another seed -- if it falls short.~]"
+              path (or (gethash "size" reply) "") seed
+              (/ (- (get-internal-real-time) t0) internal-time-units-per-second)
+              (show-image path))))))
 
 (defparameter *notes-file*
   (merge-pathnames ".operandi/operandi-notes.md" (user-homedir-pathname))

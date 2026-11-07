@@ -176,6 +176,9 @@ always prompt text — `operandi tui` is a task whose text is "tui".
 | `--repl` | the interactive TUI, explicitly (`--tui` is an older name for it) |
 | `--help`, `-h` `[TOPIC]` | usage; `TOPIC` is one of `modes`, `backends`, `session`, `agent`, `env`, `files`, `diagnostics`, `all` |
 | `--model M` | model `M` on the configured backend (`config.json` `backend`: `ppq` or `openrouter`), so a harness need not know which this machine pays |
+| `--images URL\|ppq` | where the `Imagine` tool gets pictures: an OpenAI-compatible image server (`POST /v1/images/generations`, e.g. ex-nihilo's `bin/ex-nihilo` on `http://127.0.0.1:9940`), or `ppq` for PPQ's image models, paid from the PPQ account. Without it there is no `Imagine` |
+| `--image-model M` | the image model; on `ppq` any of its image models (default `qwen-image-3`) |
+| `--no-tool-images` | don't show the model pictures from tools. By default a picture `Imagine` makes or `Read` opens follows that turn's tool results, shrunk to 768 px, and the newest 4 stay in the conversation |
 | `--mcp-config FILE` | also read FILE's `mcpServers` (repeatable; after the default file) |
 | `--mcp NAME=CMD [ARGS…]` | an external stdio MCP server, quoted as one argument (repeatable) |
 | `--mcp NAME=https://URL` | an external Streamable HTTP MCP server |

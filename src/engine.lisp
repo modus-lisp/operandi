@@ -34,6 +34,7 @@
                     (#:sf    #:operandi.safefetch))
   (:export #:run
            #:preflight-model
+           #:*tool-images-p*
            #:*payment-required-hook* #:payment-required-p #:handle-payment-required
            #:*max-iterations*
            #:*wrapup-iterations*
@@ -1327,6 +1328,18 @@ another tool or give a final answer.")
         (search "insufficient balance" text :test #'char-equal)
         (search "Payment Required" text :test #'char-equal))))
 
+(defun credit-reserved-p (parsed)
+  "Is this PPQ's 402 for credit held by requests still settling (\"would exceed
+   your available credits given your current in-flight requests\")?  Not empty
+   credit: its reservation for a request grows with the request's size, and is
+   released a little after the request ends, so a big request (pictures) right
+   after another can be refused with money in the account.  Waiting fixes it;
+   a top-up does not."
+  (search "in-flight requests" (or (provider-error-text parsed) "") :test #'char-equal))
+
+(defvar *credit-reserved-waits* '(5 10 20 30 30)
+  "Seconds to wait before each retry of a request refused by CREDIT-RESERVED-P.")
+
 (defun handle-payment-required ()
   "Run the hook once for everyone who saw the 402 at the same time. True when
    the caller should retry."
@@ -1369,6 +1382,7 @@ another tool or give a final answer.")
    missing a usable message. Returns parsed body."
   (let ((attempt 0)
         (topups 0)
+        (waits *credit-reserved-waits*)
         (sleep *chat-retry-sleep*))
     (loop
       (let* ((parsed (handler-case (do-chat messages tools-vec)
@@ -1392,6 +1406,11 @@ another tool or give a final answer.")
         (cond
           ;; Success path: we got a usable message.
           ((and parsed msg) (return parsed))
+          ;; 402 with credit held by requests still settling: wait it out
+          ((and err waits (credit-reserved-p parsed))
+           (when verbose
+             (format t "~&[operandi] provider credit held by in-flight requests; retrying in ~Ds~%" (first waits)))
+           (sleep (pop waits)))
           ;; 402: pay (once, single-flight) and retry -- not a transient retry
           ((and err (payment-required-p parsed) (< topups 2) (handle-payment-required))
            (incf topups))
@@ -1462,6 +1481,51 @@ another tool or give a final answer.")
       (when (and (stringp r) (plusp (length r)))
         (setf (gethash "reasoning_content" h) r)))
     h))
+
+(defvar *tool-images-p* t
+  "Whether pictures a tool opens or makes (Read of an image, Imagine) are
+   shown to the model.  --no-tool-images for a model that takes none.")
+
+(defvar *tool-image-side* 768
+  "Longest side, in pixels, of a picture shown to the model from a tool.")
+
+(defvar *tool-images-kept* 4
+  "How many tool pictures stay in the conversation; older ones become their
+   paths, so a long run does not resend every picture it ever looked at.")
+
+(defparameter +tool-images-tag+ "[Pictures from the tool calls above"
+  "How a tool-pictures message begins; its pictures follow.")
+
+(defun tool-images-msg (paths)
+  "The user message showing PATHS (oldest first) to the model, or NIL when
+   none can be read."
+  (let ((parts (loop for p in paths
+                     for part = (ignore-errors (llm:image-part p :max-side *tool-image-side*))
+                     when part collect (llm:text-part (format nil "~%~A:" p)) and collect part)))
+    (when parts
+      (ht "role" "user"
+          "content" (coerce (cons (llm:text-part (format nil "~A, in order.]" +tool-images-tag+)) parts)
+                            'vector)))))
+
+(defun prune-tool-images (messages &optional (keep *tool-images-kept*))
+  "MESSAGES with all but the last KEEP tool pictures replaced by a note --
+   their paths stay, in the text parts beside them."
+  (let ((seen 0))
+    (nreverse
+     (loop for m in (reverse messages)
+           for c = (gethash "content" m)
+           collect (if (and (equal (gethash "role" m) "user") (vectorp c) (plusp (length c))
+                            (hash-table-p (aref c 0))
+                            (uiop:string-prefix-p +tool-images-tag+ (or (gethash "text" (aref c 0)) "")))
+                       (let ((parts (map 'vector (lambda (part)
+                                                   (if (equal (gethash "type" part) "image_url")
+                                                       (if (<= (incf seen) keep)
+                                                           part
+                                                           (llm:text-part " (picture no longer shown; Read the file to see it again)"))
+                                                       part))
+                                         (reverse c))))
+                         (ht "role" "user" "content" (reverse parts)))
+                       m)))))
 
 (defun tool-result-msg (tool-call-id content)
   (ht "role" "tool"
@@ -1711,6 +1775,7 @@ another tool or give a final answer.")
            ;; Execute every tool_call, append each result. If the budget
            ;; cap is hit, short-circuit with a synthetic result so the
            ;; model knows to stop searching and finalize.
+           (let ((tools:*tool-images* (if *tool-images-p* '() :off)))
            (loop for tc in tcs
                  for tcid = (gethash "id" tc)
                  for name = (tool-call-name tc)
@@ -1748,6 +1813,13 @@ another tool or give a final answer.")
                           (note-progress
                            (append messages
                                    (list (tool-result-msg tcid result))))))
+           ;; The pictures those calls opened or made, after all their results.
+           (let ((shown (and (consp tools:*tool-images*)
+                             (tool-images-msg (reverse (remove-duplicates tools:*tool-images* :test #'string=))))))
+             (when shown
+               (when verbose
+                 (format t "~&[operandi] showing the model ~D picture~:P~%" (llm:content-images (gethash "content" shown))))
+               (setf messages (prune-tool-images (append messages (list shown)))))))
            ;; Continue loop (compaction happens at the top of the next
            ;; iteration, before the next send).
            )

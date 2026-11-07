@@ -542,6 +542,14 @@
             "reasoning.effort. On llama.cpp anything but off/default turns Qwen-style"
             "thinking on. The compaction budget follows the backend (24k tokens on"
             "llama, 96k on OpenRouter) unless OPERANDI_CONTEXT_BUDGET is set.")
+           ("--images URL|ppq" "where the Imagine tool gets pictures: an OpenAI image server"
+            "(POST /v1/images/generations -- ex-nihilo's bin/ex-nihilo, http://127.0.0.1:9940),"
+            "or ppq: PPQ's image models, paid from the PPQ account. Without it there is no Imagine.")
+           ("--image-model M" "the image model: on ppq, any of its image models (default qwen-image-3;"
+            "flux-1-schnell is cheapest, gpt-image-2 and nano-banana-pro among the best)")
+           ("--no-tool-images" "don't show the model pictures from tools (Imagine's, Read of an image)"
+            "-- for a model that takes none. By default each follows its turn's tool results,"
+            "shrunk to 768 px, and the newest 4 stay in the conversation.")
            ("--tools A,B,C" "allow-list: exactly these tools")
            ("--no-tools X,Y" "the default tool set minus these")
            ("--mcp-config FILE" "also read FILE's mcpServers (repeatable)"
@@ -958,6 +966,20 @@
                         (sb-ext:exit :code 2))
                       (setf (symbol-value (find-symbol "*WORKER-MODEL*" "OPERANDI.SUBAGENT")) m
                             acc (cddr acc))))
+                   ;; --images URL|ppq, --image-model M: the Imagine tool's backend
+                   ((and acc (string= (first acc) "--images"))
+                    (multiple-value-bind (v ok) (tools:parse-images (second acc))
+                      (unless ok
+                        (format *error-output* "operandi: --images takes an http(s) URL of an image server, or ppq, not ~S~%" (second acc))
+                        (sb-ext:exit :code 2))
+                      (setf tools:*images* v acc (cddr acc))))
+                   ((and acc (string= (first acc) "--image-model"))
+                    (unless (and (second acc) (plusp (length (second acc))))
+                      (format *error-output* "operandi: --image-model takes a model id~%")
+                      (sb-ext:exit :code 2))
+                    (setf tools:*image-model* (second acc) acc (cddr acc)))
+                   ((and acc (string= (first acc) "--no-tool-images"))
+                    (setf eng:*tool-images-p* nil acc (rest acc)))
                    ((and acc (string= (first acc) "--effort"))
                     (multiple-value-bind (e ok) (llm:parse-effort (second acc))
                       (unless ok

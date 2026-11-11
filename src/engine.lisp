@@ -40,7 +40,7 @@
            #:*wrapup-iterations*
            #:*wrapup-grace*
            #:ended-at-cap-p
-           #:*max-empty-turns*
+           #:*max-empty-turns* #:+empty-turn-nudge+
            #:*prompt-cache*
            #:*stream*
            #:*on-token*
@@ -1560,17 +1560,29 @@ another tool or give a final answer.")
    so it's scoped to one run (single-threaded — tool calls run in sequence
    — hence no lock) and discarded when the run ends (no cross-run leak).")
 
+(defparameter +empty-turn-nudge+
+  "Your last message was empty. Either call a tool to make progress, or write your final answer now as plain text."
+  "What RUN says, as a user message, after an empty turn: a front end showing the
+   history leaves it out (it is the engine's, not the user's).")
+
 (defun last-substantive (messages)
-  "Best salvage when the model ends with only empty turns: the most
-   recent non-empty assistant text, else the most recent tool result."
-  (or (loop for m in (reverse messages)
-            when (and (string= (gethash "role" m) "assistant") (msg-text m))
-              return (msg-text m))
-      (loop for m in (reverse messages)
-            when (string= (gethash "role" m) "tool")
-              return (let ((c (gethash "content" m)))
-                       (when (and (stringp c) (plusp (length c)))
-                         (format nil "[no final summary from the model; last tool result follows]~%~A" c))))))
+  "Best salvage when the model ends with only empty turns: this turn's most
+   recent non-empty assistant text, else its most recent tool result.  This
+   turn: since the last user message that isn't a nudge (or a picture shown
+   after tool calls) -- an earlier turn's words are no answer to this one."
+  (let ((turn (loop for m in (reverse messages)
+                    until (and (string= (gethash "role" m) "user")
+                               (stringp (gethash "content" m))
+                               (string/= (gethash "content" m) +empty-turn-nudge+))
+                    collect m)))
+    (or (loop for m in turn
+              when (and (string= (gethash "role" m) "assistant") (msg-text m))
+                return (msg-text m))
+        (loop for m in turn
+              when (string= (gethash "role" m) "tool")
+                return (let ((c (gethash "content" m)))
+                         (when (and (stringp c) (plusp (length c)))
+                           (format nil "[no final summary from the model; last tool result follows]~%~A" c)))))))
 
 (defun ended-at-cap-p (history)
   "True if the run that produced HISTORY ended at its iteration cap: the last
@@ -1923,8 +1935,7 @@ another tool or give a final answer.")
                      empty-turns *max-empty-turns*))
            (setf messages
                  (append messages
-                         (list (ht "role" "user" "content"
-                                   "Your last message was empty. Either call a tool to make progress, or write your final answer now as plain text.")))))
+                         (list (ht "role" "user" "content" +empty-turn-nudge+)))))
           (t
            ;; Still empty after nudging — salvage the last real content
            ;; rather than returning "NULL"/"" as the answer.

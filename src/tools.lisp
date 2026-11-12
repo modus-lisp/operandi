@@ -927,8 +927,17 @@ of titles + URLs + short descriptions."
       (let ((w (parse-integer size :end x :junk-allowed t)) (h (parse-integer size :start (1+ x) :junk-allowed t)))
         (and w h (plusp w) (plusp h) (values w h))))))
 
-(defun %image-request (prompt size seed)
-  "(values url body headers) for one picture from *IMAGES*."
+(defun %image-source (path)
+  "The picture at PATH (made readable by the usual checks) as a data: URL."
+  (let* ((octets (with-open-file (i path :element-type '(unsigned-byte 8))
+                   (let ((v (make-array (file-length i) :element-type '(unsigned-byte 8)))) (read-sequence v i) v)))
+         (type (string-downcase (or (pathname-type (pathname path)) "png"))))
+    (format nil "data:image/~A;base64,~A" (if (equal type "jpg") "jpeg" type)
+            (cl-base64:usb8-array-to-base64-string octets))))
+
+(defun %image-request (prompt size seed &optional source strength)
+  "(values url body headers) for one picture from *IMAGES*; made from the
+   picture SOURCE (a data: URL) when given, STRENGTH how far it may change."
   (if (eq *images* :ppq)
       (let ((token (or (operandi.ppq:ppq-token) (error "Imagine: no PPQ account (~~/.operandi/ppq.token)")))
             (body (llm:ht "model" (or *image-model* *ppq-image-model*) "prompt" prompt
@@ -939,9 +948,14 @@ of titles + URLs + short descriptions."
           (when w (setf (gethash "size" body) (llm:ht "width" w "height" h)
                         (gethash "aspect_ratio" body) (%aspect-ratio w h))))
         (when seed (setf (gethash "seed" body) seed))
+        (when source (setf (gethash "image_url" body) source))   ; the models that take one: -edit, -i2i, kontext
         (values (format nil "~A/v1/images/generations" operandi.ppq:*ppq-base*) body
                 (list '("Content-Type" . "application/json") (cons "Authorization" (format nil "Bearer ~A" token)))))
-      (let ((body (llm:ht "prompt" prompt "size" (or size "1024x1024"))))
+      (let ((body (llm:ht "prompt" prompt)))
+        ;; with a source and no size, the source's shape
+        (when (or size (not source)) (setf (gethash "size" body) (or size "1024x1024")))
+        (when source (setf (gethash "image" body) source))
+        (when strength (setf (gethash "strength" body) strength))
         (when seed (setf (gethash "seed" body) seed))
         (when *image-model* (setf (gethash "model" body) *image-model*))
         (values (format nil "~A/v1/images/generations" *images*) body
@@ -981,7 +995,9 @@ of titles + URLs + short descriptions."
     (string-trim "-" (if (<= (length w) 40) w (subseq w 0 (or (position #\- w :end 41 :from-end t) 40))))))
 
 (define-tool "Imagine"
-    (:description "Generate a picture from a text prompt and save it to a file.
+    (:description "Generate a picture from a text prompt and save it to a file,
+or (with image) make one from an existing picture: restyle it, vary it, paint
+over it, the prompt describing the whole result.
 Describe what to show concretely: subject, setting, style (photograph, oil
 painting, flat illustration...), lighting, composition; quote any text the
 picture must contain exactly (\"a sign reading 'OPEN'\"). Returns the file's
@@ -996,13 +1012,21 @@ can show you pictures, you see it after the tool results."
                                            "description" "Where to save it (default generated/<prompt>[-<seed>].<ext>); the extension follows the format made.")
                             "size" (llm:ht "type" "string"
                                            "description" "WIDTHxHEIGHT (default 1024x1024). A model that takes only aspect ratios makes the nearest one; the result says what was made.")
-                            "seed" (llm:ht "type" "integer" "description" "Reproduce or vary a picture (default random)."))
+                            "seed" (llm:ht "type" "integer" "description" "Reproduce or vary a picture (default random).")
+                            "image" (llm:ht "type" "string"
+                                            "description" "A picture file (PNG, JPEG, WebP) to start from, e.g. one the user uploaded. Without size, the result takes its shape.")
+                            "strength" (llm:ht "type" "number"
+                                               "description" "With image: how much may change, 0..1 (default 0.8). Around 0.5 keeps it close (colours, details shift); 0.8 restyles and relights it, the composition kept; 0.9 keeps only the layout; 1 ignores it. A local image server's; PPQ's models edit as the prompt says and take none."))
               "required" (vector "prompt")))
   (block %imagine
   (unless *images* (error "no image backend: start operandi with --images URL or --images ppq"))
   (let ((prompt (gethash "prompt" args))
         (t0 (get-internal-real-time)))
-    (multiple-value-bind (url body headers) (%image-request prompt (gethash "size" args) (gethash "seed" args))
+    (multiple-value-bind (url body headers)
+        (let ((src (gethash "image" args)))
+          (when (and src (not (probe-file src))) (return-from %imagine (format nil "No picture at ~A." src)))
+          (%image-request prompt (gethash "size" args) (gethash "seed" args)
+                          (and src (%image-source src)) (and src (gethash "strength" args))))
       (let* ((reply (handler-case
                         (json:parse (operandi.http:post url :content (json:stringify body) :headers headers
                                                             :read-timeout 600))

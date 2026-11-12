@@ -1505,6 +1505,11 @@ another tool or give a final answer.")
 (defparameter +tool-images-tag+ "[Pictures from the tool calls above"
   "How a tool-pictures message begins; its pictures follow.")
 
+(defun tool-images-msg-p (content)
+  "Whether CONTENT (a user message's) is the pictures the engine shows after tool calls."
+  (and (vectorp content) (plusp (length content)) (hash-table-p (aref content 0))
+       (eql 0 (search +tool-images-tag+ (or (gethash "text" (aref content 0)) "")))))
+
 (defun tool-images-msg (paths)
   "The user message showing PATHS (oldest first) to the model, or NIL when
    none can be read."
@@ -1572,8 +1577,10 @@ another tool or give a final answer.")
    after tool calls) -- an earlier turn's words are no answer to this one."
   (let ((turn (loop for m in (reverse messages)
                     until (and (string= (gethash "role" m) "user")
-                               (stringp (gethash "content" m))
-                               (string/= (gethash "content" m) +empty-turn-nudge+))
+                               (let ((c (gethash "content" m)))
+                                 (if (stringp c)
+                                     (string/= c +empty-turn-nudge+)
+                                     (not (tool-images-msg-p c)))))   ; a user's message with a picture is one
                     collect m)))
     (or (loop for m in turn
               when (and (string= (gethash "role" m) "assistant") (msg-text m))

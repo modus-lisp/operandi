@@ -996,8 +996,9 @@ of titles + URLs + short descriptions."
 
 (define-tool "Imagine"
     (:description "Generate a picture from a text prompt and save it to a file,
-or (with image) make one from an existing picture: restyle it, vary it, paint
-over it, the prompt describing the whole result.
+or (with image) edit an existing picture: the prompt says what to change
+(\"make the car red\", \"put a hat on the dog\", \"turn it into a watercolor\"),
+and the rest of the picture is kept.
 Describe what to show concretely: subject, setting, style (photograph, oil
 painting, flat illustration...), lighting, composition; quote any text the
 picture must contain exactly (\"a sign reading 'OPEN'\"). Returns the file's
@@ -1014,9 +1015,9 @@ can show you pictures, you see it after the tool results."
                                            "description" "WIDTHxHEIGHT (default 1024x1024). A model that takes only aspect ratios makes the nearest one; the result says what was made.")
                             "seed" (llm:ht "type" "integer" "description" "Reproduce or vary a picture (default random).")
                             "image" (llm:ht "type" "string"
-                                            "description" "A picture file (PNG, JPEG, WebP) to start from, e.g. one the user uploaded. Without size, the result takes its shape.")
+                                            "description" "A picture file (PNG, JPEG, WebP) to edit, e.g. one the user uploaded. Without size, the result takes its shape.")
                             "strength" (llm:ht "type" "number"
-                                               "description" "With image: how much may change, 0..1 (default 0.8). Around 0.5 keeps it close (colours, details shift); 0.8 restyles and relights it, the composition kept; 0.9 keeps only the layout; 1 ignores it. A local image server's; PPQ's models edit as the prompt says and take none."))
+                                               "description" "Usually leave out: without it the picture is edited as the prompt says. With it (0..1), the picture is instead repainted from a noised copy, the prompt describing the whole result: 0.5 keeps it close, 0.8 restyles and relights it, 0.9 keeps only the layout. A local image server's only."))
               "required" (vector "prompt")))
   (block %imagine
   (unless *images* (error "no image backend: start operandi with --images URL or --images ppq"))

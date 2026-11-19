@@ -23,7 +23,7 @@
   (require :asdf)
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:json-simple :cl-ppcre :quri :uiop) :silent t))
+  #+quicklisp (ql:quickload '(:json-simple :cl-ppcre :uiop) :silent t))
 
 (defpackage #:operandi.safefetch
   (:use #:cl)
@@ -286,10 +286,29 @@ remove. No prose. If nothing qualifies, output []")
 (defstruct (fetch-host (:conc-name fh-)) last (run 1) (count 0))
 
 (defun %url-parts (url)
-  (handler-case
-      (let ((u (quri:uri url)))
-        (values (quri:uri-host u) (or (quri:uri-path u) "/") (quri:uri-query u)))
-    (error () (values nil nil nil))))
+  "URL's host, path (\"/\" when it has none) and query (NIL when none) -- scheme://[user@]host[:port]/path?query#frag.
+   NIL for all three when it has no host.  (What quri was here for.)"
+  (let* ((s (or (and (stringp url) url) ""))
+         (frag (position #\# s))
+         (s (if frag (subseq s 0 frag) s))
+         (sep (search "://" s)))
+    (if (null sep)
+        (values nil nil nil)
+        (let* ((rest (subseq s (+ sep 3)))
+               (end (or (position-if (lambda (c) (member c '(#\/ #\?))) rest) (length rest)))
+               (authority (subseq rest 0 end))
+               (after (subseq rest end))
+               (hostport (subseq authority (1+ (or (position #\@ authority :from-end t) -1))))
+               ;; an IPv6 literal keeps its brackets, as quri gave it (the address checks expect them)
+               (host (if (and (plusp (length hostport)) (char= (char hostport 0) #\[))
+                         (subseq hostport 0 (1+ (or (position #\] hostport) (1- (length hostport)))))
+                         (subseq hostport 0 (or (position #\: hostport) (length hostport)))))
+               (q (position #\? after))
+               (path (subseq after 0 (or q (length after))))
+               (query (and q (subseq after (1+ q)))))
+          (if (zerop (length host))
+              (values nil nil nil)
+              (values host (if (plusp (length path)) path "/") query))))))
 
 (defun %query-keys (query)
   (when (stringp query)

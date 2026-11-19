@@ -116,7 +116,7 @@
 
 (defun %octets (x)
   (etypecase x
-    (string (babel:string-to-octets x :encoding :utf-8))
+    (string (http:utf8-octets x))
     ((vector (unsigned-byte 8)) x)))
 
 (defun %hex (v)
@@ -186,6 +186,14 @@
 ;;; every model including the private/* ones.  The table is fetched once and
 ;;; cached; a lookup miss returns NIL and the caller keeps the provider's 0.
 
+(defun %publish (x)
+  "X as a value a global can hold whichever thread computed it.  On modus a worker's own objects cannot be
+   stored where other threads reach them (threads share no state), so the GUI's chat worker -- which makes
+   the requests, and so fills these caches -- would have the store refused: it is copied into shared memory
+   first.  Elsewhere, X."
+  #+modus (modus:share x)
+  #-modus x)
+
 (defvar *ppq-pricing* nil
   "Alist of (MODEL-ID . PLIST) from PPQ's catalogue, or NIL if never fetched.
    PLIST keys: :in :out :cache-read :cache-write (USD per 1M tokens).")
@@ -214,7 +222,7 @@
                                                   :cache-read (rate "cache_read_per_1M_tokens")
                                                   :cache-write (rate "cache_write_per_1M_tokens")))
                                    acc))))))
-          (setf *ppq-pricing* acc))
+          (setf *ppq-pricing* (%publish acc)))
       (error () nil)))
   *ppq-pricing*)
 
@@ -300,7 +308,7 @@
     (coerce body '(vector (unsigned-byte 8)))))
 
 (defun %get-json (url)
-  (json:parse (babel:octets-to-string (%get-octets url) :encoding :utf-8)))
+  (json:parse (http:utf8-string (%get-octets url))))
 
 (defun %post-json (url body)
   "POST BODY (a JSON string) to URL and parse the JSON answer.  Used for the
@@ -367,8 +375,8 @@
                       "HPKE key ~a is not report_data[32:64] (~a) — the relay is serving a key the enclave did not attest"
                       (%hex hpke) (%hex (subseq rd 32 64)))))
           (setf *attestation-cache*
-                (list :key key :hpke hpke :checks checks :bundle bundle
-                      :at (get-universal-time)))
+                (%publish (list :key key :hpke hpke :checks checks :bundle bundle
+                                :at (get-universal-time))))
           (values hpke checks bundle))))))
 
 (defun attestation-status (&key (base *ppq-private-base*) attestation-url force)

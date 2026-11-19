@@ -22,14 +22,15 @@
 ;;;;     cut off, only one that goes silent.
 ;;;;
 ;;;; Text is decoded as UTF-8 leniently (a bad byte becomes a replacement character rather than an
-;;;; error), with babel, which is portable, rather than an implementation's own octet functions.
+;;;; error), by the UTF-8 code below -- portable, and not an implementation's own octet functions.
 
 (defpackage #:operandi.http
   (:use #:cl)
   (:shadow #:get)
   (:export #:get #:post #:request
            #:http-request-failed #:response-status #:response-body #:response-url
-           #:response-headers))
+           #:response-headers
+           #:utf8-octets #:utf8-string #:base64-string))
 
 (in-package #:operandi.http)
 
@@ -48,15 +49,77 @@
   "How much of a FAILED streamed response is read into the condition.  Error bodies are small;
    the cap only matters if a server answers a stream with a failure and then keeps talking.")
 
+;;; UTF-8, both ways, in plain Lisp.  All operandi ever asked of babel: its dozens of other encodings were
+;;; the slowest thing in the build on a Lisp that compiles them from source (modus).
+
+(defun utf8-octets (string)
+  "STRING as UTF-8 octets."
+  (let ((out (make-array (length string) :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+    (flet ((put (b) (vector-push-extend b out)))
+      (loop for ch across string
+            for c = (char-code ch)
+            do (cond ((< c #x80) (put c))
+                     ((< c #x800) (put (logior #xc0 (ash c -6))) (put (logior #x80 (logand c #x3f))))
+                     ((< c #x10000) (put (logior #xe0 (ash c -12))) (put (logior #x80 (logand (ash c -6) #x3f)))
+                      (put (logior #x80 (logand c #x3f))))
+                     (t (put (logior #xf0 (ash c -18))) (put (logior #x80 (logand (ash c -12) #x3f)))
+                        (put (logior #x80 (logand (ash c -6) #x3f))) (put (logior #x80 (logand c #x3f)))))))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
+(defun utf8-string (octets &key (start 0) (end (length octets)))
+  "OCTETS[START,END) as text; a malformed sequence reads as U+FFFD (as babel's :errorp nil had it).
+   Into one string the size of the octets (text is never longer than its UTF-8), cut to length at
+   the end: a string-output stream a character at a time made a megabyte (a picture's base64 in
+   JSON) never finish on a modus worker."
+  (let ((out (make-string (max 0 (- end start)))) (j 0) (i start))
+    (flet ((emit (code) (setf (char out j) (or (ignore-errors (code-char code)) (code-char #xfffd))) (incf j)))
+      (loop while (< i end)
+            do (let* ((b (aref octets i))
+                      (len (cond ((< b #x80) 1) ((= (logand b #xe0) #xc0) 2) ((= (logand b #xf0) #xe0) 3)
+                                 ((= (logand b #xf8) #xf0) 4) (t 0))))
+                 (if (or (zerop len) (> (+ i len) end)
+                         (loop for k from 1 below len thereis (/= (logand (aref octets (+ i k)) #xc0) #x80)))
+                     ;; one replacement for the longest broken start -- a lead byte and the continuation
+                     ;; bytes it did get -- as babel (and the WHATWG decoder) have it
+                     (progn (emit #xfffd)
+                            (incf i)
+                            (when (plusp len)
+                              (loop repeat (1- len)
+                                    while (and (< i end) (= (logand (aref octets i) #xc0) #x80))
+                                    do (incf i))))
+                     (let ((c (if (= len 1) b (logand b (ash #xff (- (1+ len)))))))
+                       (loop for k from 1 below len do (setf c (logior (ash c 6) (logand (aref octets (+ i k)) #x3f))))
+                       ;; NOT A CHARACTER, though well-formed: an overlong form (C0 AF is "/" -- the old way past
+                       ;; a path check), a UTF-16 surrogate, or past U+10FFFF.  One replacement, as babel has it.
+                       (when (or (< c (case len (1 0) (2 #x80) (3 #x800) (t #x10000)))
+                                 (<= #xd800 c #xdfff) (> c #x10ffff))
+                         (setf c #xfffd))
+                       (emit c)
+                       (incf i len))))))
+    (if (= j (length out)) out (subseq out 0 j))))
+
+(defun base64-string (octets)
+  "OCTETS in base64 (RFC 4648, padded): what cl-base64 was here for."
+  (let ((alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+        (n (length octets)))
+    (with-output-to-string (o)
+      (loop for i from 0 below n by 3
+            do (let* ((b0 (aref octets i))
+                      (b1 (if (< (+ i 1) n) (aref octets (+ i 1)) 0))
+                      (b2 (if (< (+ i 2) n) (aref octets (+ i 2)) 0))
+                      (w (logior (ash b0 16) (ash b1 8) b2)))
+                 (write-char (char alphabet (ldb (byte 6 18) w)) o)
+                 (write-char (char alphabet (ldb (byte 6 12) w)) o)
+                 (write-char (if (< (+ i 1) n) (char alphabet (ldb (byte 6 6) w)) #\=) o)
+                 (write-char (if (< (+ i 2) n) (char alphabet (ldb (byte 6 0) w)) #\=) o))))))
+
 (defun %octets (x)
   (etypecase x
     (null nil)
-    (string (babel:string-to-octets x :encoding :utf-8))
+    (string (utf8-octets x))
     ((vector (unsigned-byte 8)) x)))
 
-(defun %text (octets)
-  (babel:octets-to-string (coerce octets '(simple-array (unsigned-byte 8) (*)))
-                          :encoding :utf-8 :errorp nil))
+(defun %text (octets) (utf8-string octets))
 
 (defun %drain (stream cap)
   "Up to CAP characters of STREAM as a string, then close it."

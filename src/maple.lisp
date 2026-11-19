@@ -131,6 +131,12 @@
 (defstruct (session (:conc-name sess-)) id key pcrs)
 
 (defvar *session* nil "The current enclave session, or NIL.")
+
+(defun %publish (x)
+  "X as a value a global can hold whichever thread made it: on modus a copy in shared memory (a worker's own
+   objects cannot be stored where other threads reach them -- see OPERANDI.PPQ::%PUBLISH)."
+  #+modus (modus:share x)
+  #-modus x)
 (defvar *session-lock* (bt:make-lock "maple-session"))
 (defvar *checked-pcrs* nil "The image *ON-NEW-ENCLAVE* last accepted.")
 
@@ -143,8 +149,8 @@
   (bt:with-lock-held (*session-lock*) (setf *session* nil)))
 
 (defun %u8 (x) (coerce x '(simple-array (unsigned-byte 8) (*))))
-(defun %utf8 (s) (%u8 (babel:string-to-octets s :encoding :utf-8)))
-(defun %str (o) (babel:octets-to-string (%u8 o) :encoding :utf-8))
+(defun %utf8 (s) (%u8 (http:utf8-octets s)))
+(defun %str (o) (http:utf8-string (%u8 o)))
 (defun %hex (o) (string-downcase (snp:hex-string o)))
 (defun %ht (&rest kv)
   (let ((h (make-hash-table :test 'equal)))
@@ -211,16 +217,16 @@
 
 (defun %session (&key (base *enclave-base*))
   (let ((s (bt:with-lock-held (*session-lock*)
-             (or *session* (setf *session* (%handshake :base base))))))
+             (or *session* (setf *session* (%publish (%handshake :base base)))))))
     (unless (equal (sess-pcrs s) *checked-pcrs*)
       (when *on-new-enclave* (funcall *on-new-enclave*))
-      (setf *checked-pcrs* (sess-pcrs s)))
+      (setf *checked-pcrs* (%publish (sess-pcrs s))))
     s))
 
 (defun live-pcrs ()
   "PCR0, PCR1, PCR2 of the enclave, attesting it if there is no session yet."
   (sess-pcrs (bt:with-lock-held (*session-lock*)
-               (or *session* (setf *session* (%handshake))))))
+               (or *session* (setf *session* (%publish (%handshake)))))))
 
 (defun enclave-post (url body headers &key (base *enclave-base*) (read-timeout 300))
   "POST BODY (a chat-completions JSON string) to URL through the enclave session and

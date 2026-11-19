@@ -28,7 +28,7 @@
            #:*llm-auth-token* #:*llm-model* #:*llm-backend*
            #:*llm-effort* #:parse-effort #:apply-reasoning
            #:llm-chat #:ht #:extract-json
-           #:image-part #:text-part #:user-content #:content-text #:content-images
+           #:image-part #:*image-shrinker* #:text-part #:user-content #:content-text #:content-images
            #:image-file-p
            #:*llama-url* #:llama-chat-url #:llama-ask-model #:llama-resolve-model
            #:local-model-label
@@ -115,20 +115,31 @@
                   (setf (aref out o) (round r n) (aref out (+ o 1)) (round g n) (aref out (+ o 2)) (round b n)))))))
         (values (png-pure:encode-png out nw nh :channels 3) nw nh)))))
 
+(defvar *image-shrinker* nil
+  "NIL, or (lambda (path max-side)) -> (values octets mime) for PATH no larger than MAX-SIDE pixels,
+   or NIL to fall back to SHRINK-IMAGE.  A host with a native image library sets it: a phone, where
+   decoding a 1024-pixel picture in Lisp takes more heap than the agent's worker thread has, so the
+   picture must never be read into it whole.")
+
 (defun image-part (path &key max-side)
   "An image_url content part carrying PATH's bytes as a data: URL -- shrunk
    to MAX-SIDE pixels on its longer side first, when given and larger."
   (let* ((mime (or (image-file-p path)
                    (error "not an image file (png/jpg/gif/webp): ~A" path)))
-         (bytes (with-open-file (in path :element-type '(unsigned-byte 8))
-                  (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
-                    (read-sequence v in)
-                    v)))
-         (small (and max-side (shrink-image bytes max-side))))
+         (native (and *image-shrinker* max-side
+                      (multiple-value-list (funcall *image-shrinker* path max-side))))
+         (bytes (if (first native)
+                    (first native)
+                    (with-open-file (in path :element-type '(unsigned-byte 8))
+                      (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
+                        (read-sequence v in)
+                        v))))
+         (small (and max-side (not (first native)) (shrink-image bytes max-side))))
+    (when (first native) (setf mime (or (second native) "image/jpeg")))
     (when small (setf bytes small mime "image/png"))
     (ht "type" "image_url"
         "image_url" (ht "url" (format nil "data:~A;base64,~A" mime
-                                      (cl-base64:usb8-array-to-base64-string bytes))))))
+                                      (http:base64-string bytes))))))
 
 (defun user-content (text &optional image-paths)
   "TEXT alone stays a plain string; with IMAGE-PATHS it becomes a parts
@@ -690,14 +701,17 @@ call with :want-stream nil"))
             (values (- total usage) total usage))
         (error () nil)))))
 
-(defun set-backend-openrouter! (&key (model "minimax/minimax-m2.7")
+;;; Every SET-BACKEND-*! below takes its key as TOKEN, when the caller has it (a phone's keychain: the
+;;; GUI's settings panel), and otherwise reads TOKEN-FILE, as the CLI always has.
+
+(defun set-backend-openrouter! (&key token (model "minimax/minimax-m2.7")
                             (token-file (merge-pathnames
                                          ".operandi/openrouter.token"
                                          (user-homedir-pathname))))
   "Switch the LLM client to OpenRouter. Reads the bearer token from
    TOKEN-FILE (default ~/.operandi/openrouter.token, mode 600).
    Returns T on success, NIL if the token file is missing or empty."
-  (let ((token (read-token-file token-file)))
+  (let ((token (or token (read-token-file token-file))))
     (cond
       ((or (null token) (zerop (length token)))
        (format *error-output*
@@ -734,7 +748,7 @@ call with :want-stream nil"))
                 u)))
     (format nil "~A/v1/chat/completions" u)))
 
-(defun set-backend-routstr! (&key (model "gemini-3-6-flash")
+(defun set-backend-routstr! (&key token (model "gemini-3-6-flash")
                              confidential
                              (url *routstr-url*)
                              (token-file (merge-pathnames
@@ -750,7 +764,7 @@ call with :want-stream nil"))
    sent.  The node relays the sealed body blind.  Any other model is an ordinary
    plaintext request to the node, which --confidential accepts only with
    --trust=routstr."
-  (let ((token (read-token-file token-file))
+  (let ((token (or token (read-token-file token-file)))
         ;; --confidential may have been given BEFORE --routstr, so the session flag
         ;; wins over the keyword: choosing a backend must not silently drop the claim.
         (conf (or confidential *confidential*)))
@@ -817,7 +831,7 @@ call with :want-stream nil"))
                  url))
         (t nil)))
 
-(defun set-backend-maple! (&key (model "gpt-oss-120b")
+(defun set-backend-maple! (&key token (model "gpt-oss-120b")
                                 url
                                 (token-file *maple-token-file*))
   "Switch the LLM client to Maple.  Returns T on success, NIL (after saying why) when
@@ -832,7 +846,7 @@ call with :want-stream nil"))
    With URL, go through a maple-proxy there.  The token is optional and the path is
    not verified by operandi, so --confidential refuses it whatever --trust says.  A
    non-loopback http:// URL is refused for the reason in MAPLE-REFUSAL."
-  (let ((token (read-token-file token-file)))
+  (let ((token (or token (read-token-file token-file))))
     (cond
       ((null url)
        (cond
@@ -871,7 +885,7 @@ call with :want-stream nil"))
              *sealed-post*    nil)
        t))))
 
-(defun set-backend-tinfoil! (&key (model "gpt-oss-120b")
+(defun set-backend-tinfoil! (&key token (model "gpt-oss-120b")
                                   (base operandi.ppq:*tinfoil-base*)
                                   (attestation-url operandi.ppq:*tinfoil-attestation-url*)
                                   (token-file operandi.ppq:*tinfoil-token-file*))
@@ -884,7 +898,7 @@ call with :want-stream nil"))
    parsed.  MODEL is a bare Tinfoil id (gpt-oss-120b, glm-5-3, kimi-k3, …).
 
    Returns T on success, NIL if the token file is missing or empty."
-  (let ((token (read-token-file token-file)))
+  (let ((token (or token (read-token-file token-file))))
     (cond
       ((or (null token) (zerop (length token)))
        (format *error-output* "~&set-backend-tinfoil!: token file ~A missing or empty~%"
@@ -905,7 +919,7 @@ call with :want-stream nil"))
                                  :attestation-url attestation-url)))
        t))))
 
-(defun set-backend-ppq! (&key (model "private/gpt-oss-120b")
+(defun set-backend-ppq! (&key token (model "private/gpt-oss-120b")
                               confidential
                               (base operandi.ppq:*ppq-base*)
                               (private-base operandi.ppq:*ppq-private-base*)
@@ -923,7 +937,7 @@ call with :want-stream nil"))
    misconfiguration fails at startup instead of silently sending plaintext.
 
    Returns T on success, NIL if the token file is missing or empty."
-  (let ((token (read-token-file token-file))
+  (let ((token (or token (read-token-file token-file)))
         ;; --confidential may have been given BEFORE --ppq (the natural order
         ;; is `--confidential --ppq private/x`), so the session flag wins over
         ;; the keyword: once confidential mode is on, choosing a backend must
@@ -1180,6 +1194,19 @@ call with :want-stream nil"))
 (defvar *illatio-engines* (make-hash-table :test 'equal)
   "Loaded in-image models: GGUF path -> illatio engine.")
 
+;;; ILLATIO IS NOT A DEPENDENCY.  It is the largest thing operandi could load and only --illatio uses it, so it
+;;; is reached by name: loaded on first use where ASDF can find it (the desktop launcher bakes it into its
+;;; core), and absent -- with a sentence saying so -- where it is not (a phone, which has no model to run).
+(defun %ill (name)
+  "illatio's function NAME, loading illatio/openai first if it can be found and is not loaded yet."
+  (unless (find-package "ILLATIO")
+    (when (asdf:find-system "illatio/openai" nil)
+      (asdf:load-system "illatio/openai")))
+  (let ((s (and (find-package "ILLATIO") (find-symbol name "ILLATIO"))))
+    (if (and s (fboundp s))
+        (symbol-function s)
+        (error "illatio is not in this image: the in-image backend (--illatio) needs it"))))
+
 (defun in-image-p (&optional (url *llm-url*))
   "True when URL names a model in this image (illatio:PATH)."
   (and (stringp url) (uiop:string-prefix-p "illatio:" url)))
@@ -1190,12 +1217,12 @@ call with :want-stream nil"))
 
 (defun in-image-post (url body)
   "The response body CHAT-COMPLETION gives for request BODY (a JSON string)."
-  (json:stringify (illatio:chat-completion (%illatio-engine url) (json:parse body))))
+  (json:stringify (funcall (%ill "CHAT-COMPLETION") (%illatio-engine url) (json:parse body))))
 
 (defun in-image-chunks (body on-chunk &optional (url *llm-url*))
   "Stream request BODY (a hash table) from the in-image model: ON-CHUNK gets
    each chat.completion.chunk object, exactly what an SSE event would parse to."
-  (illatio:chat-completion-chunks (%illatio-engine url)
+  (funcall (%ill "CHAT-COMPLETION-CHUNKS") (%illatio-engine url)
                                    (json:parse (json:stringify body))
                                    on-chunk))
 
@@ -1207,7 +1234,7 @@ call with :want-stream nil"))
 
 (defun illatio-context-length (&optional (url *llm-url*))
   (and (in-image-p url)
-       (illatio:context-n-ctx (illatio:engine-context (%illatio-engine url)))))
+       (funcall (%ill "CONTEXT-N-CTX") (funcall (%ill "ENGINE-CONTEXT") (%illatio-engine url)))))
 
 (defun set-backend-illatio! (&key (path (default-illatio-model)) (n-ctx 32768))
   "Load the GGUF model at PATH into this image (once per path) and send every
@@ -1216,14 +1243,14 @@ call with :want-stream nil"))
   (let* ((path (namestring (or (probe-file path)
                                (error "no model at ~A (set ILLATIO_MODEL, or pass --illatio PATH)" path))))
          (engine (or (gethash path *illatio-engines*)
-                     (let ((m (illatio:load-model path)))
+                     (let ((m (funcall (%ill "LOAD-MODEL") path)))
                        (setf (gethash path *illatio-engines*)
-                             (illatio:make-engine
-                              m :n-ctx (min n-ctx (illatio:model-context-length m))))))))
+                             (funcall (%ill "MAKE-ENGINE")
+                                      m :n-ctx (min n-ctx (funcall (%ill "MODEL-CONTEXT-LENGTH") m))))))))
     (setf *llm-backend*      :illatio
           *llm-url*          (concatenate 'string "illatio:" path)
           *llm-auth-token*   nil
-          *llm-model*        (illatio:model-name (illatio:engine-model engine))
+          *llm-model*        (funcall (%ill "MODEL-NAME") (funcall (%ill "ENGINE-MODEL") engine))
           *llm-read-timeout* 600
           *sealed-post*      nil))
   t)

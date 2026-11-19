@@ -726,7 +726,7 @@ start may outlive you: kill every background process before you report."
          (scratch (%make-scratch-dir))
          (context (format nil "~@[~A~%~%~]~A" context (scratch-rules scratch)))
          (before (%untracked-files))
-         (project (namestring (uiop:getcwd)))
+         (project (namestring (operandi.env:cwd)))
          (commit (%git-head))
          ;; one deadline for the whole swarm, across every batch
          (deadline (+ (get-universal-time) *swarm-deadline*)))
@@ -893,7 +893,7 @@ where a question has two sides, state both sides as separate claims.
 Between 3 and ~D hypotheses.
 
 Reply with ONLY a JSON array of strings, one hypothesis each."
-                         (namestring (uiop:getcwd)) question
+                         (namestring (operandi.env:cwd)) question
                          (and prior (plusp (length prior)) prior)
                          *ask-max-hypotheses*))
          (reply (handler-case (llm:llm-chat prompt :max-tokens 3000 :effort :low)
@@ -956,7 +956,7 @@ high confidence — that work is done."
    returns), answer (NULL unless SYNTHESIZE), timed_out, debris and usage.
    HYPOTHESES given = settle exactly those; NIL = elicit rivals first.
    Signals an ERROR when there is nothing to settle."
-  (let* ((project (namestring (uiop:getcwd)))
+  (let* ((project (namestring (operandi.env:cwd)))
          (commit (%git-head))
          (prior-records (project-findings project))
          (prior (and prior-records (findings-brief prior-records)))

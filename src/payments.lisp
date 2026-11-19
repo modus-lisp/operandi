@@ -18,7 +18,7 @@
            ;; PPQ (ppq.ai) Lightning top-up -- same shape, different endpoint.
            #:create-ppq-topup #:ppq-topup-status #:request-ppq-payment
            #:ppq-token #:*ppq-api* #:*ppq-token-file*
-           #:ppq-create-account #:ppq-balance #:*ppq-credit-id-file* #:ppq-account-p))
+           #:ppq-create-account #:ppq-new-account #:ppq-balance #:*ppq-credit-id-file* #:ppq-account-p))
 
 (in-package #:operandi.payments)
 
@@ -55,8 +55,9 @@
                (with-open-file (s *ppq-token-file*)
                  (or (read-line s nil nil) ""))))
 
-(defun %ppq-auth ()
-  (list (cons "Authorization" (format nil "Bearer ~A" (ppq-token)))))
+(defun %ppq-auth (&optional token)
+  "The Authorization header: TOKEN when the caller has the key (a phone's keychain), else the key file's."
+  (list (cons "Authorization" (format nil "Bearer ~A" (or token (ppq-token))))))
 
 (defparameter *ppq-credit-id-file*
   (merge-pathnames ".operandi/ppq.credit_id" (user-homedir-pathname))
@@ -73,16 +74,9 @@
     (write-line text o))
   #+sbcl (ignore-errors (funcall (find-symbol "CHMOD" "SB-POSIX") (namestring path) #o600)))
 
-(defun ppq-create-account ()
-  "Create a PPQ account (POST /accounts/create needs no credentials) and store
-   its API key in *PPQ-TOKEN-FILE* and credit id in *PPQ-CREDIT-ID-FILE*.
-   Refuses when a key is already there: a second account would split the
-   balance, and the old key would be lost. Returns (values credit-id api-key)."
-  (when (ppq-account-p)
-    (error 'payment-error :message
-           (format nil "a PPQ key already exists in ~A; not creating another account"
-                   (namestring *ppq-token-file*))))
-  #+sbcl (ignore-errors (require :sb-posix))
+(defun ppq-new-account ()
+  "Create a PPQ account (POST /accounts/create needs no credentials) and return (values API-KEY CREDIT-ID),
+   storing nothing: the caller keeps them (PPQ-CREATE-ACCOUNT in files; a phone in its keychain)."
   (let* ((text (http:post (format nil "~A/accounts/create" *ppq-api*)
                           :content "{}" :headers '(("Content-Type" . "application/json"))
                           :read-timeout 25))
@@ -91,23 +85,37 @@
          (cid (gethash "credit_id" j)))
     (unless (and (stringp key) (plusp (length key)))
       (error 'payment-error :message (format nil "PPQ account creation returned no api_key: ~A" text)))
+    (values key (and (stringp cid) cid))))
+
+(defun ppq-create-account ()
+  "Create a PPQ account and store its API key in *PPQ-TOKEN-FILE* and credit id in *PPQ-CREDIT-ID-FILE*.
+   Refuses when a key is already there: a second account would split the balance, and the old key would be
+   lost. Returns (values credit-id api-key)."
+  (when (ppq-account-p)
+    (error 'payment-error :message
+           (format nil "a PPQ key already exists in ~A; not creating another account"
+                   (namestring *ppq-token-file*))))
+  #+sbcl (ignore-errors (require :sb-posix))
+  (multiple-value-bind (key cid) (ppq-new-account)
     (%write-secret *ppq-token-file* key)
-    (when (stringp cid) (%write-secret *ppq-credit-id-file* cid))
+    (when cid (%write-secret *ppq-credit-id-file* cid))
     (values cid key)))
 
-(defun ppq-balance ()
-  "The account balance as PPQ reports it (a hash table), or NIL without a
-   credit id."
-  (when (probe-file *ppq-credit-id-file*)
-    (let* ((cid (string-trim '(#\Space #\Tab #\Newline #\Return)
-                             (with-open-file (s *ppq-credit-id-file*) (or (read-line s nil nil) ""))))
-           (h (make-hash-table :test 'equal)))
-      (setf (gethash "credit_id" h) cid)
-      (%parse (http:post (format nil "~A/credits/balance" *ppq-api*)
-                         :content (%json-body h) :headers '(("Content-Type" . "application/json"))
-                         :read-timeout 20)))))
+(defun ppq-balance (&key credit-id)
+  "The account balance as PPQ reports it (a hash table), or NIL without a credit id.  CREDIT-ID when the
+   caller has it, else *PPQ-CREDIT-ID-FILE*'s."
+  (let ((cid (or credit-id
+                 (and (probe-file *ppq-credit-id-file*)
+                      (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                   (with-open-file (s *ppq-credit-id-file*) (or (read-line s nil nil) "")))))))
+    (when (and cid (plusp (length cid)))
+      (let ((h (make-hash-table :test 'equal)))
+        (setf (gethash "credit_id" h) cid)
+        (%parse (http:post (format nil "~A/credits/balance" *ppq-api*)
+                           :content (%json-body h) :headers '(("Content-Type" . "application/json"))
+                           :read-timeout 20))))))
 
-(defun create-ppq-topup (amount &key (unit :sats))
+(defun create-ppq-topup (amount &key (unit :sats) token)
   "Create a PPQ Lightning top-up invoice for AMOUNT in base units: UNIT :sats
    (100..1,000,000) or :cents (USD cents). Integers only -- no decimal amounts
    anywhere; cents become PPQ's USD at the wire. Returns a plist: :invoice-id
@@ -129,7 +137,7 @@
     (let* ((text (http:post (format nil "~A/topup/create/btc-lightning" *ppq-api*)
                             :content (%json-body h)
                             :headers (cons (cons "Content-Type" "application/json")
-                                           (%ppq-auth))
+                                           (%ppq-auth token))
                             :read-timeout 25))
            (j (%parse text)))
       (unless (gethash "lightning_invoice" j)
@@ -140,10 +148,10 @@
             :expires-at (gethash "expires_at" j)
             :checkout-url (gethash "checkout_url" j))))))
 
-(defun ppq-topup-status (invoice-id)
+(defun ppq-topup-status (invoice-id &key token)
   "Status plist for a PPQ top-up: :status (\"paid\"/...), :raw."
   (let* ((text (http:get (format nil "~A/topup/status/~A" *ppq-api* invoice-id)
-                         :headers (%ppq-auth)
+                         :headers (%ppq-auth token)
                          :read-timeout 20))
          (j (ignore-errors (%parse text))))
     (list :status (and (hash-table-p j)
@@ -269,9 +277,9 @@
 
 (defun %qr-matrix (text)
   "2-D 1/0 array of the QR symbol for TEXT (no quiet zone), ECC level M."
-  (funcall (symbol-function (find-symbol "ENCODE->MATRIX"
-                                         (find-package "MARE5X.LISPQR.ENCODE")))
-           text :ec-level :m))
+  (let ((pkg (find-package "MARE5X.LISPQR.ENCODE")))
+    (unless pkg (error "a QR code needs lispqr, which is not loaded in this image"))
+    (funcall (symbol-function (find-symbol "ENCODE->MATRIX" pkg)) text :ec-level :m)))
 
 (defun render-terminal (text &key (quiet 2) (stream *standard-output*))
   "Print TEXT as a QR code using half-block characters (two module rows per

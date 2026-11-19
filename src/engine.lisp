@@ -22,7 +22,7 @@
   (require :asdf)
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:json-simple :babel) :silent t))
+  #+quicklisp (ql:quickload '(:json-simple) :silent t))
 
 (defpackage #:operandi.engine
   (:use #:cl)
@@ -1296,7 +1296,7 @@ another tool or give a final answer.")
          (raw (ignore-errors (http:response-body e)))
          (body (cond ((stringp raw) raw)
                      ((typep raw '(vector (unsigned-byte 8)))
-                      (ignore-errors (babel:octets-to-string raw :encoding :utf-8 :errorp nil)))
+                      (ignore-errors (http:utf8-string raw)))
                      ;; streaming request (:want-stream t) → body is a stream; slurp it.
                      ((and raw (streamp raw))
                       (ignore-errors
@@ -1879,7 +1879,7 @@ another tool or give a final answer.")
                            (append messages
                                    (list (tool-result-msg tcid result))))))
            ;; The pictures those calls opened or made, after all their results.
-           (let ((shown (and (consp tools:*tool-images*)
+           (let ((shown (and tools:*tool-images-send* (consp tools:*tool-images*)
                              (tool-images-msg (reverse (remove-duplicates tools:*tool-images* :test #'string=))))))
              (when shown
                (when verbose

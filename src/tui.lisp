@@ -613,7 +613,7 @@
     (return-from run-ask nil))
   (let ((synthesis
           (handler-case
-              (let* ((project (namestring (uiop:getcwd)))
+              (let* ((project (namestring (operandi.env:cwd)))
                      (prior-records (operandi.subagent:project-findings project))
                      (prior (and prior-records (operandi.subagent:findings-brief prior-records))))
                 (fresh)

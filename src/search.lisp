@@ -23,7 +23,7 @@
   (require :asdf)
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:json-simple :cl-ppcre :babel) :silent t))
+  #+quicklisp (ql:quickload '(:json-simple :cl-ppcre) :silent t))
 
 (defpackage #:operandi.search
   (:use #:cl)
@@ -148,7 +148,7 @@
    (e.g. 'ñ', 'é', '北') are emitted as their UTF-8 byte sequence with
    each byte percent-encoded — Brave (and most servers) reject single-byte
    percent-encodings of codepoints > 127."
-  (let ((bytes (babel:string-to-octets s :encoding :utf-8)))
+  (let ((bytes (http:utf8-octets s)))
     (with-output-to-string (out)
       (loop for b across bytes do
             (let ((c (code-char b)))

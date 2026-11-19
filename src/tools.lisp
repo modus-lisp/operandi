@@ -24,7 +24,7 @@
   #+sbcl (require :sb-posix)   ; modus provides SB-POSIX as a boot-time surface
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:json-simple :uiop :cl-ppcre :quri :bordeaux-threads) :silent t))
+  #+quicklisp (ql:quickload '(:json-simple :uiop :cl-ppcre :bordeaux-threads) :silent t))
 
 (defpackage #:operandi.tools
   (:use #:cl)
@@ -44,7 +44,7 @@
            #:*tool-gate*
            #:*tool-images*
            #:show-image
-           #:*images* #:*image-model* #:parse-images #:images-label
+           #:*images* #:*image-model* #:*image-token* #:*tool-images-send* #:*processes* #:parse-images #:images-label
            #:define-tool
            #:register-tool
            #:unregister-tool
@@ -114,6 +114,12 @@
   "Paths the current turn's tools want the model to see, newest first; :OFF
    when nothing will deliver them (no agent loop, or the model takes no
    pictures).")
+
+(defvar *tool-images-send* t
+  "Whether the pictures tools collect are SENT to the model (as data: URLs after the tool results).
+   NIL still collects them -- a GUI shows them as they are made -- but the model is told their paths
+   only.  A phone sets it: shrinking a 1024-pixel picture and base64-ing it into the request is more
+   than its worker thread's 16 MB heap holds.")
 
 (defun show-image (path)
   "Ask for PATH (an image file) to be shown to the model after this turn's
@@ -294,18 +300,42 @@
    sometimes sends offset/limit as strings or negatives."
   (if (and (integerp v) (>= v floor)) v default))
 
+(defun %native (path)
+  "PATH as the filesystem must see it: merged with *DEFAULT-PATHNAME-DEFAULTS*, as OPEN and PROBE-FILE
+   merge it.  SB-POSIX:STAT takes a path as it stands, so a relative one named the PROCESS's directory --
+   which on a phone is the read-only app container, not the agent's working directory -- and every
+   relative Read reported \"not a regular file\"."
+  (let ((s (if (pathnamep path) (namestring path) path)))
+    (if (and (stringp s) (plusp (length s)) (char/= (char s 0) #\/))
+        (namestring (merge-pathnames s))
+        s)))
+
+(defun %path-kind (path)
+  ":FILE, :DIR, :OTHER (a device, a fifo, a socket) or NIL (nothing there).  stat(2) where SB-POSIX has
+   it; where it does not (modus on macOS and iOS), portable CL: PROBE-FILE, and PROBE-FILE of the name as
+   a directory, which only a directory answers."
+  (let ((n (%native path)))
+    (handler-case
+        (let ((m (sb-posix:stat-mode (sb-posix:stat n))))
+          (cond ((sb-posix:s-isreg m) :file) ((sb-posix:s-isdir m) :dir) (t :other)))
+      (error ()
+        (cond ((null (ignore-errors (probe-file n))) nil)
+              ((ignore-errors (probe-file (concatenate 'string (string-right-trim "/" n) "/"))) :dir)
+              (t :file))))))
+
+(defun %native-namestring (p)
+  (or (ignore-errors (funcall (find-symbol "NATIVE-NAMESTRING" "SB-EXT") p)) (namestring p)))
+
 (defun regular-file-p (path)
   "True only for a plain regular file. Rejects directories, character
    devices (/dev/zero, /dev/random), fifos, sockets — none are safely
    line-readable and the endless ones would OOM the image."
-  (handler-case
-      (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:stat path)))
-    (error () nil)))
+  (eq (%path-kind path) :file))
 
 (defun file-byte-size (path)
   "Size of PATH in bytes, or NIL if it can't be stat'd."
-  (handler-case (sb-posix:stat-size (sb-posix:stat path))
-    (error () nil)))
+  (or (ignore-errors (sb-posix:stat-size (sb-posix:stat (%native path))))
+      (ignore-errors (with-open-file (in (%native path) :element-type '(unsigned-byte 8)) (file-length in)))))
 
 (defparameter *edit-max-bytes* 10000000
   "Edit reads the whole target with READ-FILE-STRING; refuse files past
@@ -585,6 +615,49 @@ Prefer Eval for anything touching our Lisp data."
        (every (lambda (c) (or (alphanumericp c) (find c "_-./*?[]{}, ")))
               p)))
 
+(defun lisp-grep (pat path &key (max-lines 200) (max-files 4000) (max-bytes 4000000))
+  "Grep without a program to run (a phone): the files under PATH (or PATH itself), their lines holding
+   PAT -- a literal, or with a leading / a regular expression when CL-PPCRE is loaded -- as
+   FILE:LINE:TEXT, at most MAX-LINES of them.  Binary files (a NUL in the first 4 KB) and files over
+   MAX-BYTES are skipped."
+  (let* ((regex-p (and (plusp (length pat)) (char= (char pat 0) #\/)))
+         (real (if regex-p (subseq pat 1) pat))
+         (scan (and regex-p (find-package "CL-PPCRE")
+                    (ignore-errors (funcall (find-symbol "CREATE-SCANNER" "CL-PPCRE") real))))
+         (match (if scan
+                    (lambda (line) (funcall (find-symbol "SCAN" "CL-PPCRE") scan line))
+                    (lambda (line) (search real line))))
+         (root (if (and (stringp path) (plusp (length path))) path "."))
+         (files (if (eq (%path-kind root) :file)
+                    (list root)
+                    (let ((*glob-budget* (* 4 max-files)))
+                      (declare (special *glob-budget*))    ; its DEFVAR is further down the file
+                      (glob-files (concatenate 'string (string-right-trim "/" root) "/**/*")))))
+         (out '()) (n 0) (total 0))
+    (when (and regex-p (not scan))
+      (return-from lisp-grep "Grep: a regular expression needs CL-PPCRE, which this image does not have; search for a literal (no leading /)."))
+    (dolist (f (subseq files 0 (min max-files (length files))))
+      (let ((size (or (file-byte-size f) 0)))
+        (when (<= size max-bytes)
+          (ignore-errors
+           (unless (with-open-file (in (%native f) :element-type '(unsigned-byte 8))
+                     (let ((head (make-array (min 4096 size) :element-type '(unsigned-byte 8))))
+                       (read-sequence head in)
+                       (find 0 head)))
+             (with-open-file (in (%native f))
+               (loop for line = (read-line in nil) for k from 1
+                     while line
+                     when (funcall match line)
+                       do (incf total)
+                          (when (< n max-lines)
+                            (incf n)
+                            (push (format nil "~a:~d:~a" f k (if (> (length line) 300) (subseq line 0 300) line)) out)))))))))
+    (cond ((null out) "(no matches)")
+          ((> total max-lines)
+           (format nil "~{~a~%~}... ~:d matching lines total, showing the first ~d -- narrow the pattern or pass a PATH."
+                   (nreverse out) total max-lines))
+          (t (format nil "~{~a~^~%~}" (nreverse out))))))
+
 (define-tool "Grep"
     (:description "Find pattern in files (ripgrep if available, else grep -rn).
 Literal by default; prefix '/' for regex. First 200 matching lines."
@@ -599,12 +672,15 @@ Literal by default; prefix '/' for regex. First 200 matching lines."
   (let* ((pat (gethash "pattern" args))
          (raw-path (gethash "path" args))
          (path (if (and (stringp raw-path) (plusp (length raw-path))) raw-path ".")))
+    (block %grep-tool
     (cond
       ((not (stringp pat)) "Grep: pattern must be a string")
       (t
        ;; Pattern and path go as ARGV, never a shell string — no injection.
        ;; `--` stops a leading-dash pattern being read as a flag. Bounded by
        ;; coreutils `timeout` so a huge tree / pathological pattern can't hang.
+       (unless *processes*
+         (return-from %grep-tool (lisp-grep pat path)))
        (let* ((regex-p (and (plusp (length pat)) (char= (char pat 0) #\/)))
               (real-pat (if regex-p (subseq pat 1) pat))
               (base (if (probe-file "/usr/bin/rg")
@@ -627,7 +703,7 @@ Literal by default; prefix '/' for regex. First 200 matching lines."
            ((> total 200)
             (format nil "~A~&… ~:D matching lines total, showing the first 200 — narrow the pattern or pass a PATH to see the rest."
                     out total))
-           (t out)))))))
+           (t out))))))))
 
 (define-tool "TodoWrite"
     (:description "Set the current task list for this run. Replaces any
@@ -723,18 +799,21 @@ multiple steps — write the plan up front, mark items as you go."
 (defun %glob-entries (dir)
   "DIR's (a native directory name, \"\" for the cwd) entries: (name . dir-p),
    dir-p :link for a symlinked directory."
-  (let ((d (sb-ext:parse-native-namestring (if (string= dir "") "./" dir)
-                                           nil *default-pathname-defaults* :as-directory t))
+  (let ((d (or (ignore-errors (funcall (find-symbol "PARSE-NATIVE-NAMESTRING" "SB-EXT")
+                                        (if (string= dir "") "./" dir)
+                                        nil *default-pathname-defaults* :as-directory t))
+               ;; modus has no PARSE-NATIVE-NAMESTRING: the directory, merged, as a directory
+               (pathname (%native (if (string= dir "") "./" dir)))))
         (out '()))
     (flet ((last-name (p)
-             (let* ((s (string-right-trim "/" (sb-ext:native-namestring p)))
+             (let* ((s (string-right-trim "/" (%native-namestring p)))
                     (k (position #\/ s :from-end t)))
                (if k (subseq s (1+ k)) s))))
       (dolist (p (ignore-errors (directory (merge-pathnames (make-pathname :name :wild :type :wild) d) :resolve-symlinks nil)))
         (when (minusp (decf *glob-budget*)) (return))
         (let ((dir-p (null (pathname-name p))))
           (push (cons (last-name p)
-                      (and dir-p (if (ignore-errors (sb-posix:s-islnk (sb-posix:stat-mode (sb-posix:lstat (string-right-trim "/" (sb-ext:native-namestring p))))))
+                      (and dir-p (if (ignore-errors (sb-posix:s-islnk (sb-posix:stat-mode (sb-posix:lstat (string-right-trim "/" (%native-namestring p))))))
                                      :link t)))
                 out))))
     out))
@@ -755,10 +834,10 @@ multiple steps — write the plan up front, mark items as you go."
              acc)
             ((notany (lambda (c) (find c "*?[")) part)   ; a literal component
              (let ((path (concatenate 'string dir part)))
-               (cond (more (if (ignore-errors (sb-posix:s-isdir (sb-posix:stat-mode (sb-posix:stat path))))
+               (cond (more (if (eq (%path-kind path) :dir)
                                (%glob-walk (concatenate 'string path "/") more acc)
                                acc))
-                     ((ignore-errors (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:stat path))))
+                     ((eq (%path-kind path) :file)
                       (cons path acc))
                      (t acc))))
             (t
@@ -780,10 +859,10 @@ multiple steps — write the plan up front, mark items as you go."
             (when parts
               (setf acc (%glob-walk (if abs "/" "") parts acc)))))))
     (let ((files (remove-duplicates
-                  (remove-if-not (lambda (f) (ignore-errors (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:stat f)))))
+                  (remove-if-not (lambda (f) (eq (%path-kind f) :file))
                                  acc)
                   :test #'string=)))
-      (mapcar #'car (sort (mapcar (lambda (f) (cons f (or (ignore-errors (sb-posix:stat-mtime (sb-posix:stat f))) 0)))
+      (mapcar #'car (sort (mapcar (lambda (f) (cons f (or (ignore-errors (sb-posix:stat-mtime (sb-posix:stat f))) (ignore-errors (file-write-date (%native f))) 0)))
                                   files)
                           #'> :key #'cdr)))))
 
@@ -890,6 +969,10 @@ of titles + URLs + short descriptions."
 (defvar *images* nil
   "Where Imagine gets pictures: NIL (no Imagine), a base URL, or :PPQ.")
 
+(defvar *image-token* nil
+  "The PPQ key Imagine pays with when the caller has it (a phone's keychain), or NIL for
+   ~/.operandi/ppq.token.")
+
 (defvar *image-model* nil
   "The model Imagine asks for, or NIL for the backend's default: on PPQ,
    *PPQ-IMAGE-MODEL*; a server like ex-nihilo serves one and ignores it.")
@@ -933,13 +1016,13 @@ of titles + URLs + short descriptions."
                    (let ((v (make-array (file-length i) :element-type '(unsigned-byte 8)))) (read-sequence v i) v)))
          (type (string-downcase (or (pathname-type (pathname path)) "png"))))
     (format nil "data:image/~A;base64,~A" (if (equal type "jpg") "jpeg" type)
-            (cl-base64:usb8-array-to-base64-string octets))))
+            (operandi.http:base64-string octets))))
 
 (defun %image-request (prompt size seed &optional source strength)
   "(values url body headers) for one picture from *IMAGES*; made from the
    picture SOURCE (a data: URL) when given, STRENGTH how far it may change."
   (if (eq *images* :ppq)
-      (let ((token (or (operandi.ppq:ppq-token) (error "Imagine: no PPQ account (~~/.operandi/ppq.token)")))
+      (let ((token (or *image-token* (operandi.ppq:ppq-token) (error "Imagine: no PPQ account (~~/.operandi/ppq.token)")))
             (body (llm:ht "model" (or *image-model* *ppq-image-model*) "prompt" prompt
                           "response_format" "b64_json")))
         ;; both: models that take sizes (Flux, Qwen-Image) make exactly W x H; the rest
@@ -987,6 +1070,79 @@ of titles + URLs + short descriptions."
                     (when (>= bits 8) (decf bits 8) (vector-push (ldb (byte 8 bits) acc) out)))
     (coerce out '(simple-array (unsigned-byte 8) (*)))))
 
+(defun %stream-image (url body headers out)
+  "POST BODY (a hash table, as JSON) to URL and write the picture in the answer's data[0].b64_json to
+   the file OUT, never holding the answer or the picture whole: the body is read a buffer at a time,
+   the base64 decoded as it passes, and only the rest of the JSON -- seed, content type, cost -- is
+   kept, with the picture's value left empty, and parsed at the end.
+
+   Why: a 1024-pixel picture is 3-4 MB of base64 inside the JSON.  Read whole and parsed, that is
+   a 4 MB string, a word a character on modus -- and the agent's worker thread has a 16 MB heap, so
+   on a phone the process ended mid-picture.  Returns (values META STATUS ERROR-TEXT): META the
+   parsed JSON with an empty b64_json, or NIL with STATUS and the provider's error text."
+  (multiple-value-bind (read status hdrs close)
+      (seal.http:open-body-reader "POST" url :headers headers
+                                             :body (operandi.http::%octets (json:stringify body))
+                                             :timeout 600)
+    (declare (ignore hdrs))
+    (unwind-protect
+         (let* ((buf (make-array 65536 :element-type '(unsigned-byte 8)))
+                (meta (make-array 4096 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+                (key (map '(vector (unsigned-byte 8)) #'char-code "\"b64_json\""))
+                (matched 0) (state :scan) (escape nil)
+                (acc 0) (bits 0)
+                (obuf (make-array 49152 :element-type '(unsigned-byte 8))) (on 0))
+           (if (not (<= 200 status 299))
+               ;; a refusal: its text, capped
+               (loop for n = (funcall read buf 0 (length buf))
+                     while (and (plusp n) (< (fill-pointer meta) 4096))
+                     do (loop for i below n do (vector-push-extend (aref buf i) meta))
+                     finally (return (values nil status (operandi.http:utf8-string meta))))
+               (progn
+                (with-open-file (o out :direction :output :element-type '(unsigned-byte 8)
+                                      :if-exists :supersede :if-does-not-exist :create)
+                 (flet ((meta+ (b) (when (< (fill-pointer meta) 262144) (vector-push-extend b meta)))
+                        (flush () (when (plusp on) (write-sequence obuf o :end on) (setf on 0))))
+                   (loop for n = (funcall read buf 0 (length buf))
+                         while (plusp n)
+                         do (dotimes (i n)
+                              (let ((b (aref buf i)))
+                                (ecase state
+                                  (:scan
+                                   (meta+ b)
+                                   (setf matched (cond ((= b (aref key matched)) (1+ matched))
+                                                       ((= b (aref key 0)) 1)
+                                                       (t 0)))
+                                   (when (= matched (length key)) (setf state :colon matched 0)))
+                                  (:colon                ; whitespace, the colon, whitespace, the quote
+                                   (meta+ b)
+                                   (when (= b 34) (setf state :value)))
+                                  (:value
+                                   (cond (escape (setf escape nil)
+                                                 (when (= b 47) (setf b 47)))  ; \/ is /
+                                         ((= b 92) (setf escape t) (setf b nil))
+                                         ((= b 34) (meta+ 34) (setf state :scan b nil)))
+                                   (when b
+                                     (let ((v (cond ((<= 65 b 90) (- b 65)) ((<= 97 b 122) (- b 71))
+                                                    ((<= 48 b 57) (+ b 4)) ((= b 43) 62) ((= b 47) 63))))
+                                       (when v
+                                         (setf acc (logior (ash (logand acc #xffff) 6) v))
+                                         (incf bits 6)
+                                         (when (>= bits 8)
+                                           (decf bits 8)
+                                           (setf (aref obuf on) (ldb (byte 8 bits) acc))
+                                           (incf on)
+                                           (when (= on (length obuf)) (flush)))))))))))
+                   (flush)))
+                 (values (json:parse (operandi.http:utf8-string meta)) status nil))))
+      (funcall close))))
+
+(defun %file-head (path n)
+  "The first N octets of PATH (fewer if it is shorter)."
+  (with-open-file (i path :element-type '(unsigned-byte 8))
+    (let ((v (make-array (min n (file-length i)) :element-type '(unsigned-byte 8))))
+      (read-sequence v i) v)))
+
 (defun %slug (s)
   (let ((w (with-output-to-string (o)
              (loop for c across (string-downcase s) with dash = nil
@@ -1028,14 +1184,19 @@ can show you pictures, you see it after the tool results."
           (when (and src (not (probe-file src))) (return-from %imagine (format nil "No picture at ~A." src)))
           (%image-request prompt (gethash "size" args) (gethash "seed" args)
                           (and src (%image-source src)) (and src (gethash "strength" args))))
-      (let* ((reply (handler-case
-                        (json:parse (operandi.http:post url :content (json:stringify body) :headers headers
-                                                            :read-timeout 600))
-                      (operandi.http:http-request-failed (e)
+      (let* ((tmp (format nil "generated/.imagine-~36R.part" (random (expt 36 8))))
+             (_ (ensure-directories-exist (merge-pathnames tmp)))
+             (reply (multiple-value-bind (meta status err)
+                        (handler-case (%stream-image url body headers tmp)
+                          (error (e)
+                            (ignore-errors (delete-file tmp))
+                            (return-from %imagine (format nil "IMAGE SERVER ERROR: ~A" e))))
+                      (unless meta
+                        (ignore-errors (delete-file tmp))
                         (return-from %imagine
-                          (format nil "IMAGE SERVER ERROR (~A): ~A" (operandi.http:response-status e)
-                                  (let ((b (operandi.http:response-body e)))
-                                    (if (stringp b) (subseq b 0 (min 500 (length b))) "")))))))
+                          (format nil "IMAGE SERVER ERROR (~A): ~A" status
+                                  (subseq err 0 (min 500 (length err))))))
+                      meta))
              (d (aref (gethash "data" reply) 0))
              (seed (or (gethash "seed" d) (gethash "seed" args)))
              (ext (%image-extension (gethash "content_type" d)))
@@ -1044,24 +1205,29 @@ can show you pictures, you see it after the tool results."
                        (if (string-equal (or (pathname-type (pathname asked)) "") ext)
                            asked
                            (namestring (make-pathname :type ext :defaults (pathname asked))))
-                       (format nil "generated/~A~@[-~D~].~A"
-                               (let ((x (%slug prompt))) (if (plusp (length x)) x "picture")) seed ext)))
+                       ;; a new name, never an old picture's: a backend that reports no seed makes the
+                       ;; same name for the same prompt, and the old one cannot be overwritten unread
+                       (let ((base (format nil "generated/~A~@[-~D~]"
+                                           (let ((x (%slug prompt))) (if (plusp (length x)) x "picture")) seed)))
+                         (loop for k from 1
+                               for p = (format nil "~A~[~;~:;-~:*~D~].~A" base k ext)
+                               unless (probe-file p) return p))))
              (refusal (check-write-allowed path))
              (dims nil))
-        (when refusal (return-from %imagine refusal))
+        (declare (ignore _))
+        (when refusal (ignore-errors (delete-file tmp)) (return-from %imagine refusal))
         (ensure-directories-exist (merge-pathnames path))
-        (let ((octets (%base64-octets (gethash "b64_json" d))))
-          (with-open-file (o path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
-            (write-sequence octets o))
-          (multiple-value-bind (w h) (%image-dims octets)
-            (setf dims (and w h (format nil "~Dx~D" w h)))))
+        (when (probe-file path) (delete-file path))
+        (rename-file tmp (merge-pathnames path))
+        (multiple-value-bind (w h) (%image-dims (%file-head path 262144))
+          (setf dims (and w h (format nil "~Dx~D" w h))))
         (record-read path)
         (format nil "Wrote ~A (~A~@[ ~A~]~@[, seed ~D~]~@[, $~,4F~], ~,1F s).~@[ ~A~]~:[ You do not see the picture.~; It is shown to you after this turn's tool results: check it against what was asked (text spelled right, nothing missing), and try again -- a better prompt, or another seed -- if it falls short.~]"
                 path (string-upcase ext) dims seed (gethash "cost" reply)
                 (/ (- (get-internal-real-time) t0) internal-time-units-per-second)
                 (and asked (not (equal asked path))
                      (format nil "(~A was asked for; the backend made ~A, so it is saved as ~A.)" asked (string-upcase ext) path))
-                (show-image path)))))))
+                (and (show-image path) *tool-images-send*)))))))
 
 (defparameter *notes-file*
   (merge-pathnames ".operandi/operandi-notes.md" (user-homedir-pathname))
@@ -1070,7 +1236,7 @@ can show you pictures, you see it after the tool results."
 
 (defun system-notes-file () *notes-file*)
 
-(defun project-notes-file (&optional (cwd (uiop:getcwd)))
+(defun project-notes-file (&optional (cwd (operandi.env:cwd)))
   "PROJECT notes for the directory CWD: kept under ~/.operandi/projects/, keyed
    by the directory's path, so nothing is written into the project itself and
    notes from one project never leak into another. The key escapes % and / so
@@ -1167,23 +1333,29 @@ large)."
           (format nil "~A~&~A" bounded value)
           value))))
 
+(defvar *processes* t
+  "Whether this image can run programs.  NIL (a phone: no fork, no exec) leaves Bash out of the tools
+   the model is offered, rather than let it learn by failing.")
+
 (defun default-tools ()
   ;; Verdict is deliberately absent: it is the WORKER's reporting channel,
   ;; and Investigate adds it to the toolset of the workers it spawns. An
   ;; agent that was not given a hypothesis has nothing to return a verdict on.
-  (append
+  (remove-if
+   (lambda (n) (and (not *processes*) (string= n "Bash")))
+   (append
    '("Eval" "Read" "Write" "Edit" "Bash" "Grep" "Glob" "WebFetch"
      "WebSearch" "Remember" "Findings" "Task" "Fan" "Spawn" "Investigate"
      "SendMessage" "TodoWrite")
    (and *images* (list "Imagine"))
-   (copy-list *extra-default-tools*)))
+   (copy-list *extra-default-tools*))))
 
 (defun read-notes-if-any (file)
   (handler-case
       (if (probe-file file) (uiop:read-file-string file) "")
     (error () "")))
 
-(defun load-notes (&optional (cwd (uiop:getcwd)))
+(defun load-notes (&optional (cwd (operandi.env:cwd)))
   "System notes followed by the notes for project CWD. Returns a string,
    empty if neither exists."
   (let ((sys (read-notes-if-any (system-notes-file)))

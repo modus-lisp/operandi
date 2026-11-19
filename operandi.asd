@@ -17,8 +17,10 @@
   :author "ynniv"
   :license "MIT"
   :version "0.1.0"
+  ;; NOT HERE, on purpose: illatio (the in-image model, --illatio) and lispqr (payment QR codes) are reached
+  ;; by name when loaded -- bin/operandi bakes both into its core -- so an image without them (a phone)
+  ;; carries neither; sqlite (the audit log, store.lisp) the same way.  babel, quri and cl-base64 were a few lines each (http.lisp, safefetch.lisp).
   :depends-on ("json-simple"
-               "illatio/openai" ; the model in this image, for --illatio (pure CL, sibling repo)
                "seal/http"      ; pure-CL HTTP/TLS (on natrium) -- replaced dexador, which was
                                 ; the only way FFI entered this stack (cl+ssl, iolib, static-vectors)
                "cl-sev-snp"     ; AMD SEV-SNP / AWS Nitro attestation verification, pure CL --
@@ -26,13 +28,8 @@
                "cl-sev-snp/kds" ; ...plus the AMD KDS fetch for the ARK/ASK chain
                "natrium"        ; X25519 and ChaCha20-Poly1305 for Maple's enclave sessions
                "witness"        ; signed `routed' statements: where Maple sends each model
-               "babel"
-               "quri"
-               "cl-base64"
                "cl-ppcre"
-               "sqlite"
                "bordeaux-threads"
-               "lispqr"         ; pure-CL QR encoder (mare5x, MIT) -- for payment invoices; pulls zpng
                "png-pure"       ; pure-CL PNG encoder (cram's deflate) -- QR image for :open
                "pigment"        ; pure-CL image decoders -- pictures shrunk before they go to a model
                "quill")         ; pure-CL line editor for the REPL prompt -- replaced linedit

@@ -16,20 +16,40 @@
   (require :asdf)
   ;; #+QUICKLISP: the .asd already loads these; this is for loading the file by hand.  Guarded
   ;; because READING `ql:' is an error in an image without Quicklisp, before anything runs.
-  #+quicklisp (ql:quickload '(:sqlite :bordeaux-threads) :silent t))
+  #+quicklisp (ql:quickload '(:bordeaux-threads) :silent t))
 
 (defpackage #:operandi.store
   (:use #:cl)
-  (:local-nicknames (#:s  #:sqlite)
-                    (#:bt #:bordeaux-threads))
+  (:local-nicknames (#:bt #:bordeaux-threads))
   (:export #:*db* #:*default-path* #:*db-lock*
            #:open-store #:close-store
            #:with-tx #:with-db-lock
            #:exec #:exec-non-query #:select-rows #:select-single
            #:current-schema-version
-           #:init-schema #:*exec-via*))
+           #:init-schema #:*exec-via* #:store-available-p))
 
 (in-package #:operandi.store)
+
+;;; SQLITE IS NOT A DEPENDENCY.  The store is an audit log, and cl-sqlite is a C library behind an FFI (or, on
+;;; modus, a whole SQLite in Lisp) -- a lot to carry for a log.  It is reached by name: loaded on the first
+;;; OPEN-STORE where ASDF can find "sqlite" (the desktop), and where it cannot (a phone) OPEN-STORE says so,
+;;; *DB* stays NIL, and the tool-call hook, which ignores errors, logs nothing.
+
+(defun store-available-p ()
+  "True when a SQLite binding is loaded, or ASDF can find one to load."
+  (or (find-package "SQLITE") (and (asdf:find-system "sqlite" nil) t)))
+
+(defun %sq (name)
+  "cl-sqlite's function NAME, loading \"sqlite\" first if it is findable and not loaded."
+  (unless (find-package "SQLITE")
+    (if (asdf:find-system "sqlite" nil)
+        (asdf:load-system "sqlite")
+        (error "operandi's store needs SQLite (the \"sqlite\" system), which is not in this image")))
+  (symbol-function (find-symbol name "SQLITE")))
+
+(defun %sqlite-error-p (e)
+  (let ((c (and (find-package "SQLITE") (find-symbol "SQLITE-ERROR" "SQLITE"))))
+    (and c (typep e c))))
 
 (defvar *db* nil "Connection to the live SQLite handle.")
 
@@ -54,42 +74,42 @@
 (defun open-store (&optional (path *default-path*))
   "Open (or create) the store at PATH. Sets *DB* and returns the
    connection."
-  (when *db* (s:disconnect *db*))
+  (when *db* (funcall (%sq "DISCONNECT") *db*))
   (ensure-directories-exist path)
-  (setf *db* (s:connect (namestring path)))
+  (setf *db* (funcall (%sq "CONNECT") (namestring path)))
   ;; Wait for a lock instead of failing at once. Without this, operandi
   ;; processes STARTING TOGETHER (operandi_fan, a campaign driver, an
   ;; xargs -P) collide on the WAL switch below, and SQLite's default -- no
   ;; busy handler -- turns the collision into an immediate SQLITE_BUSY that
   ;; kills the process before its first turn.
-  (s:execute-non-query *db* "PRAGMA busy_timeout = 30000")
+  (funcall (%sq "EXECUTE-NON-QUERY") *db* "PRAGMA busy_timeout = 30000")
   ;; WAL mode: better concurrency and safer crashes for a long-running
   ;; reader+writer like the replay loop. Switching to it needs a moment of
   ;; exclusive access, which a busy timeout does not always cover (the
   ;; switch can return BUSY without invoking the handler), so retry.
   (loop for attempt from 1
-        do (handler-case (progn (s:execute-non-query *db* "PRAGMA journal_mode = WAL") (return))
-             (s:sqlite-error (e)
-               (when (>= attempt 50) (error e))
+        do (handler-case (progn (funcall (%sq "EXECUTE-NON-QUERY") *db* "PRAGMA journal_mode = WAL") (return))
+             (error (e)
+               (when (or (not (%sqlite-error-p e)) (>= attempt 50)) (error e))
                (sleep (+ 0.05 (random 0.2))))))
-  (s:execute-non-query *db* "PRAGMA synchronous = NORMAL")
-  (s:execute-non-query *db* "PRAGMA foreign_keys = ON")
+  (funcall (%sq "EXECUTE-NON-QUERY") *db* "PRAGMA synchronous = NORMAL")
+  (funcall (%sq "EXECUTE-NON-QUERY") *db* "PRAGMA foreign_keys = ON")
   (init-schema)
   *db*)
 
 (defun close-store ()
-  (when *db* (s:disconnect *db*) (setf *db* nil)))
+  (when *db* (funcall (%sq "DISCONNECT") *db*) (setf *db* nil)))
 
 (defmacro with-tx (&body body)
   "Run BODY inside a transaction (rollback on error), holding the store
    lock for the whole transaction so no other thread interleaves."
   `(with-db-lock
-     (s:execute-non-query *db* "BEGIN")
+     (funcall (%sq "EXECUTE-NON-QUERY") *db* "BEGIN")
      (handler-case
          (multiple-value-prog1 (progn ,@body)
-           (s:execute-non-query *db* "COMMIT"))
+           (funcall (%sq "EXECUTE-NON-QUERY") *db* "COMMIT"))
        (error (e)
-         (s:execute-non-query *db* "ROLLBACK")
+         (funcall (%sq "EXECUTE-NON-QUERY") *db* "ROLLBACK")
          (error e)))))
 
 (defvar *exec-via* nil
@@ -102,7 +122,7 @@
   "Execute SQL with PARAMS, return nothing meaningful."
   (if *exec-via*
       (progn (funcall *exec-via* sql params) nil)
-      (with-db-lock (apply #'s:execute-non-query *db* sql params))))
+      (with-db-lock (apply (%sq "EXECUTE-NON-QUERY") *db* sql params))))
 
 (defun exec (sql &rest params)
   "Alias for exec-non-query."
@@ -110,16 +130,16 @@
 
 (defun select-rows (sql &rest params)
   "Run SELECT SQL with PARAMS, return list of rows (each a list of values)."
-  (with-db-lock (apply #'s:execute-to-list *db* sql params)))
+  (with-db-lock (apply (%sq "EXECUTE-TO-LIST") *db* sql params)))
 
 (defun select-single (sql &rest params)
   "Single-value SELECT (e.g. SELECT COUNT(*) FROM …)."
-  (with-db-lock (apply #'s:execute-single *db* sql params)))
+  (with-db-lock (apply (%sq "EXECUTE-SINGLE") *db* sql params)))
 
 ;;; ----------------------- schema versioning -----------------------
 
 (defun current-schema-version ()
-  (with-db-lock (s:execute-single *db* "PRAGMA user_version")))
+  (with-db-lock (funcall (%sq "EXECUTE-SINGLE") *db* "PRAGMA user_version")))
 
 (defparameter *schema-v1*
   ;; Operandi-agent tool-call log. Every Tool/Eval/Bash/etc invocation
@@ -144,12 +164,12 @@
 
 (defun column-exists-p (table column)
   (some (lambda (r) (string= (second r) column))
-        (s:execute-to-list *db* (format nil "PRAGMA table_info(~A)" table))))
+        (funcall (%sq "EXECUTE-TO-LIST") *db* (format nil "PRAGMA table_info(~A)" table))))
 
 (defun ensure-column (table column type)
   "ALTER TABLE … ADD COLUMN if not already present. Idempotent."
   (unless (column-exists-p table column)
-    (s:execute-non-query *db*
+    (funcall (%sq "EXECUTE-NON-QUERY") *db*
                          (format nil "ALTER TABLE ~A ADD COLUMN ~A ~A"
                                  table column type))))
 

@@ -1209,14 +1209,18 @@ call with :want-stream nil"))
   (and (in-image-p url)
        (illatio:context-n-ctx (illatio:engine-context (%illatio-engine url)))))
 
-(defun set-backend-illatio! (&key (path (default-illatio-model)) (n-ctx 32768))
+(defun set-backend-illatio! (&key (path (default-illatio-model)) (n-ctx 32768)
+                                (gpu (let ((g (uiop:getenv "ILLATIO_GPU"))) (and g (string/= g "") (string/= g "0")))))
   "Load the GGUF model at PATH into this image (once per path) and send every
    request to it.  N-CTX is the context it serves, capped at what the model
-   was trained for."
+   was trained for.  GPU (default: $ILLATIO_GPU set and not 0) runs a dense or
+   qwen35 model on Metal; DeepSeek V4 Flash uses the GPU either way."
   (let* ((path (namestring (or (probe-file path)
                                (error "no model at ~A (set ILLATIO_MODEL, or pass --illatio PATH)" path))))
          (engine (or (gethash path *illatio-engines*)
-                     (let ((m (illatio:load-model path)))
+                     (let ((m (if (and gpu (member :darwin *features*))
+                                  (illatio::load-model-gpu path)
+                                  (illatio:load-model path))))
                        (setf (gethash path *illatio-engines*)
                              (illatio:make-engine
                               m :n-ctx (min n-ctx (illatio:model-context-length m))))))))

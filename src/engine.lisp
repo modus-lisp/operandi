@@ -916,7 +916,12 @@ another tool or give a final answer.")
                  ((zerop (length notes)) *base-system-prompt*)
                  (t (format nil "~A~%~%## Persistent notes (from previous runs)~%~%~A"
                             *base-system-prompt* notes)))))
-    (format nil "~A~{~%~%~A~}" base (mapcar #'cdr (reverse operandi.tools:*system-sections*)))))
+    ;; the working directory, so a relative path means something (small
+    ;; models otherwise invent absolute ones); an image with no OS directory
+    ;; to ask (a phone) leaves it out
+    (format nil "~A~@[~%~%## Environment~%~%Working directory: ~A~%Relative paths are resolved against it.~]~{~%~%~A~}"
+            base (let ((d (ignore-errors (uiop:getcwd)))) (and d (string-right-trim "/" (namestring d))))
+            (mapcar #'cdr (reverse operandi.tools:*system-sections*)))))
 
 (defparameter *default-system-prompt* nil
   "DEPRECATED — use BUILD-SYSTEM-PROMPT instead so notes load fresh

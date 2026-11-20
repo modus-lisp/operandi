@@ -916,7 +916,12 @@ another tool or give a final answer.")
                  ((zerop (length notes)) *base-system-prompt*)
                  (t (format nil "~A~%~%## Persistent notes (from previous runs)~%~%~A"
                             *base-system-prompt* notes)))))
-    (format nil "~A~{~%~%~A~}" base (mapcar #'cdr (reverse operandi.tools:*system-sections*)))))
+    ;; the working directory, so a relative path means something (small
+    ;; models otherwise invent absolute ones); OPERANDI.ENV:CWD has one even
+    ;; in an image with no OS directory to ask (a phone)
+    (format nil "~A~@[~%~%## Environment~%~%Working directory: ~A~%Relative paths are resolved against it.~]~{~%~%~A~}"
+            base (let ((d (ignore-errors (operandi.env:cwd)))) (and d (string-right-trim "/" (namestring d))))
+            (mapcar #'cdr (reverse operandi.tools:*system-sections*)))))
 
 (defparameter *default-system-prompt* nil
   "DEPRECATED — use BUILD-SYSTEM-PROMPT instead so notes load fresh
@@ -1629,6 +1634,7 @@ another tool or give a final answer.")
          (tool-call-count 0)
          (empty-turns 0)
          (call-sigs '())      ; every tool call issued this run, newest first
+         (turn-sigs nil)      ; the previous turn's calls, while wrapping up
          (stall-warned nil)   ; the one free correction has been spent
          (usage (llm:make-usage))
          (*subagent-usage* (llm:make-usage))
@@ -1824,6 +1830,34 @@ another tool or give a final answer.")
         ;; requires it.
         (setf messages (append messages (list (assistant-msg-from-response msg)))
               *live-messages* messages)
+        ;; THE WRAP-UP ENDS WHEN IT SAYS IT DOES.  A wrap-up turn that only
+        ;; repeats the last one's calls makes no progress (seen: a 4B model
+        ;; re-sending one no-op Edit through every grace turn, each told "THIS
+        ;; IS YOUR FINAL TURN"), and on the last turn allowed nothing would read
+        ;; a call's result.  Either way the calls are not run: each gets a
+        ;; result saying so (the history stays well formed for whoever persists
+        ;; it) and the run ends on the model's latest words.
+        (when (and tcs wrapping-up)
+          (let ((sigs (mapcar #'%tool-call-sig tcs)))
+            (when (or (>= n max-iterations) (equal sigs turn-sigs))
+              (when verbose
+                (format t "~&[operandi] wrap-up turn ~:[repeats the last~;is the last~]; ending the run~%"
+                        (>= n max-iterations)))
+              (setf messages
+                    (append messages
+                            (loop for tc in tcs
+                                  collect (tool-result-msg (gethash "id" tc)
+                                                           "Not executed: the run ended after the wrap-up."))))
+              (setf messages (maybe-compact messages verbose))
+              (return (values (or (and (stringp text) (plusp (length (string-trim '(#\Space #\Newline #\Tab) text))) text)
+                                  (loop for m in (reverse messages)
+                                        for c = (and (equal (gethash "role" m) "assistant") (gethash "content" m))
+                                        when (and (stringp c) (plusp (length (string-trim '(#\Space #\Newline #\Tab) c))))
+                                          return c)
+                                  "[max-iterations exceeded]")
+                              messages n
+                              (llm:usage-incf (llm:copy-usage usage) *subagent-usage*))))
+            (setf turn-sigs sigs)))
         (cond
           (tcs
            (setf empty-turns 0)   ; a tool-calling turn is progress, not a stall

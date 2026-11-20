@@ -39,6 +39,7 @@
            #:*todos*
            #:*bash-timeout*
            #:*eval-timeout*
+           #:*eval-package*
            #:*edit-max-bytes*
            #:*read-max-total-bytes*
            #:*tool-gate*
@@ -380,7 +381,7 @@ webp) is shown to you as a picture instead."
               "type" "object"
               "properties" (llm:ht
                             "path" (llm:ht "type" "string"
-                                            "description" "Absolute path")
+                                            "description" "File path: absolute, or relative to the working directory")
                             "offset" (llm:ht "type" "integer"
                                               "description" "First line to read (1-based, default 1)")
                             "limit" (llm:ht "type" "integer"
@@ -466,7 +467,7 @@ Refuses if the file exists and you haven't Read it this run."
               "type" "object"
               "properties" (llm:ht
                             "path"    (llm:ht "type" "string"
-                                               "description" "Absolute path")
+                                               "description" "File path: absolute, or relative to the working directory")
                             "content" (llm:ht "type" "string"
                                                "description" "File contents"))
               "required" (vector "path" "content")))
@@ -485,17 +486,19 @@ Refuses if the file exists and you haven't Read it this run."
        (format nil "wrote ~A bytes to ~A" (length content) path)))))
 
 (define-tool "Edit"
-    (:description "Replace OLD with NEW in PATH. Errors if OLD isn't unique.
-Read the file first."
+    (:description "Replace OLD with NEW in PATH. Errors if OLD isn't unique, unless ALL
+is true, which replaces every occurrence. Read the file first."
      :schema (llm:ht
               "type" "object"
               "properties" (llm:ht
                             "path" (llm:ht "type" "string"
-                                            "description" "Absolute path")
+                                            "description" "File path: absolute, or relative to the working directory")
                             "old"  (llm:ht "type" "string"
                                             "description" "Exact text to replace")
                             "new"  (llm:ht "type" "string"
-                                            "description" "Replacement text"))
+                                            "description" "Replacement text")
+                            "all"  (llm:ht "type" "boolean"
+                                            "description" "Replace every occurrence of OLD (default false: OLD must be unique)"))
               "required" (vector "path" "old" "new")))
   (let* ((path (gethash "path" args))
          (refusal (check-write-allowed path))
@@ -520,16 +523,26 @@ Read the file first."
                          finally (return hits)))))
          (cond
            ((zerop n) (format nil "Edit: OLD not found in ~A" path))
-           ((> n 1) (format nil "Edit: OLD appears ~A times in ~A — make it unique" n path))
+           ((and (> n 1) (not (eq t (gethash "all" args))))
+            (format nil "Edit: OLD appears ~A times in ~A — include more surrounding text to make it unique, or pass \"all\": true to replace all ~A" n path n))
            (t (let* ((idx (search old text))
-                     (out (concatenate 'string
-                                       (subseq text 0 idx) new
-                                       (subseq text (+ idx (length old))))))
+                     (out (if (> n 1)
+                              (with-output-to-string (o)
+                                (loop with start = 0
+                                      for hit = (search old text :start2 start)
+                                      while hit
+                                      do (write-string text o :start start :end hit)
+                                         (write-string new o)
+                                         (setf start (+ hit (length old)))
+                                      finally (write-string text o :start start)))
+                              (concatenate 'string
+                                           (subseq text 0 idx) new
+                                           (subseq text (+ idx (length old)))))))
                 (with-open-file (s path :direction :output :if-exists :supersede)
                   (write-string out s))
                 (record-read path)
-                (format nil "edited ~A: 1 replacement (~A→~A bytes)"
-                        path (length text) (length out))))))))))
+                (format nil "edited ~A: ~A replacement~:P (~A→~A bytes)"
+                        path n (length text) (length out))))))))))
 
 (defvar *last-bash-code* nil
   "Exit status of the most recent %RUN-BASH call.")
@@ -1282,6 +1295,11 @@ every project. Notes appear in future system prompts — keep them tight."
       (format out "~%- **~A** — ~A~%" topic note))
     (format nil "noted (~A): ~A" scope topic)))
 
+(defvar *eval-package* :cl-user
+  "The package Eval reads and evaluates in (and so LOADs into).  The eval
+   suite gives each task a fresh one, so one task's definitions are not
+   another's.")
+
 (define-tool "Eval"
     (:description "Evaluate Common Lisp in the running SBCL image. Every
 package loaded in the image is callable — operandi.store plus whatever
@@ -1303,7 +1321,7 @@ large)."
         ;; its own handler clause below (as does STORAGE-CONDITION from a
         ;; deeply-recursive form — the ERROR clause alone would miss both).
         (bt:with-timeout (*eval-timeout*)
-          (let ((*package* (find-package :cl-user))
+          (let ((*package* (or (find-package *eval-package*) (find-package :cl-user)))
                 (*standard-output* out)
                 (*error-output* out)
                 (last-result nil))

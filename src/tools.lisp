@@ -39,6 +39,7 @@
            #:*todos*
            #:*bash-timeout*
            #:*eval-timeout*
+           #:*eval-package*
            #:*edit-max-bytes*
            #:*read-max-total-bytes*
            #:*tool-gate*
@@ -1128,6 +1129,11 @@ every project. Notes appear in future system prompts — keep them tight."
       (format out "~%- **~A** — ~A~%" topic note))
     (format nil "noted (~A): ~A" scope topic)))
 
+(defvar *eval-package* :cl-user
+  "The package Eval reads and evaluates in (and so LOADs into).  The eval
+   suite gives each task a fresh one, so one task's definitions are not
+   another's.")
+
 (define-tool "Eval"
     (:description "Evaluate Common Lisp in the running SBCL image. Every
 package loaded in the image is callable — operandi.store plus whatever
@@ -1149,7 +1155,7 @@ large)."
         ;; its own handler clause below (as does STORAGE-CONDITION from a
         ;; deeply-recursive form — the ERROR clause alone would miss both).
         (bt:with-timeout (*eval-timeout*)
-          (let ((*package* (find-package :cl-user))
+          (let ((*package* (or (find-package *eval-package*) (find-package :cl-user)))
                 (*standard-output* out)
                 (*error-output* out)
                 (last-result nil))

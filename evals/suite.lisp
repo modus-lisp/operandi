@@ -203,9 +203,6 @@ case? Count occurrences, not lines. Answer with just the number."
 
 (defvar *tool-names* nil "The tools every task gets; NIL = the task's own, else the default set.")
 (defvar *transcripts* nil "A directory each task's messages are written to as NAME.json, or NIL.")
-(defvar *cwd-hint* nil
-  "When true, each task's system prompt says what the working directory is
-   (operandi's own prompt does not).")
 
 (defun count-tool-calls (messages)
   (loop for m in messages
@@ -224,16 +221,19 @@ case? Count occurrences, not lines. Answer with just the number."
     (setf *default-pathname-defaults* dir)
     (multiple-value-bind (text messages iters usage)
         (handler-case
-          (let ((tools:*system-sections*
-                  (if *cwd-hint*
-                      (cons (cons "cwd" (format nil "## Environment~%~%Working directory: ~A~%Relative paths are resolved against it."
-                                                (string-right-trim "/" (namestring dir))))
-                            tools:*system-sections*)
-                      tools:*system-sections*)))
+          ;; a fresh package for the task's Eval and what it LOADs: tasks run
+          ;; in one image, and one task's FIB or *STACK* must not be found by
+          ;; the next
+          (let ((tools:*eval-package*
+                  (let ((name (format nil "EVAL-~:@(~A~)" (task-name task))))
+                    (when (find-package name) (delete-package name))
+                    (make-package name :use '(:cl)))))
             (eng:run (task-prompt task)
                      :tool-names (or (task-tools task) *tool-names* (tools:default-tools))
                      :max-iterations 30 :verbose nil))
           (error (e) (values (format nil "RUN ERROR: ~A" e) nil 0 (llm:make-usage))))
+      (let ((pkg (find-package (format nil "EVAL-~:@(~A~)" (task-name task)))))
+        (when pkg (delete-package pkg)))
       (with-open-file (s (merge-pathnames ".operandi-answer" dir)
                          :direction :output :if-exists :supersede
                          :if-does-not-exist :create)
@@ -300,7 +300,6 @@ case? Count occurrences, not lines. Answer with just the number."
 ;;   --tools core     only *CORE-TOOLS* (default: operandi's full default set)
 ;;   --only a,b       only the tasks with these names
 ;;   --out DIR        write each task's transcript and results.json to DIR
-;;   --cwd-hint       tell the model its working directory in the system prompt
 ;;   --keep-notes     keep ~/.operandi's notes in the prompt (default: none, so
 ;;                    a run measures the model, not whoever's machine it is on)
 (let* ((args (remove "--" (uiop:command-line-arguments) :test #'string=))
@@ -322,7 +321,6 @@ case? Count occurrences, not lines. Answer with just the number."
   (when only
     (setf tasks (remove-if-not (lambda (tk) (member (task-name tk) only :test #'string=)) tasks)))
   (when (equal (funcall opt "--tools") "core") (setf *tool-names* *core-tools*))
-  (when (member "--cwd-hint" args :test #'string=) (setf *cwd-hint* t))
   (unless (member "--keep-notes" args :test #'string=)
     (setf tools:*notes-file* (merge-pathnames "operandi-evals-no-notes.md" (uiop:temporary-directory))))
   (when out

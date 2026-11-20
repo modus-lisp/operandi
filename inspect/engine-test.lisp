@@ -192,10 +192,58 @@
                     (label "http://localhost/v1/chat/completions" "deepseek-v4-flash"))
            (string= "local" (label "http://localhost/v1/chat/completions" nil))))))
 
+;;; ---- the wrap-up ends when it says it does ------------------------------
+;;; Past the iteration cap the loop grants wrap-up turns (and unannounced
+;;; grace turns, each told it is the last).  A small model was seen
+;;; re-sending one no-op call through all of them.  A wrap-up turn that only
+;;; repeats the previous turn's calls ends the run, and so does the last turn
+;;; allowed; their calls are not run.
+
+(defun run-counting (responses &key (max 2))
+  "Run against RESPONSES with the iteration cap MAX; (values text messages
+   chat-calls)."
+  (let ((calls 0))
+    (setf *script* (copy-list responses))
+    (setf (symbol-function 'operandi.engine::do-chat-with-retries)
+          (lambda (messages tools-vec &key verbose)
+            (declare (ignore messages tools-vec verbose))
+            (incf calls)
+            (or (pop *script*) (assistant-resp :content 'null))))
+    (multiple-value-bind (text messages) (eng:run "do the task" :verbose nil :max-iterations max)
+      (values text messages calls))))
+
+(defun not-executed-p (messages)
+  (find-if (lambda (m) (and (equal (gethash "role" m) "tool")
+                            (search "Not executed: the run ended" (or (gethash "content" m) ""))))
+           messages))
+
+(defun run-wrapup ()
+  (format t "~&wrap-up~%")
+  (let ((eng:*wrapup-iterations* 3) (eng:*wrapup-grace* 2))
+    (check "a wrap-up turn repeating the last one's calls ends the run"
+      (multiple-value-bind (text messages calls)
+          (run-counting (list (assistant-resp :tool-calls (vector (bash-call "a" "echo 1")))
+                              (assistant-resp :tool-calls (vector (bash-call "b" "echo 2")))
+                              ;; the cap trips here: the wrap-up begins
+                              (assistant-resp :content "writing up" :tool-calls (vector (bash-call "c" "echo same")))
+                              (assistant-resp :tool-calls (vector (bash-call "d" "echo same")))
+                              (assistant-resp :tool-calls (vector (bash-call "e" "echo same")))
+                              (assistant-resp :tool-calls (vector (bash-call "f" "echo same")))))
+        (and (= calls 4) (equal text "writing up") (not-executed-p messages))))
+    (check "the last turn allowed ends the run; its calls are not run"
+      (multiple-value-bind (text messages calls)
+          (run-counting (loop for i from 0 below 12
+                              collect (assistant-resp :content (format nil "step ~D" i)
+                                                      :tool-calls (vector (bash-call (format nil "c~D" i)
+                                                                                     (format nil "echo ~D" i))))))
+        ;; 2 turns to the cap, then 3 announced + 2 grace wrap-up turns
+        (and (= calls 7) (equal text "step 6") (not-executed-p messages))))))
+
 (defun run ()
   (setf *pass* 0 *fail* 0)
   (format t "~&operandi engine empty-turn oracle~%")
   (run-llama-picks)
+  (run-wrapup)
 
   ;; A normal single answer passes straight through.
   (check "normal answer returns verbatim"

@@ -297,6 +297,7 @@ case? Count occurrences, not lines. Answer with just the number."
 ;; args (any order): an openrouter model (contains "/"), and/or a suite
 ;; selector easy|hard|tools|all (default all).  Also:
 ;;   --illatio PATH   run the GGUF at PATH in this image (ILLATIO_GPU=1 for Metal)
+;;   --local URL      a local OpenAI server (llama-server, illatio --serve) at URL
 ;;   --tools core     only *CORE-TOOLS* (default: operandi's full default set)
 ;;   --only a,b       only the tasks with these names
 ;;   --out DIR        write each task's transcript and results.json to DIR
@@ -305,11 +306,12 @@ case? Count occurrences, not lines. Answer with just the number."
 (let* ((args (remove "--" (uiop:command-line-arguments) :test #'string=))
        (opt (lambda (flag) (let ((p (member flag args :test #'string=))) (and p (second p)))))
        (illatio (funcall opt "--illatio"))
+       (local (funcall opt "--local"))
        (only (let ((o (funcall opt "--only"))) (and o (uiop:split-string o :separator ","))))
        (out (funcall opt "--out"))
        (plain (loop with skip = nil for a in args
                     if skip do (setf skip nil)
-                    else if (member a '("--illatio" "--tools" "--only" "--out") :test #'string=) do (setf skip t)
+                    else if (member a '("--illatio" "--local" "--tools" "--only" "--out") :test #'string=) do (setf skip t)
                     else if (uiop:string-prefix-p "--" a) do (progn)
                     else collect a))
        (model (find-if (lambda (a) (find #\/ a)) plain))
@@ -326,8 +328,11 @@ case? Count occurrences, not lines. Answer with just the number."
   (when out
     (setf *transcripts* (uiop:ensure-directory-pathname (merge-pathnames out (uiop:getcwd))))
     (ensure-directories-exist *transcripts*))
+  (when local
+    (llm:set-backend-llama! :url local)
+    (format t "~&local: ~A at ~A~%" llm:*llm-model* local))
   (when illatio
     (llm:set-backend-illatio! :path illatio)
     (format t "~&illatio: ~A (context ~D)~%" llm:*llm-model* (llm:illatio-context-length)))
   (format t "~&suite=~A (~A tasks)~%" suite (length tasks))
-  (sb-ext:exit :code (if (run-evals :model (and (not illatio) model) :tasks tasks) 0 1)))
+  (sb-ext:exit :code (if (run-evals :model (and (not illatio) (not local) model) :tasks tasks) 0 1)))
